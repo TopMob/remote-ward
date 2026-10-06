@@ -41,7 +41,7 @@ impl Default for ClientConfig {
             video_port: 48000,
             width: 2560,
             height: 1440,
-            preferred_codec: VideoCodec::HEVC,
+            preferred_codec: VideoCodec::H264, // H.264 по умолчанию для 100% аппаратной совместимости
         }
     }
 }
@@ -427,6 +427,9 @@ impl ApplicationHandler for RemoteWardClientApp {
         }
 
         if got_new_frame {
+            if self.frames_rendered == 1 {
+                tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
+            }
             self.draw_current_frame();
             if let Some(ref window) = self.window {
                 window.request_redraw();
@@ -454,6 +457,18 @@ pub async fn run_client(
         UdpSocket::bind(format!("0.0.0.0:{}", config.video_port)).await?,
     );
     tracing::info!("Сетевой видеосокет клиента открыт на порту {}", config.video_port);
+
+    // Фоновая задача пробивки порта в Windows Firewall / NAT и отправки Heartbeat на видеопорт хоста
+    let host_video_addr = SocketAddr::new(config.host_control_addr.ip(), config.video_port);
+    let is_running_punch = Arc::clone(&is_running);
+    let video_socket_punch = Arc::clone(&video_socket);
+    tokio::spawn(async move {
+        let punch_packet = [core_protocol::MSG_TYPE_CONTROL, 0x50, 0x55, 0x4E, 0x43, 0x48]; // PUNCH
+        while is_running_punch.load(Ordering::Relaxed) {
+            let _ = video_socket_punch.send_to(&punch_packet, host_video_addr).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
 
     // Канал для передачи событий ввода из GUI потока в сетевой сокет
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
@@ -513,14 +528,45 @@ pub async fn run_client(
             .unwrap();
 
         rt.block_on(async move {
+            let mut packets_count = 0u64;
+            let mut frames_count = 0u64;
             while is_running_video.load(Ordering::Relaxed) {
                 match video_socket_task.recv_from(&mut buf).await {
-                    Ok((len, _src)) => {
+                    Ok((len, src)) => {
+                        if len < 4 {
+                            continue;
+                        }
+                        if buf[0] == core_protocol::MSG_TYPE_CONTROL {
+                            continue;
+                        }
+
+                        packets_count += 1;
+                        if packets_count == 1 {
+                            tracing::info!("Первый видеопакет успешно получен от {} ({} байт)!", src, len);
+                        }
+
                         let datagram = &buf[..len];
                         if let Ok(Some(assembled_frame)) = reassembler.process_packet(datagram) {
+                            frames_count += 1;
+                            if frames_count == 1 {
+                                tracing::info!(
+                                    "Первый видеокадр #{} успешно собран из пакетов ({} байт, keyframe={})!",
+                                    assembled_frame.frame_id,
+                                    assembled_frame.data.len(),
+                                    assembled_frame.is_keyframe
+                                );
+                            }
+
                             if let Some(ref mut decoder) = decoder_opt {
                                 match decoder.decode(&assembled_frame.data) {
                                     Ok(Some(decoded)) => {
+                                        if frames_count == 1 {
+                                            tracing::info!(
+                                                "Первый видеокадр успешно декодирован в NV12 ({}x{})!",
+                                                decoded.width,
+                                                decoded.height
+                                            );
+                                        }
                                         let _ = frame_tx.try_send(decoded);
                                     }
                                     Ok(None) => {}

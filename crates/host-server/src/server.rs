@@ -26,7 +26,7 @@ impl Default for HostConfig {
             control_port: 48001,
             bitrate_kbps: 20_000, // 20 Мбит/с для отличного качества в 1440p
             fps: 60,
-            preferred_codec: VideoCodec::HEVC, // HEVC по умолчанию для RTX 2060 SUPER
+            preferred_codec: VideoCodec::H264, // H.264 по умолчанию для гарантированной аппаратной совместимости
         }
     }
 }
@@ -87,6 +87,30 @@ impl RemoteWardHost {
             "Видеосокет (UDP Stream) открыт на порту {}",
             self.config.video_port
         );
+
+        // Фоновый поток сопряжения видеоканала (Hole Punch / NAT traversal)
+        {
+            let video_socket_punch = Arc::clone(&video_socket);
+            let state_punch = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                let mut punch_buf = [0u8; 128];
+                while state_punch.is_running.load(Ordering::Relaxed) {
+                    if let Ok((len, src)) = video_socket_punch.recv_from(&mut punch_buf) {
+                        if len > 0 {
+                            let mut endpoint = state_punch.client_endpoint.write().unwrap();
+                            if endpoint.as_ref() != Some(&src) {
+                                tracing::info!(
+                                    "Видеосокет хоста успешно сопряжен с клиентом: {} (получен пакет пробивки)!",
+                                    src
+                                );
+                                *endpoint = Some(src);
+                                state_punch.force_keyframe.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Фоновая задача обработки управляющих сообщений и ввода
         let control_task = {
@@ -204,7 +228,7 @@ impl RemoteWardHost {
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
 
         let encoder_lock = Arc::new(std::sync::Mutex::new(None));
-        let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::HEVC));
+        let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::H264));
 
         let encoder_clone = Arc::clone(&encoder_lock);
         let last_codec_clone = Arc::clone(&last_codec_lock);
@@ -280,6 +304,18 @@ impl RemoteWardHost {
                         core_protocol::DEFAULT_MAX_PAYLOAD_SIZE,
                     );
 
+                    let is_kf = encoded.is_keyframe;
+                    if frame_id == 0 || is_kf {
+                        tracing::info!(
+                            "Отправлен {} #{}: {} байт ({} пакетов) клиенту {}",
+                            if is_kf { "KEYFRAME" } else { "кадр" },
+                            frame_id,
+                            encoded.data.len(),
+                            packets.len(),
+                            target_addr
+                        );
+                    }
+
                     // Отправка клиенту через UDP сокет
                     let socket = &video_socket_clone;
                     for packet in &packets {
@@ -318,5 +354,64 @@ impl RemoteWardHost {
         tracing::info!("Сервер Remote-Ward успешно остановлен.");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wgc_nvenc_pipeline() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        let encoded_count = Arc::new(AtomicU32::new(0));
+        let ec = Arc::clone(&encoded_count);
+
+        let encoder_opt = Arc::new(std::sync::Mutex::new(None));
+        let enc_clone = Arc::clone(&encoder_opt);
+
+        let session = WgcCaptureSession::start(move |tex, dev, w, h| {
+            let mut enc_guard = enc_clone.lock().unwrap();
+            if enc_guard.is_none() {
+                println!("Init Nvenc with dev={:?}, {}x{}", dev, w, h);
+                match NvencEncoder::new_from_raw_device(dev, w, h, 60, 20_000, VideoCodec::H264) {
+                    Ok(e) => {
+                        println!("Nvenc created successfully!");
+                        *enc_guard = Some(e);
+                    }
+                    Err(err) => {
+                        println!("Nvenc creation failed: {:?}", err);
+                        return Err(Box::new(std::io::Error::other(format!("{:?}", err))));
+                    }
+                }
+            }
+
+            if let Some(ref mut encoder) = *enc_guard {
+                match encoder.encode_frame_raw(tex, false) {
+                    Ok(frame) => {
+                        println!("Frame encoded: len={}, keyframe={}", frame.data.len(), frame.is_keyframe);
+                        ec.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(err) => {
+                        println!("Frame encode failed: {:?}", err);
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        match session {
+            Ok(mut s) => {
+                std::thread::sleep(Duration::from_millis(1500));
+                let count = encoded_count.load(Ordering::SeqCst);
+                println!("Frames successfully encoded by NVENC in 1.5s: {}", count);
+                s.stop();
+            }
+            Err(e) => {
+                println!("Capture session start failed: {:?}", e);
+            }
+        }
     }
 }

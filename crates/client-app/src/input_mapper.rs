@@ -85,6 +85,45 @@ pub fn keycode_to_scancode(key: KeyCode) -> Option<(u16, bool)> {
         KeyCode::F11 => Some((0x57, false)),
         KeyCode::F12 => Some((0x58, false)),
 
+        // Знаки препинания и русские буквы (б, ю, ., э, ж, х, ъ, ё, -, =)
+        KeyCode::Minus => Some((0x0C, false)),
+        KeyCode::Equal => Some((0x0D, false)),
+        KeyCode::BracketLeft => Some((0x1A, false)),  // х
+        KeyCode::BracketRight => Some((0x1B, false)), // ъ
+        KeyCode::Semicolon => Some((0x27, false)),    // ж
+        KeyCode::Quote => Some((0x28, false)),        // э
+        KeyCode::Backquote => Some((0x29, false)),    // ё
+        KeyCode::Backslash => Some((0x2B, false)),
+        KeyCode::Comma => Some((0x33, false)),        // б
+        KeyCode::Period => Some((0x34, false)),       // ю
+        KeyCode::Slash => Some((0x35, false)),        // . / ?
+
+        // Windows клавиши и системные
+        KeyCode::SuperLeft => Some((0x5B, true)),
+        KeyCode::SuperRight => Some((0x5C, true)),
+        KeyCode::ContextMenu => Some((0x5D, true)),
+        KeyCode::PrintScreen => Some((0x37, true)),
+        KeyCode::Pause => Some((0x45, true)),
+
+        // Numpad
+        KeyCode::NumLock => Some((0x45, true)),
+        KeyCode::Numpad0 => Some((0x52, false)),
+        KeyCode::Numpad1 => Some((0x4F, false)),
+        KeyCode::Numpad2 => Some((0x50, false)),
+        KeyCode::Numpad3 => Some((0x51, false)),
+        KeyCode::Numpad4 => Some((0x4B, false)),
+        KeyCode::Numpad5 => Some((0x4C, false)),
+        KeyCode::Numpad6 => Some((0x4D, false)),
+        KeyCode::Numpad7 => Some((0x47, false)),
+        KeyCode::Numpad8 => Some((0x48, false)),
+        KeyCode::Numpad9 => Some((0x49, false)),
+        KeyCode::NumpadDecimal => Some((0x53, false)),
+        KeyCode::NumpadDivide => Some((0x35, true)),
+        KeyCode::NumpadMultiply => Some((0x37, false)),
+        KeyCode::NumpadSubtract => Some((0x4A, false)),
+        KeyCode::NumpadAdd => Some((0x4E, false)),
+        KeyCode::NumpadEnter => Some((0x1C, true)),
+
         _ => None,
     }
 }

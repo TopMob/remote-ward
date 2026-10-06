@@ -226,6 +226,7 @@ dependencies = [
  "core-protocol",
  "core-transport",
  "host-server",
+ "rayon",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

@@ -54,12 +54,14 @@ impl MftVideoDecoder {
             VideoCodec::AV1 => return false,
         };
 
-        unsafe {
+        std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let _ = MFStartup(MF_VERSION, 0);
             let res: Result<IMFTransform, _> = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER);
             res.is_ok()
-        }
+        })
+        .join()
+        .unwrap_or(false)
     }
 
     /// Список аппаратно поддерживаемых кодеков на текущей системе клиента

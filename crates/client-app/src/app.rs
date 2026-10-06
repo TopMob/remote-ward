@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{PhysicalKey};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
+use winit::platform::windows::WindowAttributesExtWindows;
 
 use core_protocol::{
     ButtonState, ClientHello, ControlMessage, InputEvent, MouseButton, VideoCodec,
@@ -76,7 +77,8 @@ impl ApplicationHandler for RemoteWardClientApp {
                 .with_inner_size(winit::dpi::LogicalSize::new(
                     self.config.width as f64 / 1.5,
                     self.config.height as f64 / 1.5,
-                ));
+                ))
+                .with_drag_and_drop(false);
 
             match event_loop.create_window(window_attributes) {
                 Ok(window) => {

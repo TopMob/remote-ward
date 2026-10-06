@@ -1,0 +1,26 @@
+[package]
+name = "host-capture"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+core-protocol = { path = "../core-protocol" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+win_desktop_duplication = "0.10"
+windows-capture = "2.0"
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]

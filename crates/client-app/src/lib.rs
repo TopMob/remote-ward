@@ -1,4 +1,5 @@
 pub mod app;
+pub mod calibration;
 pub mod decoder;
 pub mod input_mapper;
 

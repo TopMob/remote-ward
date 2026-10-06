@@ -1,0 +1,27 @@
+[package]
+name = "host-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-protocol = { path = "../core-protocol" }
+core-transport = { path = "../core-transport" }
+host-capture = { path = "../host-capture" }
+host-encode = { path = "../host-encode" }
+host-input = { path = "../host-input" }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+]

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["TopMob"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TopMob/remote-ward"
+
+[workspace.dependencies]
+# Асинхронность и многопоточность
+tokio = { version = "1.43", features = ["full"] }
+
+# Логирование и диагностика
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Ошибки
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Сериализация и бинарные структуры
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+bytemuck = { version = "1.21", features = ["derive"] }
+
+# Сеть и криптография
+quinn = "0.11"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
+# Windows API
+windows = "0.58"
+
+# Оптимизации сборки для минимальной задержки в Release
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Быстрая сборка для разработки
+[profile.dev]
+opt-level = 0
+debug = true

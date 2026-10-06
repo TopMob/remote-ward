@@ -1,0 +1,76 @@
+# === Rust & Cargo ===
+/target/
+**/*.rs.bk
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# === IDEs & Editors ===
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.suo
+*.user
+*.vcxproj.user
+
+# === Windows OS ===
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# === Video / Audio / Test Dumps & Logs ===
+*.log
+logs/
+*.raw
+*.yuv
+*.h264
+*.h265
+*.hevc
+*.ivf
+*.mp4
+*.mkv
+*.wav
+*.pcm
+*.dmp
+*.crash
+
+# === Secrets, Certificates & Keys ===
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+credentials.json
+.env
+.env.*
+!.env.example
+
+# === WiX Toolset & Installer Outputs ===
+*.wixobj
+*.wixpdb
+*.msi
+*.msm
+*.cab
+dist/
+build/
+
+# === Node / Web / Tauri ===
+node_modules/
+.svelte-kit/
+.next/
+dist-isolated/
+
+# === Android ===
+.gradle/
+*.apk
+*.aab
+local.properties
+.cxx/

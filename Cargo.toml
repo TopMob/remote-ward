@@ -32,6 +32,7 @@ bytemuck = { version = "1.21", features = ["derive"] }
 # Сеть и криптография
 quinn = "0.11"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+socket2 = "0.5"
 
 # Windows API
 windows = "0.58"

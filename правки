@@ -1,0 +1,6 @@
+1. сделать по умолчанию полноэкранный режим
+2. 2026-10-06T20:11:18.049068Z  WARN host_server::server: Не удалось динамически перенастроить битрейт NVENC: MediaTypeConfigFailed("Ошибка reconfigure_bitrate(45000 kbps): NV_ENC_ERR_INVALID_PARAM")
+2026-10-06T20:11:18.067068Z  WARN host_server::server: Не удалось динамически перенастроить битрейт NVENC: MediaTypeConfigFailed("Ошибка reconfigure_bitrate(45000 kbps): NV_ENC_ERR_INVALID_PARAM")
+2026-10-06T20:11:18.085372Z  WARN host_server::server: Не удалось динамически перенастроить битрейт NVENC: MediaTypeConfigFailed("Ошибка reconfigure_bitrate(45000 kbps): NV_ENC_ERR_INVALID_PARAM")
+
+3. 

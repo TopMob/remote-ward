@@ -54,11 +54,13 @@ impl GraphicsCaptureApiHandler for WgcCaptureHandler {
         let width = frame.width();
         let height = frame.height();
         let texture_raw: *mut std::ffi::c_void =
-            unsafe { *(frame.as_raw_texture() as *const _ as *const *mut std::ffi::c_void) };
+            unsafe { std::mem::transmute_copy(frame.as_raw_texture()) };
         let device_raw: *mut std::ffi::c_void =
-            unsafe { *(frame.device() as *const _ as *const *mut std::ffi::c_void) };
+            unsafe { std::mem::transmute_copy(frame.device()) };
 
-        (self.callback)(texture_raw, device_raw, width, height)?;
+        if let Err(e) = (self.callback)(texture_raw, device_raw, width, height) {
+            tracing::warn!("Ошибка в колбэке кадра WGC: {:?}", e);
+        }
         Ok(())
     }
 

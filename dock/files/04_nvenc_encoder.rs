@@ -21,9 +21,13 @@ pub struct NvencEncoder {
     encoder_ptr: *mut c_void,
     width: u32,
     height: u32,
+    fps: u32,
+    encode_guid: GUID,
+    preset_guid: GUID,
     output_bitstream: NV_ENC_OUTPUT_PTR,
     frame_count: u64,
     encode_config: NV_ENC_CONFIG,
+    registered_resources: std::collections::HashMap<usize, NV_ENC_REGISTERED_PTR>,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -31,6 +35,11 @@ unsafe impl Send for NvencEncoder {}
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
+            if let Some(unreg_fn) = self.fn_list.nvEncUnregisterResource {
+                for (_, handle) in self.registered_resources.drain() {
+                    let _ = unreg_fn(self.encoder_ptr, handle);
+                }
+            }
             if !self.output_bitstream.is_null() {
                 if let Some(destroy_bitstream) = self.fn_list.nvEncDestroyBitstreamBuffer {
                     let _ = destroy_bitstream(self.encoder_ptr, self.output_bitstream);
@@ -151,18 +160,51 @@ impl NvencEncoder {
             tracing::warn!("GetEncodePresetConfigEx вернул {:?}, используем базовую конфигурацию", status);
         }
 
-        // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, intra refresh
+        // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, VBV буфер на 1 кадр, IDR только по запросу
         let mut encode_config = preset_config.presetCfg;
         encode_config.version = NV_ENC_CONFIG_VER;
         encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-        encode_config.gopLength = fps; // Автоматическое обновление каждые 1 секунду
+        // Бесконечный GOP: убираем ежесекундные IDR-спайки, вызывающие лаги сети и фантомные курсоры
+        encode_config.gopLength = 0xFFFFFFFF;
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
-        // Rate control: CBR для постоянного битрейта без задержки на буферизацию
+        // Rate control: CBR для постоянного битрейта со строгим VBV буфером размера ~1 кадра
         encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         encode_config.rcParams.averageBitRate = bitrate_kbps * 1000;
         encode_config.rcParams.maxBitRate = bitrate_kbps * 1000;
+        let vbv_size = (bitrate_kbps * 1000) / fps.max(1);
+        encode_config.rcParams.vbvBufferSize = vbv_size;
+        encode_config.rcParams.vbvInitialDelay = vbv_size;
         encode_config.rcParams.set_zeroReorderDelay(1); // Нулевая задержка переупорядочивания
+
+        // Кодеко-специфичные настройки: повтор SPS/PPS на IDR и цветовое пространство BT.709
+        match codec {
+            VideoCodec::H264 => {
+                let h264 = unsafe { &mut encode_config.encodeCodecConfig.h264Config };
+                h264.set_repeatSPSPPS(1);
+                h264.idrPeriod = 0xFFFFFFFF;
+                h264.maxNumRefFrames = 1;
+                h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+                h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
+                h264.h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                h264.h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                h264.h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                h264.h264VUIParameters.videoFullRangeFlag = 0; // Limited range
+            }
+            VideoCodec::HEVC => {
+                let hevc = unsafe { &mut encode_config.encodeCodecConfig.hevcConfig };
+                hevc.set_repeatSPSPPS(1);
+                hevc.idrPeriod = 0xFFFFFFFF;
+                hevc.maxNumRefFramesInDPB = 1;
+                hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
+                hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
+                hevc.hevcVUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                hevc.hevcVUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                hevc.hevcVUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                hevc.hevcVUIParameters.videoFullRangeFlag = 0; // Limited range
+            }
+            _ => {}
+        }
 
         // 4. Инициализация параметров энкодера
         let mut init_params = NV_ENC_INITIALIZE_PARAMS {
@@ -222,9 +264,13 @@ impl NvencEncoder {
             encoder_ptr,
             width,
             height,
+            fps,
+            encode_guid,
+            preset_guid,
             output_bitstream: create_bitstream.bitstreamBuffer,
             frame_count: 0,
             encode_config,
+            registered_resources: std::collections::HashMap::new(),
         })
     }
 
@@ -236,16 +282,26 @@ impl NvencEncoder {
 
         self.encode_config.rcParams.averageBitRate = new_bitrate_kbps * 1000;
         self.encode_config.rcParams.maxBitRate = new_bitrate_kbps * 1000;
+        let effective_fps = if self.fps > 0 { self.fps } else { 60 };
+        let vbv_size = (new_bitrate_kbps * 1000) / effective_fps;
+        self.encode_config.rcParams.vbvBufferSize = vbv_size;
+        self.encode_config.rcParams.vbvInitialDelay = vbv_size;
 
         let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
             version: NV_ENC_RECONFIGURE_PARAMS_VER,
             reInitEncodeParams: NV_ENC_INITIALIZE_PARAMS {
                 version: NV_ENC_INITIALIZE_PARAMS_VER,
+                encodeGUID: self.encode_guid,
+                presetGUID: self.preset_guid,
                 encodeWidth: self.width,
                 encodeHeight: self.height,
                 darWidth: self.width,
                 darHeight: self.height,
+                frameRateNum: effective_fps,
+                frameRateDen: 1,
+                enablePTD: 1,
                 encodeConfig: &mut self.encode_config,
+                tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 ..Default::default()
             },
             ..Default::default()
@@ -280,31 +336,38 @@ impl NvencEncoder {
     ) -> Result<EncodedFrame, EncodeError> {
         let t0 = Instant::now();
 
-        // 1. Регистрируем текстуру Direct3D 11 как ресурс в NVENC
-        let mut register_resource = NV_ENC_REGISTER_RESOURCE {
-            version: NV_ENC_REGISTER_RESOURCE_VER,
-            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
-            width: self.width,
-            height: self.height,
-            pitch: self.width * 4,
-            resourceToRegister: texture_ptr,
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
-            ..Default::default()
+        // 1. Проверяем кэш зарегистрированных ресурсов или регистрируем текстуру Direct3D 11 в NVENC
+        let ptr_key = texture_ptr as usize;
+        let registered_handle = if let Some(&handle) = self.registered_resources.get(&ptr_key) {
+            handle
+        } else {
+            let mut register_resource = NV_ENC_REGISTER_RESOURCE {
+                version: NV_ENC_REGISTER_RESOURCE_VER,
+                resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
+                width: self.width,
+                height: self.height,
+                pitch: self.width * 4,
+                resourceToRegister: texture_ptr,
+                bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+                ..Default::default()
+            };
+
+            let reg_fn = self.fn_list.nvEncRegisterResource.ok_or_else(|| {
+                EncodeError::ProcessInputFailed("nvEncRegisterResource отсутствует".into())
+            })?;
+
+            let status = unsafe { reg_fn(self.encoder_ptr, &mut register_resource) };
+            if status != NVENCSTATUS::NV_ENC_SUCCESS {
+                return Err(EncodeError::ProcessInputFailed(format!(
+                    "Ошибка регистрации текстуры: {:?}",
+                    status
+                )));
+            }
+
+            let handle = register_resource.registeredResource;
+            self.registered_resources.insert(ptr_key, handle);
+            handle
         };
-
-        let reg_fn = self.fn_list.nvEncRegisterResource.ok_or_else(|| {
-            EncodeError::ProcessInputFailed("nvEncRegisterResource отсутствует".into())
-        })?;
-
-        let status = unsafe { reg_fn(self.encoder_ptr, &mut register_resource) };
-        if status != NVENCSTATUS::NV_ENC_SUCCESS {
-            return Err(EncodeError::ProcessInputFailed(format!(
-                "Ошибка регистрации текстуры: {:?}",
-                status
-            )));
-        }
-
-        let registered_handle = register_resource.registeredResource;
 
         // 2. Отображаем ресурс для входа энкодера
         let mut map_resource = NV_ENC_MAP_INPUT_RESOURCE {
@@ -402,16 +465,13 @@ impl NvencEncoder {
         let is_keyframe = (lock_bitstream.pictureType == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR)
             || (lock_bitstream.pictureType == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I);
 
-        // 5. Разблокировка и очистка входных ресурсов
+        // 5. Разблокировка и очистка входных ресурсов (текстура остается в кэше зарегистрированных)
         unsafe {
             if let Some(unlock_fn) = self.fn_list.nvEncUnlockBitstream {
                 let _ = unlock_fn(self.encoder_ptr, self.output_bitstream);
             }
             if let Some(unmap_fn) = self.fn_list.nvEncUnmapInputResource {
                 let _ = unmap_fn(self.encoder_ptr, input_buffer);
-            }
-            if let Some(unreg_fn) = self.fn_list.nvEncUnregisterResource {
-                let _ = unreg_fn(self.encoder_ptr, registered_handle);
             }
         }
 

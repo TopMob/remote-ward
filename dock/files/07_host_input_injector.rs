@@ -3,7 +3,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
     MOUSEEVENTF_XUP, VIRTUAL_KEY,
 };
 
@@ -63,7 +63,7 @@ impl WindowsInputInjector {
             }
 
             InputEvent::MouseMoveAbsolute { x, y } => {
-                // Преобразование координат пикселей в нормализованный диапазон 0..65535
+                // Преобразование координат пикселей в нормализованный диапазон 0..65535 для основного монитора
                 let norm_x = ((*x as u64 * 65535) / self.screen_width as u64) as i32;
                 let norm_y = ((*y as u64 * 65535) / self.screen_height as u64) as i32;
 
@@ -74,7 +74,7 @@ impl WindowsInputInjector {
                             dx: norm_x,
                             dy: norm_y,
                             mouseData: 0,
-                            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
                             time: 0,
                             dwExtraInfo: 0,
                         },
@@ -233,6 +233,51 @@ impl WindowsInputInjector {
             });
         }
         Ok(())
+    }
+
+    /// Экстренный сброс всех зажатых клавиш и кнопок мыши при обрыве соединения или потере фокуса
+    pub fn release_all(&self) {
+        let mouse_up_flags = [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP];
+        let mut inputs = Vec::new();
+        for flag in mouse_up_flags {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: flag,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        // Отпускаем основные модификаторы: LCtrl, RCtrl, LAlt, RAlt, LShift, RShift, LWin, RWin
+        let modifier_scancodes = [0x1D, 0x1D | 0xE000, 0x38, 0x38 | 0xE000, 0x2A, 0x36, 0x5B | 0xE000, 0x5C | 0xE000];
+        for sc in modifier_scancodes {
+            let is_ext = (sc & 0xE000) != 0;
+            let mut dw_flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+            if is_ext {
+                dw_flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: (sc & 0xFF) as u16,
+                        dwFlags: dw_flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        let _ = self.send(&inputs);
     }
 }
 

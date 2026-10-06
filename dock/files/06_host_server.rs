@@ -38,6 +38,8 @@ pub struct ServerState {
     pub is_running: Arc<AtomicBool>,
     pub frame_counter: Arc<AtomicU64>,
     pub target_bitrate_kbps: Arc<AtomicU32>,
+    pub display_width: Arc<AtomicU32>,
+    pub display_height: Arc<AtomicU32>,
 }
 
 pub struct RemoteWardHost {
@@ -56,6 +58,8 @@ impl RemoteWardHost {
             is_running: Arc::new(AtomicBool::new(true)),
             frame_counter: Arc::new(AtomicU64::new(0)),
             target_bitrate_kbps: Arc::new(AtomicU32::new(initial_bitrate)),
+            display_width: Arc::new(AtomicU32::new(0)),
+            display_height: Arc::new(AtomicU32::new(0)),
         });
 
         let input_injector = Arc::new(WindowsInputInjector::new());
@@ -82,12 +86,14 @@ impl RemoteWardHost {
             self.config.control_port
         );
 
-        // 2. Создаем сокет для видеопотока
-        let video_socket = Arc::new(
-            std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?,
-        );
+        // 2. Создаем сокет для видеопотока с буфером 4 МБ для защиты от сброса пакетов ОС
+        let video_socket_raw = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?;
+        let sock_ref = socket2::SockRef::from(&video_socket_raw);
+        let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
+        let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+        let video_socket = Arc::new(video_socket_raw);
         tracing::info!(
-            "Видеосокет (UDP Stream) открыт на порту {}",
+            "Видеосокет (UDP Stream) открыт на порту {} с буфером SO_SNDBUF 4 МБ",
             self.config.video_port
         );
 
@@ -178,13 +184,15 @@ impl RemoteWardHost {
                                         // Форсируем первый I-кадр (IDR) для немедленного отображения
                                         state.force_keyframe.store(true, Ordering::SeqCst);
 
-                                        // Отправляем ответ ServerHello
+                                        // Отправляем ответ ServerHello с реальным разрешением захваченного экрана хоста
+                                        let real_w = state.display_width.load(Ordering::Relaxed);
+                                        let real_h = state.display_height.load(Ordering::Relaxed);
                                         let response = ControlMessage::ServerHello(ServerHello {
                                             server_name: "remote-ward-host".into(),
                                             server_version: "0.1.0".into(),
                                             selected_codec: selected,
-                                            width: hello.screen_width,
-                                            height: hello.screen_height,
+                                            width: if real_w > 0 { real_w } else { hello.screen_width },
+                                            height: if real_h > 0 { real_h } else { hello.screen_height },
                                             target_fps: config_fps,
                                             session_id: "session-001".into(),
                                         });
@@ -287,6 +295,7 @@ impl RemoteWardHost {
                                         tracing::info!("Клиент отключился: {}", reason);
                                         let mut endpoint = state.client_endpoint.write().unwrap();
                                         *endpoint = None;
+                                        injector.release_all();
                                     }
 
                                     _ => {}
@@ -412,15 +421,12 @@ impl RemoteWardHost {
                         );
                     }
 
-                    // Отправка клиенту через UDP сокет с микро-пейсингом пачек по 8 пакетов (защита от сброса пакетов роутером)
+                    // Отправка клиенту через UDP сокет с буфером SO_SNDBUF 4 МБ БЕЗ блокировки колбэка захвата
                     let socket = &video_socket_clone;
-                    for chunk in packets.chunks(8) {
-                        for packet in chunk {
-                            if let Err(e) = socket.send_to(packet, target_addr) {
-                                tracing::warn!("Ошибка отправки видеопакета: {:?}", e);
-                            }
+                    for packet in &packets {
+                        if let Err(e) = socket.send_to(packet, target_addr) {
+                            tracing::warn!("Ошибка отправки видеопакета: {:?}", e);
                         }
-                        std::thread::sleep(std::time::Duration::from_micros(60));
                     }
                 }
                 Err(e) => {
@@ -430,6 +436,9 @@ impl RemoteWardHost {
 
             Ok(())
         })?;
+
+        self.state.display_width.store(capture_session.width, Ordering::Relaxed);
+        self.state.display_height.store(capture_session.height, Ordering::Relaxed);
 
         tracing::info!(
             "Сессия захвата экрана запущена: разрешение дисплея {}x{}",

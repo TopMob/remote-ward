@@ -102,7 +102,10 @@ impl MftVideoDecoder {
             GUID::from_u128(0x9c27891a_ed7a_40e1_88e8_b22727a024ee);
         if let Ok(codec_api) = decoder.cast::<ICodecAPI>() {
             let var = VARIANT::from(1u32);
-            let _ = unsafe { codec_api.SetValue(&CODECAPI_AV_LOW_LATENCY_MODE, &var) };
+            match unsafe { codec_api.SetValue(&CODECAPI_AV_LOW_LATENCY_MODE, &var) } {
+                Ok(_) => tracing::info!("Режим CODECAPI_AV_LOW_LATENCY_MODE успешно активирован в MFT декодере"),
+                Err(e) => tracing::warn!("Не удалось включить CODECAPI_AV_LOW_LATENCY_MODE в MFT: {:?}", e),
+            }
         }
 
         // 1. Устанавливаем тип входных данных

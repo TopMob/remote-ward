@@ -102,10 +102,13 @@ pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
                 let u = uv_row[x] as i32 - 128;
                 let v = uv_row[x + 1] as i32 - 128;
 
-                // Предвычисляем цветовые добавки для 2x2 блока
-                let r_add = 409 * v + 128;
-                let g_add = -100 * u - 208 * v + 128;
-                let b_add = 516 * u + 128;
+                // Точная матрица BT.709 Limited Range (согласовано с VUI энкодера NVENC):
+                // R = 1.16438 * (Y - 16) + 1.79274 * V
+                // G = 1.16438 * (Y - 16) - 0.21325 * U - 0.53291 * V
+                // B = 1.16438 * (Y - 16) + 2.11240 * U
+                let r_add = 459 * v + 128;
+                let g_add = -55 * u - 136 * v + 128;
+                let b_add = 541 * u + 128;
 
                 // Точка (x, y0)
                 let c00 = 298 * ((y_row0_slice[x] as i32) - 16);
@@ -164,24 +167,33 @@ fn render_bgra_to_hwnd(
             return;
         }
 
+        // Сохранение правильных пропорций кадра (Letterbox / Pillarbox)
+        let scale_x = dest_w as f64 / width as f64;
+        let scale_y = dest_h as f64 / height as f64;
+        let scale = scale_x.min(scale_y);
+        let target_w = (width as f64 * scale).round() as i32;
+        let target_h = (height as f64 * scale).round() as i32;
+        let offset_x = (dest_w - target_w) / 2;
+        let offset_y = (dest_h - target_h) / 2;
+
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = width as i32;
-        bmi.bmiHeader.biHeight = -(height as i32); // Отрицательная высота для формата Top-Down (сверху вниз)
+        bmi.bmiHeader.biHeight = -(height as i32); // Отрицательная высота для формата Top-Down
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
-        // Включаем качественную интерполяцию HALFTONE для четкого отображения текста и мелких деталей
+        // Включаем качественную интерполяцию HALFTONE для максимальной четкости текста
         let _ = SetStretchBltMode(hdc, HALFTONE);
         let _ = SetBrushOrgEx(hdc, 0, 0, None);
 
         let _ = StretchDIBits(
             hdc,
-            0,
-            0,
-            dest_w,
-            dest_h,
+            offset_x,
+            offset_y,
+            target_w,
+            target_h,
             0,
             0,
             width as i32,
@@ -209,7 +221,7 @@ impl RemoteWardClientApp {
             input_tx,
             frame_rx,
             is_running,
-            cursor_grabbed: false,
+            cursor_grabbed: true,
             frames_rendered: 0,
             last_stats_instant: Instant::now(),
             bgra_buffer: Vec::new(),
@@ -225,6 +237,27 @@ impl RemoteWardClientApp {
             }
         }
         None
+    }
+
+    fn get_letterbox(&self) -> (f64, f64, f64, f64) {
+        if let Some(hwnd) = self.get_hwnd() {
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
+                let dest_w = (rect.right - rect.left) as f64;
+                let dest_h = (rect.bottom - rect.top) as f64;
+                let fw = if self.last_frame_size.0 > 0 { self.last_frame_size.0 as f64 } else { self.config.width as f64 };
+                let fh = if self.last_frame_size.1 > 0 { self.last_frame_size.1 as f64 } else { self.config.height as f64 };
+                if dest_w > 0.0 && dest_h > 0.0 && fw > 0.0 && fh > 0.0 {
+                    let scale = (dest_w / fw).min(dest_h / fh);
+                    let target_w = (fw * scale).round();
+                    let target_h = (fh * scale).round();
+                    let offset_x = ((dest_w - target_w) / 2.0).round();
+                    let offset_y = ((dest_h - target_h) / 2.0).round();
+                    return (offset_x, offset_y, target_w, target_h);
+                }
+            }
+        }
+        (0.0, 0.0, self.config.width as f64, self.config.height as f64)
     }
 
     fn draw_current_frame(&self) {
@@ -246,15 +279,14 @@ impl ApplicationHandler for RemoteWardClientApp {
         if self.window.is_none() {
             let window_attributes = Window::default_attributes()
                 .with_title("Remote-Ward Client (Ultra-Low Latency Streaming)")
-                .with_inner_size(winit::dpi::LogicalSize::new(
-                    self.config.width as f64 / 1.5,
-                    self.config.height as f64 / 1.5,
-                ))
+                .with_fullscreen(Some(Fullscreen::Borderless(None)))
                 .with_drag_and_drop(false);
 
             match event_loop.create_window(window_attributes) {
                 Ok(window) => {
-                    tracing::info!("Окно клиента успешно создано");
+                    tracing::info!("Окно клиента успешно создано в полноэкранном режиме (Borderless)");
+                    window.set_cursor_visible(false);
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
                     self.window = Some(window);
                 }
                 Err(e) => {
@@ -275,6 +307,24 @@ impl ApplicationHandler for RemoteWardClientApp {
                 tracing::info!("Закрытие окна клиентом...");
                 self.is_running.store(false, Ordering::Relaxed);
                 event_loop.exit();
+            }
+
+            WindowEvent::Focused(is_focused) => {
+                if !is_focused {
+                    // При потере фокуса сбрасываем зажатые кнопки мыши
+                    let _ = self.input_tx.send(InputEvent::MouseButton {
+                        button: MouseButton::Left,
+                        state: ButtonState::Released,
+                    });
+                    let _ = self.input_tx.send(InputEvent::MouseButton {
+                        button: MouseButton::Right,
+                        state: ButtonState::Released,
+                    });
+                    let _ = self.input_tx.send(InputEvent::MouseButton {
+                        button: MouseButton::Middle,
+                        state: ButtonState::Released,
+                    });
+                }
             }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -319,18 +369,20 @@ impl ApplicationHandler for RemoteWardClientApp {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                // В обычном оконном режиме передаем абсолютные координаты курсора на хост
+                // В обычном оконном режиме передаем точные координаты курсора с учетом Letterbox
                 if !self.cursor_grabbed {
-                    if let Some(ref window) = self.window {
-                        let win_size = window.inner_size();
-                        if win_size.width > 0 && win_size.height > 0 {
-                            let host_x = (position.x * self.config.width as f64 / win_size.width as f64) as u32;
-                            let host_y = (position.y * self.config.height as f64 / win_size.height as f64) as u32;
-                            let _ = self.input_tx.send(InputEvent::MouseMoveAbsolute {
-                                x: host_x.min(self.config.width.saturating_sub(1)),
-                                y: host_y.min(self.config.height.saturating_sub(1)),
-                            });
-                        }
+                    let (ox, oy, tw, th) = self.get_letterbox();
+                    let fw = if self.last_frame_size.0 > 0 { self.last_frame_size.0 as f64 } else { self.config.width as f64 };
+                    let fh = if self.last_frame_size.1 > 0 { self.last_frame_size.1 as f64 } else { self.config.height as f64 };
+                    if tw > 0.0 && th > 0.0 {
+                        let norm_x = ((position.x - ox) / tw).clamp(0.0, 1.0);
+                        let norm_y = ((position.y - oy) / th).clamp(0.0, 1.0);
+                        let host_x = (norm_x * (fw - 1.0)).round() as u32;
+                        let host_y = (norm_y * (fh - 1.0)).round() as u32;
+                        let _ = self.input_tx.send(InputEvent::MouseMoveAbsolute {
+                            x: host_x,
+                            y: host_y,
+                        });
                     }
                 }
             }
@@ -425,7 +477,6 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             // Конвертируем только 1 самый свежий кадр
             nv12_to_bgra(&frame.data, w, h, &mut self.bgra_buffer);
-            self.draw_current_frame();
 
             if self.frames_rendered == 1 {
                 tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
@@ -470,11 +521,16 @@ pub async fn run_client(
     let control_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let host_ctrl_addr = config.host_control_addr;
 
-    // 2. Создаем сокет для приема видео
-    let video_socket = Arc::new(
-        UdpSocket::bind(format!("0.0.0.0:{}", config.video_port)).await?,
+    // 2. Создаем сокет для приема видео с расширенным системным буфером SO_RCVBUF (8 МБ)
+    let video_socket_std = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.video_port))?;
+    let sock_ref = socket2::SockRef::from(&video_socket_std);
+    let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
+    video_socket_std.set_nonblocking(true)?;
+    let video_socket = Arc::new(UdpSocket::from_std(video_socket_std)?);
+    tracing::info!(
+        "Сетевой видеосокет клиента открыт на порту {} с буфером SO_RCVBUF 8 МБ",
+        config.video_port
     );
-    tracing::info!("Сетевой видеосокет клиента открыт на порту {}", config.video_port);
 
     // Фоновая задача пробивки порта в Windows Firewall / NAT и отправки Heartbeat на видеопорт хоста
     let host_video_addr = SocketAddr::new(config.host_control_addr.ip(), config.video_port);
@@ -490,8 +546,10 @@ pub async fn run_client(
 
     // Канал для передачи событий ввода из GUI потока в сетевой сокет
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
-    // Канал для передачи декодированных кадров из сетевого потока в GUI поток
-    let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(16);
+    // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 2 для минимальной задержки)
+    let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(2);
+    // Канал для передачи собранных кадров из сетевого потока в поток декодера
+    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(2);
 
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
     let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr).await;
@@ -591,154 +649,210 @@ pub async fn run_client(
         }
     });
 
-    // Фоновая задача отправки пользовательского ввода с минимальной задержкой
+    // Фоновая задача отправки пользовательского ввода с минимальной задержкой (без 100% CPU спина)
     let is_running_input = Arc::clone(&is_running);
     let ctrl_socket_input = Arc::clone(&control_socket);
     tokio::spawn(async move {
-        while is_running_input.load(Ordering::Relaxed) {
-            if let Some(event) = input_rx.recv().await {
-                if let Ok(bytes) = event.to_packet() {
-                    let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
-                }
+        while let Some(event) = input_rx.recv().await {
+            if !is_running_input.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(bytes) = event.to_packet() {
+                let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
             }
         }
     });
 
-    // Фоновая задача приема видеопакетов и декодирования
-    let is_running_video = Arc::clone(&is_running);
-    let video_socket_task = Arc::clone(&video_socket);
-    let ctrl_socket_task = Arc::clone(&control_socket);
+    // 5. Выделенный поток аппаратного декодирования MFT (полностью развязан от сетевого сокета)
+    let is_running_decoder = Arc::clone(&is_running);
     let width = config.width;
     let height = config.height;
     let preferred_codec = config.preferred_codec;
+    let frame_tx_decoder = frame_tx.clone();
 
-    std::thread::spawn(move || {
-        let mut reassembler = FrameReassembler::new(Duration::from_millis(50));
-        let effective_codec = if MftVideoDecoder::is_codec_supported(preferred_codec) {
-            preferred_codec
-        } else {
-            VideoCodec::H264
-        };
-        let mut decoder_opt = MftVideoDecoder::new(width, height, effective_codec).ok();
-        let mut buf = [0u8; 2048];
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async move {
-            let mut packets_count = 0u64;
+    std::thread::Builder::new()
+        .name("video-decoder".into())
+        .spawn(move || {
+            let effective_codec = if MftVideoDecoder::is_codec_supported(preferred_codec) {
+                preferred_codec
+            } else {
+                VideoCodec::H264
+            };
+            let mut decoder_opt = MftVideoDecoder::new(width, height, effective_codec).ok();
             let mut frames_count = 0u64;
-            let mut last_frame_id_opt: Option<u32> = None;
-            let mut packets_in_window = 0u32;
-            let mut gaps_in_window = 0u32;
-            let mut last_stats_sent = Instant::now();
 
-            while is_running_video.load(Ordering::Relaxed) {
-                // Периодическая отправка статистики потерь пакетов хосту (каждые 1 сек)
-                if last_stats_sent.elapsed() >= Duration::from_millis(1000) {
-                    let total = packets_in_window + gaps_in_window;
-                    let loss_rate = if total > 0 {
-                        gaps_in_window as f32 / total as f32
-                    } else {
-                        0.0
-                    };
-                    let stats = ControlMessage::ClientStats {
-                        rtt_us: 0,
-                        jitter_us: 0,
-                        decode_latency_us: 0,
-                        render_latency_us: 0,
-                        packet_loss_rate: loss_rate,
-                    };
-                    if let Ok(bytes) = stats.to_packet() {
-                        let _ = ctrl_socket_task.send_to(&bytes, host_ctrl_addr).await;
-                    }
-                    packets_in_window = 0;
-                    gaps_in_window = 0;
-                    last_stats_sent = Instant::now();
-                }
-
-                match video_socket_task.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        if len < 4 {
-                            continue;
-                        }
-                        if buf[0] == core_protocol::MSG_TYPE_CONTROL {
-                            continue;
+            while is_running_decoder.load(Ordering::Relaxed) {
+                match raw_frame_rx.blocking_recv() {
+                    Some(assembled_frame) => {
+                        frames_count += 1;
+                        if frames_count == 1 {
+                            tracing::info!(
+                                "Первый видеокадр #{} отправлен в аппаратный декодер ({} байт, keyframe={})!",
+                                assembled_frame.frame_id,
+                                assembled_frame.data.len(),
+                                assembled_frame.is_keyframe
+                            );
                         }
 
-                        packets_count += 1;
-                        packets_in_window += 1;
-                        if packets_count == 1 {
-                            tracing::info!("Первый видеопакет успешно получен от {} ({} байт)!", src, len);
-                        }
-
-                        let datagram = &buf[..len];
-                        if let Ok(Some(assembled_frame)) = reassembler.process_packet(datagram) {
-                            if let Some(last_id) = last_frame_id_opt {
-                                if assembled_frame.frame_id > last_id + 1 && !assembled_frame.is_keyframe {
-                                    let gap = assembled_frame.frame_id - last_id - 1;
-                                    gaps_in_window += gap;
-                                    // Потерян промежуточный кадр по сети! Мгновенно запрашиваем I-кадр для очистки шлейфов и призрачных курсоров
-                                    let req = ControlMessage::RequestKeyframe {
-                                        reason: "frame gap detected".into(),
-                                    };
-                                    if let Ok(req_bytes) = req.to_packet() {
-                                        let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                        if let Some(ref mut decoder) = decoder_opt {
+                            match decoder.decode(&assembled_frame.data) {
+                                Ok(Some(decoded)) => {
+                                    if frames_count == 1 {
+                                        tracing::info!(
+                                            "Первый видеокадр успешно декодирован в NV12 ({}x{})!",
+                                            decoded.width,
+                                            decoded.height
+                                        );
                                     }
+                                    let _ = frame_tx_decoder.try_send(decoded);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Ошибка декодирования кадра #{}: {:?}",
+                                        assembled_frame.frame_id,
+                                        e
+                                    );
                                 }
                             }
-                            last_frame_id_opt = Some(assembled_frame.frame_id);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        })
+        .unwrap();
 
-                            frames_count += 1;
-                            if frames_count == 1 {
+    // 6. Выделенный поток сетевого приема и сборки видеопакетов
+    let is_running_video = Arc::clone(&is_running);
+    let video_socket_task = Arc::clone(&video_socket);
+    let ctrl_socket_task = Arc::clone(&control_socket);
+
+    std::thread::Builder::new()
+        .name("video-receiver".into())
+        .spawn(move || {
+            let mut reassembler = FrameReassembler::new(Duration::from_millis(50));
+            let mut buf = [0u8; 2048];
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            rt.block_on(async move {
+                let mut packets_count = 0u64;
+                let mut last_frame_id_opt: Option<u32> = None;
+                let mut packets_in_window = 0u32;
+                let mut gaps_in_window = 0u32;
+                let mut last_stats_sent = Instant::now();
+                let mut awaiting_clean_keyframe = false;
+                let mut last_idr_request = Instant::now() - Duration::from_secs(1);
+
+                while is_running_video.load(Ordering::Relaxed) {
+                    // Периодическая отправка статистики потерь пакетов хосту (каждые 1 сек)
+                    if last_stats_sent.elapsed() >= Duration::from_millis(1000) {
+                        let total = packets_in_window + gaps_in_window;
+                        let loss_rate = if total > 0 {
+                            gaps_in_window as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        let stats = ControlMessage::ClientStats {
+                            rtt_us: 0,
+                            jitter_us: 0,
+                            decode_latency_us: 0,
+                            render_latency_us: 0,
+                            packet_loss_rate: loss_rate,
+                        };
+                        if let Ok(bytes) = stats.to_packet() {
+                            let _ = ctrl_socket_task.send_to(&bytes, host_ctrl_addr).await;
+                        }
+                        packets_in_window = 0;
+                        gaps_in_window = 0;
+                        last_stats_sent = Instant::now();
+                    }
+
+                    match video_socket_task.recv_from(&mut buf).await {
+                        Ok((len, src)) => {
+                            if len < 4 {
+                                continue;
+                            }
+                            if buf[0] == core_protocol::MSG_TYPE_CONTROL {
+                                continue;
+                            }
+
+                            packets_count += 1;
+                            packets_in_window += 1;
+                            if packets_count == 1 {
                                 tracing::info!(
-                                    "Первый видеокадр #{} успешно собран из пакетов ({} байт, keyframe={})!",
-                                    assembled_frame.frame_id,
-                                    assembled_frame.data.len(),
-                                    assembled_frame.is_keyframe
+                                    "Первый видеопакет успешно получен от {} ({} байт)!",
+                                    src,
+                                    len
                                 );
                             }
 
-                            if let Some(ref mut decoder) = decoder_opt {
-                                match decoder.decode(&assembled_frame.data) {
-                                    Ok(Some(decoded)) => {
-                                        if frames_count == 1 {
-                                            tracing::info!(
-                                                "Первый видеокадр успешно декодирован в NV12 ({}x{})!",
-                                                decoded.width,
-                                                decoded.height
-                                            );
-                                        }
-                                        let _ = frame_tx.try_send(decoded);
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        tracing::warn!("Ошибка декодирования кадра #{}: {:?}", assembled_frame.frame_id, e);
-                                        // Запрашиваем ключевой кадр при ошибке
+                            let datagram = &buf[..len];
+                            if let Ok(Some(assembled_frame)) = reassembler.process_packet(datagram) {
+                                let is_gap = match last_frame_id_opt {
+                                    Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
+                                    None => false,
+                                };
+
+                                if is_gap && !assembled_frame.is_keyframe {
+                                    let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
+                                    gaps_in_window += gap;
+                                    awaiting_clean_keyframe = true;
+
+                                    // Лимит частоты запроса IDR (не чаще 1 раза в 300 мс)
+                                    if last_idr_request.elapsed() >= Duration::from_millis(300) {
                                         let req = ControlMessage::RequestKeyframe {
-                                            reason: "decode error".into(),
+                                            reason: "frame gap detected".into(),
                                         };
                                         if let Ok(req_bytes) = req.to_packet() {
                                             let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
                                         }
+                                        last_idr_request = Instant::now();
                                     }
                                 }
+
+                                if assembled_frame.is_keyframe {
+                                    // Чистый ключевой кадр получен — возобновляем отображение
+                                    awaiting_clean_keyframe = false;
+                                }
+
+                                // Если опорный кадр утерян, отбрасываем битые P-кадры до прихода IDR
+                                // (устраняет эффект шлейфов и призрачных курсоров!)
+                                if awaiting_clean_keyframe {
+                                    if last_idr_request.elapsed() >= Duration::from_millis(300) {
+                                        let req = ControlMessage::RequestKeyframe {
+                                            reason: "awaiting clean keyframe".into(),
+                                        };
+                                        if let Ok(req_bytes) = req.to_packet() {
+                                            let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                        }
+                                        last_idr_request = Instant::now();
+                                    }
+                                    continue;
+                                }
+
+                                last_frame_id_opt = Some(assembled_frame.frame_id);
+
+                                // Передаем кадр в поток декодера (не блокируя сетевой сокет)
+                                let _ = raw_frame_tx.try_send(assembled_frame);
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("Ошибка чтения видеосокета: {:?}", e);
+                        Err(e) => {
+                            tracing::error!("Ошибка чтения видеосокета: {:?}", e);
+                        }
                     }
                 }
-            }
-        });
-    });
+            });
+        })
+        .unwrap();
 
-    // 4. Запуск оконного цикла событий Winit
+    // 7. Запуск оконного цикла событий Winit
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2)));
 
     let mut app = RemoteWardClientApp::new(config, input_tx, frame_rx, Arc::clone(&is_running));
     event_loop.run_app(&mut app)?;

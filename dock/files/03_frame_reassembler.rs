@@ -24,6 +24,7 @@ pub struct FrameReassembler {
     pending_frames: HashMap<u32, PartialFrame>,
     max_frame_age: Duration,
     latest_completed_frame_id: u32,
+    last_cleanup: Instant,
 }
 
 impl FrameReassembler {
@@ -32,6 +33,7 @@ impl FrameReassembler {
             pending_frames: HashMap::new(),
             max_frame_age,
             latest_completed_frame_id: 0,
+            last_cleanup: Instant::now(),
         }
     }
 
@@ -45,14 +47,34 @@ impl FrameReassembler {
         let packet_idx = header.get_packet_index() as usize;
         let total_packets = header.get_total_packets();
 
+        // Защита от поврежденных или аномальных пакетов
+        if total_packets == 0 || total_packets > 4096 {
+            return Ok(None);
+        }
+
         // Отбрасываем пакеты уже завершенных или слишком старых кадров
         if frame_id < self.latest_completed_frame_id
-            && (self.latest_completed_frame_id - frame_id) < 1000
+            && (self.latest_completed_frame_id.wrapping_sub(frame_id)) < 1000
         {
             return Ok(None);
         }
 
-        self.cleanup_stale_frames();
+        // Периодическая очистка устаревших кадров раз в 50 мс вместо каждого пакета
+        if self.last_cleanup.elapsed() >= Duration::from_millis(50) {
+            self.cleanup_stale_frames();
+            self.last_cleanup = Instant::now();
+        }
+
+        // Защита от переполнения очереди ожидания
+        if self.pending_frames.len() >= 64 && !self.pending_frames.contains_key(&frame_id) {
+            self.cleanup_stale_frames();
+            if self.pending_frames.len() >= 64 {
+                // Удаляем самый старый незавершенный кадр
+                if let Some(&oldest_id) = self.pending_frames.keys().next() {
+                    self.pending_frames.remove(&oldest_id);
+                }
+            }
+        }
 
         let partial = self
             .pending_frames
@@ -72,7 +94,8 @@ impl FrameReassembler {
 
             if partial.received_packets == partial.total_packets {
                 // Все фрагменты получены — собираем целый кадр
-                let mut full_data = Vec::new();
+                let total_size: usize = partial.chunks.iter().map(|c| c.as_ref().map_or(0, |b| b.len())).sum();
+                let mut full_data = Vec::with_capacity(total_size);
                 for c in partial.chunks.drain(..).flatten() {
                     full_data.extend_from_slice(&c);
                 }

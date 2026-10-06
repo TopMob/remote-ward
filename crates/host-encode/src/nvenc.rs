@@ -120,7 +120,7 @@ impl NvencEncoder {
             VideoCodec::AV1 => NV_ENC_CODEC_AV1_GUID,
         };
 
-        let preset_guid = NV_ENC_PRESET_P1_GUID; // P1 = максимальная скорость / минимальная задержка
+        let preset_guid = NV_ENC_PRESET_P3_GUID; // P3 = оптимальный баланс высокой четкости текста и сверхнизкой задержки
 
         // 3. Получение конфигурации пресета
         let mut preset_config = NV_ENC_PRESET_CONFIG {
@@ -154,7 +154,7 @@ impl NvencEncoder {
         let mut encode_config = preset_config.presetCfg;
         encode_config.version = NV_ENC_CONFIG_VER;
         encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-        encode_config.gopLength = fps * 2;
+        encode_config.gopLength = fps; // Автоматическое обновление каждые 1 секунду
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
         // Rate control: CBR для постоянного битрейта без задержки на буферизацию

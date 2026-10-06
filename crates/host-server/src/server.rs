@@ -24,7 +24,7 @@ impl Default for HostConfig {
         Self {
             video_port: 48000,
             control_port: 48001,
-            bitrate_kbps: 20_000, // 20 Мбит/с для отличного качества в 1440p
+            bitrate_kbps: 35_000, // 35 Мбит/с для кристально четкого качества текста и графики в 1440p
             fps: 60,
             preferred_codec: VideoCodec::H264, // H.264 по умолчанию для гарантированной аппаратной совместимости
         }
@@ -316,12 +316,15 @@ impl RemoteWardHost {
                         );
                     }
 
-                    // Отправка клиенту через UDP сокет
+                    // Отправка клиенту через UDP сокет с микро-пейсингом пачек по 8 пакетов (защита от сброса пакетов роутером)
                     let socket = &video_socket_clone;
-                    for packet in &packets {
-                        if let Err(e) = socket.send_to(packet, target_addr) {
-                            tracing::warn!("Ошибка отправки видеопакета: {:?}", e);
+                    for chunk in packets.chunks(8) {
+                        for packet in chunk {
+                            if let Err(e) = socket.send_to(packet, target_addr) {
+                                tracing::warn!("Ошибка отправки видеопакета: {:?}", e);
+                            }
                         }
+                        std::thread::sleep(std::time::Duration::from_micros(60));
                     }
                 }
                 Err(e) => {

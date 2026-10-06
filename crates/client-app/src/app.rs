@@ -15,7 +15,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY,
+    SRCCOPY, SetStretchBltMode, HALFTONE, SetBrushOrgEx,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -171,6 +171,10 @@ fn render_bgra_to_hwnd(
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
+
+        // Включаем качественную интерполяцию HALFTONE для четкого отображения текста и мелких деталей
+        let _ = SetStretchBltMode(hdc, HALFTONE);
+        let _ = SetBrushOrgEx(hdc, 0, 0, None);
 
         let _ = StretchDIBits(
             hdc,
@@ -399,9 +403,17 @@ impl ApplicationHandler for RemoteWardClientApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let mut got_new_frame = false;
+        let mut latest_frame = None;
+        let mut frames_received_this_tick = 0u64;
+
+        // Извлекаем только самый свежий кадр, пропуская устаревшие кадры из очереди!
         while let Ok(frame) = self.frame_rx.try_recv() {
-            self.frames_rendered += 1;
+            frames_received_this_tick += 1;
+            latest_frame = Some(frame);
+        }
+
+        if let Some(frame) = latest_frame {
+            self.frames_rendered += frames_received_this_tick;
 
             let w = frame.width as usize;
             let h = frame.height as usize;
@@ -411,8 +423,13 @@ impl ApplicationHandler for RemoteWardClientApp {
             }
             self.last_frame_size = (frame.width, frame.height);
 
+            // Конвертируем только 1 самый свежий кадр
             nv12_to_bgra(&frame.data, w, h, &mut self.bgra_buffer);
-            got_new_frame = true;
+            self.draw_current_frame();
+
+            if self.frames_rendered == 1 {
+                tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
+            }
 
             if self.last_stats_instant.elapsed() >= Duration::from_secs(1) {
                 let fps = self.frames_rendered;
@@ -424,13 +441,7 @@ impl ApplicationHandler for RemoteWardClientApp {
                     frame.latency_us as f64 / 1000.0
                 );
             }
-        }
 
-        if got_new_frame {
-            if self.frames_rendered == 1 {
-                tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
-            }
-            self.draw_current_frame();
             if let Some(ref window) = self.window {
                 window.request_redraw();
             }
@@ -530,6 +541,7 @@ pub async fn run_client(
         rt.block_on(async move {
             let mut packets_count = 0u64;
             let mut frames_count = 0u64;
+            let mut last_frame_id_opt: Option<u32> = None;
             while is_running_video.load(Ordering::Relaxed) {
                 match video_socket_task.recv_from(&mut buf).await {
                     Ok((len, src)) => {
@@ -547,6 +559,19 @@ pub async fn run_client(
 
                         let datagram = &buf[..len];
                         if let Ok(Some(assembled_frame)) = reassembler.process_packet(datagram) {
+                            if let Some(last_id) = last_frame_id_opt {
+                                if assembled_frame.frame_id > last_id + 1 && !assembled_frame.is_keyframe {
+                                    // Потерян промежуточный кадр по сети! Мгновенно запрашиваем I-кадр для очистки шлейфов и призрачных курсоров
+                                    let req = ControlMessage::RequestKeyframe {
+                                        reason: "frame gap detected".into(),
+                                    };
+                                    if let Ok(req_bytes) = req.to_packet() {
+                                        let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                    }
+                                }
+                            }
+                            last_frame_id_opt = Some(assembled_frame.frame_id);
+
                             frames_count += 1;
                             if frames_count == 1 {
                                 tracing::info!(

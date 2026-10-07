@@ -1,11 +1,23 @@
 use crate::frame::VideoCodec;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyframeReason {
+    Startup,
+    PacketLoss,
+    DecoderReset,
+    StreamChange,
+    UserRequest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_name: String,
     pub client_version: String,
+    pub protocol_version: u32,
+    pub client_token: u64,
     pub supported_codecs: Vec<VideoCodec>,
+    pub preferred_codec: Option<VideoCodec>,
     pub screen_width: u32,
     pub screen_height: u32,
     pub target_fps: u32,
@@ -17,11 +29,12 @@ pub struct ClientHello {
 pub struct ServerHello {
     pub server_name: String,
     pub server_version: String,
+    pub protocol_version: u32,
+    pub session_id: u64,
     pub selected_codec: VideoCodec,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
-    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,15 +43,18 @@ pub enum ControlMessage {
     ServerHello(ServerHello),
     /// Запрос IDR / I-кадра (при потере пакетов или рассинхроне)
     RequestKeyframe {
-        reason: String,
+        session_id: u64,
+        reason: KeyframeReason,
     },
     /// Изменение настроек на лету (битрейт, fps)
     ChangeStreamSettings {
+        session_id: u64,
         target_bitrate_kbps: u32,
         target_fps: u32,
     },
     /// Телеметрия клиента
     ClientStats {
+        session_id: u64,
         rtt_us: u32,
         jitter_us: u32,
         decode_latency_us: u32,
@@ -47,30 +63,36 @@ pub enum ControlMessage {
     },
     /// Завершение сессии
     Disconnect {
+        session_id: u64,
         reason: String,
     },
     /// Пинг для измерения RTT и джиттера
     Ping {
+        session_id: u64,
         sequence: u32,
         send_timestamp_us: u64,
     },
     /// Ответ на пинг
     Pong {
+        session_id: u64,
         sequence: u32,
         send_timestamp_us: u64,
     },
-    /// Калибровочный тестовый пакет для замера пропускной способности
+    /// Калибровочный тестовый пакет для замера пропускной способности (с реальной полезной нагрузкой)
     SpeedProbe {
+        session_id: u64,
         sequence: u32,
         payload_size: u32,
     },
     /// Подтверждение получения тестового пакета
     SpeedProbeAck {
+        session_id: u64,
         sequence: u32,
         payload_size: u32,
     },
     /// Отчет о калибровке сети
     CalibrationReport {
+        session_id: u64,
         min_rtt_us: u32,
         avg_rtt_us: u32,
         jitter_us: u32,
@@ -98,12 +120,15 @@ impl ControlMessage {
         Ok(buf)
     }
 
-    /// Десериализация из сетевой датаграммы с префиксом MSG_TYPE_CONTROL
+    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_CONTROL
     pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
         if packet.first() == Some(&crate::packet::MSG_TYPE_CONTROL) {
             bincode::deserialize(&packet[1..])
         } else {
-            bincode::deserialize(packet)
+            Err(bincode::ErrorKind::Custom(
+                "Пакет не содержит префикс MSG_TYPE_CONTROL".to_string(),
+            )
+            .into())
         }
     }
 }

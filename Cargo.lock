@@ -667,6 +667,7 @@ dependencies = [
  "anyhow",
  "core-protocol",
  "core-transport",
+ "getrandom 0.2.17",
  "host-capture",
  "host-encode",
  "host-input",

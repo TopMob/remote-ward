@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left = 1,
     Right = 2,
@@ -12,7 +12,7 @@ pub enum MouseButton {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ButtonState {
     Released = 0,
     Pressed = 1,
@@ -46,6 +46,44 @@ pub enum InputEvent {
     Gamepad(GamepadState),
 }
 
+/// Сетевой пакет ввода, привязанный к сессии и защищенный от спуфинга
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputPacket {
+    pub session_id: u64,
+    pub sequence: u32,
+    pub event: InputEvent,
+}
+
+impl InputPacket {
+    pub fn new(session_id: u64, sequence: u32, event: InputEvent) -> Self {
+        Self {
+            session_id,
+            sequence,
+            event,
+        }
+    }
+
+    /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_INPUT
+    pub fn to_packet(&self) -> Result<Vec<u8>, bincode::Error> {
+        let mut buf = Vec::with_capacity(40);
+        buf.push(crate::packet::MSG_TYPE_INPUT);
+        bincode::serialize_into(&mut buf, self)?;
+        Ok(buf)
+    }
+
+    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT
+    pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
+        if packet.first() == Some(&crate::packet::MSG_TYPE_INPUT) {
+            bincode::deserialize(&packet[1..])
+        } else {
+            Err(bincode::ErrorKind::Custom(
+                "Пакет не содержит префикс MSG_TYPE_INPUT".to_string(),
+            )
+            .into())
+        }
+    }
+}
+
 impl InputEvent {
     /// Быстрая бинарная сериализация события ввода
     pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
@@ -57,21 +95,10 @@ impl InputEvent {
         bincode::deserialize(bytes)
     }
 
-    /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_INPUT
-    pub fn to_packet(&self) -> Result<Vec<u8>, bincode::Error> {
-        let mut buf = Vec::with_capacity(32);
-        buf.push(crate::packet::MSG_TYPE_INPUT);
-        bincode::serialize_into(&mut buf, self)?;
-        Ok(buf)
-    }
-
-    /// Десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT
-    pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
-        if packet.first() == Some(&crate::packet::MSG_TYPE_INPUT) {
-            bincode::deserialize(&packet[1..])
-        } else {
-            bincode::deserialize(packet)
-        }
+    /// Упаковка события в сетевой пакет с привязкой к сессии
+    pub fn to_packet_with_session(&self, session_id: u64, sequence: u32) -> Result<Vec<u8>, bincode::Error> {
+        let packet = InputPacket::new(session_id, sequence, self.clone());
+        packet.to_packet()
     }
 }
 

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::sync::Mutex;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT,
@@ -16,10 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use core_protocol::{ButtonState, InputEvent, MouseButton};
 use crate::error::InputError;
 
-/// Высокоточный инжектор пользовательского ввода в Windows (DirectInput / RawInput совместимый)
+/// Высокоточный инжектор пользовательского ввода в Windows с отслеживанием зажатых клавиш
 pub struct WindowsInputInjector {
     screen_width: u32,
     screen_height: u32,
+    pressed_keys: Mutex<HashSet<(u16, bool)>>,
+    pressed_mouse_buttons: Mutex<HashSet<MouseButton>>,
 }
 
 impl WindowsInputInjector {
@@ -31,6 +35,8 @@ impl WindowsInputInjector {
         Self {
             screen_width: if screen_width > 0 { screen_width } else { 1920 },
             screen_height: if screen_height > 0 { screen_height } else { 1080 },
+            pressed_keys: Mutex::new(HashSet::new()),
+            pressed_mouse_buttons: Mutex::new(HashSet::new()),
         }
     }
 
@@ -39,6 +45,8 @@ impl WindowsInputInjector {
         Self {
             screen_width: if width > 0 { width } else { 1920 },
             screen_height: if height > 0 { height } else { 1080 },
+            pressed_keys: Mutex::new(HashSet::new()),
+            pressed_mouse_buttons: Mutex::new(HashSet::new()),
         }
     }
 
@@ -84,6 +92,15 @@ impl WindowsInputInjector {
             }
 
             InputEvent::MouseButton { button, state } => {
+                {
+                    let mut held = self.pressed_mouse_buttons.lock().unwrap();
+                    if *state == ButtonState::Pressed {
+                        held.insert(*button);
+                    } else {
+                        held.remove(button);
+                    }
+                }
+
                 let (flags, mouse_data) = match button {
                     MouseButton::Left => (
                         if *state == ButtonState::Pressed {
@@ -189,6 +206,15 @@ impl WindowsInputInjector {
                 is_extended,
                 state,
             } => {
+                {
+                    let mut held = self.pressed_keys.lock().unwrap();
+                    if *state == ButtonState::Pressed {
+                        held.insert((*scan_code, *is_extended));
+                    } else {
+                        held.remove(&(*scan_code, *is_extended));
+                    }
+                }
+
                 let mut flags = KEYEVENTF_SCANCODE;
                 if *is_extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;
@@ -214,7 +240,7 @@ impl WindowsInputInjector {
 
             InputEvent::Gamepad(_gamepad) => {
                 // Геймпад обрабатывается через виртуальный XInput контроллер (ViGEmBus) при наличии драйвера.
-                // В базовой поставке игнорируем без падения.
+                // В базовой поставке игнорируем без ошибки.
                 Ok(())
             }
         }
@@ -235,11 +261,41 @@ impl WindowsInputInjector {
         Ok(())
     }
 
-    /// Экстренный сброс всех зажатых клавиш и кнопок мыши при обрыве соединения или потере фокуса
+    /// Гарантированный сброс всех зажатых клавиш и кнопок мыши при обрыве соединения или завершении сессии
     pub fn release_all(&self) {
-        let mouse_up_flags = [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP];
         let mut inputs = Vec::new();
-        for flag in mouse_up_flags {
+
+        // 1. Отпускаем все зажатые кнопки мыши
+        let held_buttons: Vec<MouseButton> = {
+            let mut guard = self.pressed_mouse_buttons.lock().unwrap();
+            guard.drain().collect()
+        };
+
+        for button in held_buttons {
+            let (flag, data) = match button {
+                MouseButton::Left => (MOUSEEVENTF_LEFTUP, 0),
+                MouseButton::Right => (MOUSEEVENTF_RIGHTUP, 0),
+                MouseButton::Middle => (MOUSEEVENTF_MIDDLEUP, 0),
+                MouseButton::X1 => (MOUSEEVENTF_XUP, XBUTTON1),
+                MouseButton::X2 => (MOUSEEVENTF_XUP, XBUTTON2),
+            };
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: data,
+                        dwFlags: flag,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        // Страховочный сброс базовых кнопок мыши
+        for flag in [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP] {
             inputs.push(INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
@@ -255,10 +311,44 @@ impl WindowsInputInjector {
             });
         }
 
-        // Отпускаем основные модификаторы: LCtrl, RCtrl, LAlt, RAlt, LShift, RShift, LWin, RWin
-        let modifier_scancodes = [0x1D, 0x1D | 0xE000, 0x38, 0x38 | 0xE000, 0x2A, 0x36, 0x5B | 0xE000, 0x5C | 0xE000];
-        for sc in modifier_scancodes {
-            let is_ext = (sc & 0xE000) != 0;
+        // 2. Отпускаем все реально зажатые клавиши
+        let held_keys: Vec<(u16, bool)> = {
+            let mut guard = self.pressed_keys.lock().unwrap();
+            guard.drain().collect()
+        };
+
+        for (scan_code, is_extended) in held_keys {
+            let mut dw_flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+            if is_extended {
+                dw_flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: scan_code,
+                        dwFlags: dw_flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+
+        // Страховочный сброс системных модификаторов: LCtrl, RCtrl, LAlt, RAlt, LShift, RShift, LWin, RWin
+        let modifier_scancodes = [
+            (0x1D, false),
+            (0x1D, true),
+            (0x38, false),
+            (0x38, true),
+            (0x2A, false),
+            (0x36, false),
+            (0x5B, true),
+            (0x5C, true),
+        ];
+
+        for (sc, is_ext) in modifier_scancodes {
             let mut dw_flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
             if is_ext {
                 dw_flags |= KEYEVENTF_EXTENDEDKEY;
@@ -268,7 +358,7 @@ impl WindowsInputInjector {
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
                         wVk: VIRTUAL_KEY(0),
-                        wScan: (sc & 0xFF) as u16,
+                        wScan: sc,
                         dwFlags: dw_flags,
                         time: 0,
                         dwExtraInfo: 0,

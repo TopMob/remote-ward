@@ -1,0 +1,1185 @@
+Да. После просмотра репозитория целиком и ключевых узлов вывод довольно жёсткий:
+
+**сейчас это действительно больше прототип/демо-пайплайн, чем готовая архитектура remote desktop.** Причём проблема не в отдельных мелких багах — несколько фундаментальных решений надо переделать до дальнейшего наращивания функций.
+
+[TopMob/remote-ward на GitHub](https://github.com/TopMob/remote-ward?utm_source=chatgpt.com)
+
+## 🔴 Критично — переделать в первую очередь
+
+### 1. UDP-видеотранспорт фактически не имеет нормальной session/auth модели
+
+`host-server/server.rs`
+
+Сейчас хост принимает **любой UDP-пакет** на video-порту:
+
+```text
+получил пакет → src → записал src как client_endpoint
+```
+
+То есть любой узел в LAN может подменить endpoint.
+
+Ещё хуже: `ClientHello`, `RequestKeyframe`, `ChangeStreamSettings`, `Disconnect` и **InputEvent** также фактически не привязаны к установленной сессии.
+
+Особенно критично:
+
+```text
+MSG_TYPE_INPUT
+→ InputEvent::from_packet()
+→ injector.inject()
+```
+
+Нет проверки:
+
+- кто отправил;
+- установлена ли сессия;
+- является ли это текущим клиентом;
+- nonce/session token;
+- authentication/MAC.
+
+**Исправление:** сначала полноценный session handshake, затем только authenticated packets.
+
+---
+
+### 2. `ClientHello` доверяет клиенту практически полностью
+
+`server.rs`
+
+Клиент сообщает:
+
+```text
+supported_codecs
+screen_width
+screen_height
+target_fps
+video_port
+```
+
+и сервер это принимает.
+
+Причём `preferred_codec` клиента вообще не учитывается.
+
+Сервер делает:
+
+```text
+если HEVC есть → HEVC
+иначе H264
+```
+
+То есть `HostConfig.preferred_codec` фактически игнорируется.
+
+Нужна нормальная negotiation:
+
+```text
+server capabilities
+        ×
+client capabilities
+        ↓
+selected codec
+selected resolution
+selected fps
+selected pixel format
+selected transport
+```
+
+---
+
+### 3. Самая серьёзная архитектурная проблема: WGC callback делает encode + packetize + send
+
+Это находится в `host-server/server.rs` и вызывается из:
+
+`host-capture/wgc.rs`
+
+Фактическая цепочка сейчас:
+
+```text
+WGC callback
+    ↓
+NVENC encode
+    ↓
+Vec<u8>
+    ↓
+packetize_to_datagrams()
+    ↓
+создание Vec<Vec<u8>>
+    ↓
+UDP send_to()
+    ↓
+следующий capture callback
+```
+
+Это **не тот pipeline**, который нужен для low-latency streaming.
+
+При 4K60 ты не хочешь, чтобы callback захвата занимался сетью.
+
+Должно быть:
+
+```text
+WGC
+ ↓
+bounded frame queue
+ ↓
+NVENC
+ ↓
+bounded encoded-frame queue
+ ↓
+packetizer
+ ↓
+UDP sender
+```
+
+И очереди должны быть маленькими.
+
+Например:
+
+```text
+capture queue: 1–2
+encode queue:   1
+network queue:  1–2
+```
+
+При перегрузке надо **выбрасывать старые кадры**, а не ждать их.
+
+---
+
+### 4. Огромная проблема с аллокациями на каждом кадре
+
+Сейчас:
+
+```text
+encoded.data
+ ↓
+packetize_to_datagrams()
+ ↓
+Vec<Vec<u8>>
+ ↓
+каждый packet Vec
+```
+
+Для каждого кадра создаётся куча объектов.
+
+При 4K60 и больших IDR это становится совершенно ненужным allocator pressure.
+
+Нужен потоковый packetizer:
+
+```text
+EncodedFrame
+    ↓
+for each chunk
+    ↓
+один reusable send buffer
+    ↓
+send
+```
+
+Либо небольшой pool буферов.
+
+---
+
+### 5. `FrameReassembler` имеет неправильную модель очистки/порядка кадров
+
+`core-transport/reassembler.rs`
+
+Есть:
+
+```rust
+HashMap<u32, PartialFrame>
+```
+
+и:
+
+```rust
+pending_frames.keys().next()
+```
+
+используется как "самый старый кадр".
+
+Но `HashMap` **не гарантирует порядок**.
+
+То есть комментарий:
+
+> Удаляем самый старый незавершенный кадр
+
+не соответствует коду.
+
+Нужно хранить timestamp/creation order отдельно или использовать подходящую структуру.
+
+---
+
+### 6. `FrameReassembler` уязвим к memory/CPU abuse
+
+Здесь:
+
+```rust
+total_packets <= 4096
+```
+
+Но это всё равно позволяет создать:
+
+```text
+4096 × Vec<Option<Vec<u8>>>
+```
+
+для каждого frame_id.
+
+И до 64 pending frames.
+
+Плюс каждый payload копируется:
+
+```rust
+payload.to_vec()
+```
+
+Это нормально как первый прототип, но **не годится как production transport**.
+
+Нужны:
+
+- жёсткий max frame size;
+- max pending bytes;
+- max pending frames;
+- max frame lifetime;
+- проверка `packet_index`;
+- проверка согласованности metadata;
+- защита от frame-id abuse;
+- желательно buffer pool.
+
+---
+
+## 🔴 7. Самая большая проблема качества изображения: NV12
+
+Сейчас весь pipeline:
+
+```text
+WGC BGRA8
+ ↓
+NVENC
+ ↓
+NV12
+ ↓
+CPU
+ ↓
+NV12 → BGRA
+ ↓
+CPU
+ ↓
+StretchDIBits
+```
+
+Для проекта с целью:
+
+> до 4K  
+> текст без заметных артефактов  
+> 4:4:4
+
+это **архитектурно противоречиво**.
+
+Ты заявляешь 4:4:4, а фактически используешь:
+
+```text
+NV12 = 4:2:0
+```
+
+То есть цветовая информация уже потеряна на encode.
+
+Для обычного видео это нормально.
+
+Для:
+
+- текста;
+- мелких UI элементов;
+- тонких линий;
+- цветных шрифтов;
+
+это заметно.
+
+Если действительно нужен качественный desktop/text mode, надо проектировать отдельный режим:
+
+```text
+BGRA/RGB
+ ↓
+4:4:4-capable codec/profile
+```
+
+или хотя бы отдельно определить:
+
+```text
+Gaming mode → 4:2:0
+Desktop/Text mode → 4:4:4
+```
+
+---
+
+## 🔴 8. Клиент делает CPU NV12 → BGRA на каждом кадре
+
+`client-app/app.rs`
+
+Вот это:
+
+```text
+NV12
+ ↓
+rayon
+ ↓
+CPU conversion
+ ↓
+BGRA buffer
+ ↓
+StretchDIBits
+```
+
+на 4K60 — очень плохое место.
+
+4K кадр:
+
+```text
+3840 × 2160 × 60
+```
+
+и каждый кадр прогоняется через CPU-конвертацию.
+
+Даже с Rayon это огромный bandwidth/CPU workload.
+
+А потом ещё:
+
+```text
+StretchDIBits()
+```
+
+То есть GPU decoding используется, а затем результат снова тащится в CPU.
+
+Это практически убивает смысл GPU decode.
+
+---
+
+# 🔴 9. Renderer надо практически переписать
+
+Сейчас rendering архитектурно:
+
+```text
+MFT
+ ↓
+CPU Vec<u8>
+ ↓
+NV12→BGRA CPU
+ ↓
+GDI
+ ↓
+StretchDIBits
+```
+
+Для нормального remote desktop:
+
+```text
+Network
+ ↓
+hardware decoder
+ ↓
+GPU texture
+ ↓
+GPU colorspace conversion
+ ↓
+GPU scaling
+ ↓
+present
+```
+
+То есть нужен D3D11/D3D12 renderer.
+
+**Это один из компонентов, который я бы не латал — его лучше перепроектировать.**
+
+---
+
+# 🔴 10. Декодер неправильно определяет "hardware decoding"
+
+`decoder.rs`
+
+Комментарий говорит:
+
+> аппаратный декодер
+
+Но код просто делает:
+
+```rust
+CoCreateInstance(CLSID_CMSH264DECODER_MFT)
+```
+
+и выставляет NV12.
+
+Это **не является гарантией hardware acceleration**.
+
+Нужно реально проверить выбранный MFT / D3D11-aware path и организовать GPU surfaces.
+
+Иначе можно получить:
+
+```text
+software MFT
+```
+
+при этом приложение будет считать, что декодирование аппаратное.
+
+---
+
+# 🔴 11. MFStartup/MFShutdown сделаны опасно
+
+В `decoder.rs`:
+
+```rust
+MFStartup(...)
+```
+
+создаётся внутри decoder.
+
+А потом:
+
+```rust
+Drop
+→ MFShutdown()
+```
+
+При этом `is_codec_supported()` тоже делает:
+
+```rust
+MFStartup()
+```
+
+в отдельном thread.
+
+Media Foundation должна иметь нормальный lifecycle уровня процесса/decoder subsystem, а не случайный `Startup/Shutdown` на отдельных объектах.
+
+Это надо вынести в отдельный runtime manager.
+
+---
+
+# 🔴 12. Encoder lifecycle тоже слабый
+
+NVENC сейчас создаётся лениво внутри WGC callback:
+
+```text
+первый frame
+ ↓
+создание NVENC
+```
+
+Это означает, что первый capture callback может надолго зависнуть.
+
+Лучше:
+
+```text
+client negotiation
+ ↓
+создание encoder
+ ↓
+создание pipeline
+ ↓
+start capture
+```
+
+А не инициализация критического оборудования в hot path.
+
+---
+
+# 🔴 13. ABR сейчас практически игрушечный
+
+Это особенно заметно в `server.rs`.
+
+Например:
+
+```text
+loss > 3%
+→ bitrate × 0.85
+```
+
+а ниже:
+
+```text
+max 18 Mbps
+```
+
+и при хорошем соединении:
+
+```text
++1000 kbps
+до 36 Mbps
+```
+
+Это не полноценный congestion controller.
+
+Кроме того:
+
+```text
+6 ping
+6 probe
+```
+
+не являются нормальным bandwidth estimation.
+
+А `SpeedProbe` вообще не передаёт реальные 1200-байтные UDP payloads — это просто маленькое control message с числом:
+
+```text
+payload_size: 1200
+```
+
+То есть "speed test" фактически **не тестирует throughput**.
+
+Это надо удалить/переписать.
+
+---
+
+# 🔴 14. Потери пакетов считаются неправильно
+
+На клиенте:
+
+```text
+frame gap
+```
+
+используется как packet loss.
+
+Но потеря одного UDP packet внутри большого frame может вообще не привести к тому же самому `frame gap`.
+
+Например:
+
+```text
+frame 100:
+packet 0
+packet 1
+packet 3
+packet 4
+```
+
+кадр потерян целиком.
+
+Но frame ID не пропущен.
+
+Следовательно:
+
+```text
+frame loss != packet loss
+```
+
+Нужна отдельная статистика:
+
+```text
+packets_expected
+packets_received
+packets_lost
+frames_completed
+frames_dropped
+frames_late
+```
+
+---
+
+# 🔴 15. Pacer сейчас практически бесполезен
+
+`core-transport/pacer.rs`
+
+Он вычисляет:
+
+```text
+frame interval × 0.6 / packet count
+```
+
+Но в реальном server pipeline этот pacer фактически не является частью полноценного scheduler.
+
+Кроме того, `sleep` между UDP пакетами должен учитывать:
+
+- packet size;
+- target bitrate;
+- текущий send queue;
+- pacing clock;
+- frame deadline;
+- congestion state.
+
+Это надо переделать вместе с transport.
+
+---
+
+# 🔴 16. Timestamp использует SystemTime
+
+В server:
+
+```rust
+SystemTime::now()
+```
+
+Для latency/ordering это неправильно.
+
+Нужна монотонная временная шкала:
+
+```rust
+Instant
+```
+
+или единая session-relative timestamp.
+
+Сейчас в protocol даже комментарий говорит:
+
+```text
+Unix time или монотонный Instant
+```
+
+Это недопустимая неоднозначность для сетевого протокола.
+
+---
+
+# 🔴 17. `frame_id` ограничен u32
+
+При 60 FPS:
+
+```text
+2^32 / 60 ≈ 828 дней
+```
+
+То есть это не ближайшая проблема, но для protocol лучше сразу определить rollover semantics.
+
+Сейчас сравнение:
+
+```rust
+frame_id < latest_completed_frame_id
+```
+
+уже не является корректным при rollover.
+
+---
+
+# 🔴 18. Нет нормальной защиты от stale P-frames
+
+Есть попытка:
+
+```text
+lost frame
+ ↓
+awaiting_clean_keyframe
+ ↓
+request IDR
+```
+
+Это правильное направление.
+
+Но transport должен явно иметь состояние:
+
+```text
+SYNCED
+WAITING_FOR_KEYFRAME
+DECODING
+DISCONNECTED
+```
+
+а не набор флагов вокруг receiver loop.
+
+---
+
+# 🔴 19. Disconnect/reconnect архитектура практически отсутствует
+
+Сейчас:
+
+```text
+Disconnect
+→ endpoint = None
+→ release_all()
+```
+
+Но полноценного:
+
+```text
+session closed
+encoder reset
+decoder reset
+sequence reset
+keyframe synchronization
+reconnect
+```
+
+нет.
+
+Особенно опасно состояние:
+
+```text
+клиент отключился
+→ новый клиент подключился
+→ старый encoder state остался
+```
+
+Это нужно сделать полноценным session lifecycle.
+
+---
+
+# 🔴 20. Input subsystem сильно переоценён комментариями
+
+Например:
+
+> 100% поддержка DirectInput/RawInput в играх
+
+Нет.
+
+Используется:
+
+```text
+SendInput()
+```
+
+Это **не DirectInput / RawInput**.
+
+Игра может:
+
+- игнорировать SendInput;
+- иметь anti-cheat;
+- использовать Raw Input;
+- использовать DirectInput;
+- требовать более низкоуровневый путь.
+
+Поэтому комментарии обещают больше, чем реально реализовано.
+
+---
+
+# 🔴 21. Input mapping неполный
+
+`input_mapper.rs`
+
+Есть базовые клавиши, но полноценного:
+
+```text
+all Windows scan codes
+IME
+layout-independent input
+system keys
+AltGr
+Pause/PrintScreen edge cases
+media keys
+browser keys
+extended scan codes
+```
+
+нет.
+
+Особенно сомнителен:
+
+```text
+NumLock => 0x45 extended
+Pause => 0x45 extended
+```
+
+и некоторые extended flags.
+
+Это нужно делать через полноценную таблицу Windows scan codes, а не ручным набором.
+
+---
+
+# 🔴 22. Нет надёжного pressed-state tracking
+
+Сейчас клиент может отправить:
+
+```text
+KeyDown
+```
+
+потом сеть оборвалась.
+
+Хост должен гарантированно знать, какие keys/buttons сейчас нажаты.
+
+`release_all()` лишь приблизительный emergency reset.
+
+Нужен session-level state:
+
+```text
+pressed keys
+pressed mouse buttons
+gamepad state
+```
+
+и автоматический:
+
+```text
+session lost → release all known pressed inputs
+```
+
+---
+
+# 🟠 Ещё несколько серьёзных вещей
+
+### `ControlMessage` — bincode 1.3 без protocol versioning
+
+Для протокола, который планируется развивать, нужны:
+
+```text
+magic
+version
+message type
+length
+session id
+sequence
+payload
+```
+
+а не просто:
+
+```text
+bincode enum
+```
+
+---
+
+### `from_packet()` принимает два формата
+
+```rust
+if first == MSG_TYPE_CONTROL
+    deserialize(packet[1..])
+else
+    deserialize(packet)
+```
+
+Это плохая идея.
+
+Протокол должен иметь **один формат**.
+
+Иначе появляются неоднозначные пакеты и потенциальные parser confusion bugs.
+
+---
+
+### `reason: String`
+
+Например:
+
+```rust
+RequestKeyframe { reason: String }
+Disconnect { reason: String }
+```
+
+для сетевого control protocol — лишняя динамическая строка.
+
+Лучше enum:
+
+```text
+KeyframeReason::PacketLoss
+KeyframeReason::DecoderReset
+KeyframeReason::Startup
+...
+```
+
+---
+
+### `session_id: "session-001"`
+
+Это просто заглушка.
+
+Для реального session management нужен cryptographically random ID/nonce.
+
+---
+
+### Client использует `UnboundedSender<InputEvent>`
+
+Это потенциально опасно.
+
+Если сеть зависнет, input queue может расти без ограничения.
+
+Для input лучше:
+
+```text
+bounded channel
+```
+
+и специальные правила drop/coalesce.
+
+Например mouse move можно объединять:
+
+```text
+move + move + move
+→ один move
+```
+
+---
+
+# 🟡 Архитектурно слабые места
+
+Сейчас слишком много:
+
+```text
+Arc
+Mutex
+RwLock
+AtomicBool
+AtomicU32
+AtomicU64
+```
+
+Это результат того, что систему собирали постепенно вокруг callback'ов.
+
+Лучше сделать явные ownership boundaries:
+
+```text
+Session
+ ├── Control
+ ├── Capture
+ ├── Encoder
+ ├── VideoTransport
+ ├── Input
+ └── Metrics
+```
+
+Каждый subsystem владеет своим состоянием.
+
+А между ними:
+
+```text
+bounded channels
+```
+
+а не общий `Arc<...>` на всё.
+
+---
+
+# Отдельно: что реально выглядит как "демо-код"
+
+Я бы прямо отметил следующие места как признаки prototype-first разработки:
+
+```text
+session_id = "session-001"
+```
+
+```text
+если HEVC → HEVC
+```
+
+```text
+SpeedProbe { payload_size: 1200 }
+```
+
+при отсутствии реального payload.
+
+```text
+H264 fallback всегда
+```
+
+```text
+Gamepad → Ok(())
+```
+
+```text
+AV1 decoder → false
+```
+
+```text
+4:4:4 заявлен
+```
+
+при фактическом NV12 4:2:0.
+
+```text
+hardware decoder
+```
+
+без гарантии hardware surface.
+
+```text
+WGC → NVENC → UDP прямо в callback
+```
+
+```text
+CPU NV12 → BGRA → GDI
+```
+
+```text
+session-001
+```
+
+и отсутствие authentication.
+
+То есть да — **ощущение у тебя правильное**.
+
+Это не "пара слабых мест". Архитектура сейчас выглядит как **технический прототип, в котором отдельные компоненты демонстрируют возможность работы, но ещё не образуют production-grade remote desktop pipeline**.
+
+---
+
+# Что я бы НЕ делал
+
+Не надо сейчас:
+
+- добавлять звук;
+- добавлять clipboard;
+- добавлять Wake-on-LAN;
+- добавлять виртуальный монитор;
+- добавлять installer;
+- добавлять WAN;
+- добавлять мобильный клиент;
+- улучшать UI.
+
+Пока фундамент такой, это будет просто навешивание функций на неправильную основу.
+
+---
+
+# Что переписать полностью
+
+### 1. `client-app/src/app.rs`
+**Перепроектировать renderer.**
+
+GDI + CPU conversion → D3D11 GPU renderer.
+
+### 2. `client-app/src/decoder.rs`
+**Перепроектировать decoder pipeline.**
+
+MFT → GPU surface → renderer.
+
+### 3. `host-server/src/server.rs`
+**Практически полностью переписать.**
+
+Сейчас здесь смешаны:
+
+```text
+session
+network
+ABR
+capture
+encoder
+packetization
+lifecycle
+```
+
+в одном огромном файле.
+
+### 4. `core-transport`
+**Перепроектировать transport layer.**
+
+Особенно:
+
+```text
+reassembler
+pacing
+loss tracking
+frame deadlines
+```
+
+### 5. `core-protocol`
+**Сделать настоящий versioned protocol.**
+
+---
+
+# Правильная архитектура
+
+Я бы целился примерно в такую:
+
+```text
+                 HOST
+────────────────────────────────────────────
+
+Windows Graphics Capture
+          │
+          ▼
+   Capture Worker
+          │
+          ▼
+   bounded queue (1-2)
+          │
+          ▼
+     NVENC Worker
+          │
+          ▼
+   Encoded Frame
+          │
+          ▼
+     Packetizer
+          │
+          ▼
+    UDP Pacer
+          │
+          ▼
+      NETWORK
+          │
+          ▼
+────────────────────────────────────────────
+                 CLIENT
+
+       UDP Receiver
+          │
+          ▼
+     Packet Tracker
+          │
+          ▼
+     Frame Reassembler
+          │
+          ▼
+    Decoder Queue (1)
+          │
+          ▼
+    Hardware Decoder
+          │
+          ▼
+      GPU Texture
+          │
+          ▼
+    D3D11 Renderer
+          │
+          ▼
+       Present
+```
+
+А параллельно:
+
+```text
+CONTROL CHANNEL
+      │
+      ├── handshake
+      ├── authentication
+      ├── codec negotiation
+      ├── stream config
+      ├── keyframe request
+      ├── telemetry
+      └── disconnect
+```
+
+И отдельно:
+
+```text
+INPUT CHANNEL
+      │
+      ├── keyboard
+      ├── mouse
+      └── gamepad
+```
+
+---
+
+# Приоритет исправлений
+
+Если сделать список **прямо по очереди**, я бы дал агенту такой порядок:
+
+| Приоритет | Работа |
+|---|---|
+| 🔴 P0 | Session/authentication protocol |
+| 🔴 P0 | Убрать encode/network из WGC callback |
+| 🔴 P0 | Новый capture → encode → network pipeline |
+| 🔴 P0 | Новый GPU decoder → GPU renderer |
+| 🔴 P0 | Исправить packet/frame transport |
+| 🔴 P0 | Нормальный packet loss/reorder/deadline tracking |
+| 🔴 P0 | Session lifecycle/reconnect |
+| 🔴 P1 | Codec negotiation |
+| 🔴 P1 | ABR/congestion control |
+| 🔴 P1 | Input state tracking |
+| 🔴 P1 | Полный scan-code mapping |
+| 🟠 P1 | Protocol versioning |
+| 🟠 P1 | Buffer pools / убрать лишние allocations |
+| 🟠 P1 | Нормальные timestamps |
+| 🟠 P1 | Metrics/latency instrumentation |
+| 🟡 P2 | multi-monitor |
+| 🟡 P2 | audio |
+| 🟡 P2 | clipboard |
+| 🟡 P2 | installer |
+| 🟡 P3 | WAN/NAT |
+| 🟡 P3 | virtual monitor |
+
+## Итог
+
+**Да, текущий код я бы не рекомендовал продолжать "чинить по месту".**
+
+Не всё надо выбрасывать: `WGC`, базовая NVENC-интеграция, Rust workspace, Windows input foundation и часть packet structures можно сохранить.
+
+Но **server/transport/client rendering pipeline надо фактически вывести на архитектурный уровень 2.0**.
+
+Самые опасные три вещи сейчас:
+
+> **1. Нет нормальной аутентифицированной сессии.**  
+> **2. Capture callback выполняет слишком много работы.**  
+> **3. Клиент после hardware decode возвращает кадр на CPU и рисует через GDI.**
+
+И именно они, а не какие-нибудь мелкие `unwrap()`, являются причиной, почему этот проект пока нельзя считать серьёзным low-latency remote desktop.
+
+Если дать ИИ-агенту сейчас просто задачу **«исправь найденные баги»**, он, скорее всего, снова начнёт латать текущую архитектуру. Здесь лучше сначала дать ему **жёсткое ТЗ на архитектурный рефакторинг P0/P1**, иначе он будет строить второй этаж на фундаменте прототипа.

@@ -10,6 +10,18 @@ pub enum KeyframeReason {
     UserRequest,
 }
 
+impl std::fmt::Display for KeyframeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Startup => write!(f, "Startup"),
+            Self::PacketLoss => write!(f, "PacketLoss"),
+            Self::DecoderReset => write!(f, "DecoderReset"),
+            Self::StreamChange => write!(f, "StreamChange"),
+            Self::UserRequest => write!(f, "UserRequest"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_name: String,

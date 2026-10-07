@@ -5,8 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
 use core_protocol::{
-    ControlMessage, FramePacketizer, InputEvent, ServerHello, VideoCodec,
+    flags, ControlMessage, DatagramHeader, FramePacketizer, InputPacket, KeyframeReason,
+    ServerHello, VideoCodec, DEFAULT_MAX_PAYLOAD_SIZE, PROTOCOL_VERSION,
 };
+use core_transport::{CongestionConfig, CongestionController};
 use host_capture::WgcCaptureSession;
 use host_encode::NvencEncoder;
 use host_input::WindowsInputInjector;
@@ -33,6 +35,7 @@ impl Default for HostConfig {
 
 pub struct ServerState {
     pub client_endpoint: Arc<RwLock<Option<SocketAddr>>>,
+    pub session_id: Arc<AtomicU64>,
     pub force_keyframe: Arc<AtomicBool>,
     pub selected_codec: Arc<RwLock<VideoCodec>>,
     pub is_running: Arc<AtomicBool>,
@@ -40,6 +43,7 @@ pub struct ServerState {
     pub target_bitrate_kbps: Arc<AtomicU32>,
     pub display_width: Arc<AtomicU32>,
     pub display_height: Arc<AtomicU32>,
+    pub congestion: Arc<RwLock<CongestionController>>,
 }
 
 pub struct RemoteWardHost {
@@ -51,8 +55,13 @@ pub struct RemoteWardHost {
 impl RemoteWardHost {
     pub fn new(config: HostConfig) -> Self {
         let initial_bitrate = config.bitrate_kbps;
+        let mut cc_config = CongestionConfig::default();
+        cc_config.initial_bitrate_kbps = initial_bitrate;
+        let congestion = Arc::new(RwLock::new(CongestionController::new(cc_config)));
+
         let state = Arc::new(ServerState {
             client_endpoint: Arc::new(RwLock::new(None)),
+            session_id: Arc::new(AtomicU64::new(0)),
             force_keyframe: Arc::new(AtomicBool::new(true)),
             selected_codec: Arc::new(RwLock::new(config.preferred_codec)),
             is_running: Arc::new(AtomicBool::new(true)),
@@ -60,6 +69,7 @@ impl RemoteWardHost {
             target_bitrate_kbps: Arc::new(AtomicU32::new(initial_bitrate)),
             display_width: Arc::new(AtomicU32::new(0)),
             display_height: Arc::new(AtomicU32::new(0)),
+            congestion,
         });
 
         let input_injector = Arc::new(WindowsInputInjector::new());

@@ -17,6 +17,7 @@ pub struct CalibrationResult {
 pub async fn run_network_calibration(
     socket: &UdpSocket,
     host_addr: SocketAddr,
+    session_id: u64,
 ) -> CalibrationResult {
     tracing::info!("--- Запуск калибровки сети (RTT, джиттер, пропускная способность) ---");
 
@@ -33,6 +34,7 @@ pub async fn run_network_calibration(
             .as_micros() as u64;
 
         let ping_msg = ControlMessage::Ping {
+            session_id,
             sequence: seq as u32,
             send_timestamp_us: now_us,
         };
@@ -44,10 +46,10 @@ pub async fn run_network_calibration(
                     loop {
                         match socket.recv_from(&mut buf).await {
                             Ok((len, _src)) => {
-                                if let Ok(ControlMessage::Pong { sequence, .. }) =
+                                if let Ok(ControlMessage::Pong { sequence, session_id: pong_sid, .. }) =
                                     ControlMessage::from_packet(&buf[..len])
                                 {
-                                    if sequence == seq as u32 {
+                                    if sequence == seq as u32 && pong_sid == session_id {
                                         return Ok(t0.elapsed());
                                     }
                                 }
@@ -77,6 +79,7 @@ pub async fn run_network_calibration(
     let mut lost_probes = 0;
     for seq in 0..probe_count {
         let probe = ControlMessage::SpeedProbe {
+            session_id,
             sequence: seq as u32,
             payload_size: 1200,
         };
@@ -86,10 +89,10 @@ pub async fn run_network_calibration(
                 loop {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, _src)) => {
-                            if let Ok(ControlMessage::SpeedProbeAck { sequence, .. }) =
+                            if let Ok(ControlMessage::SpeedProbeAck { sequence, session_id: ack_sid, .. }) =
                                 ControlMessage::from_packet(&buf[..len])
                             {
-                                if sequence == seq as u32 {
+                                if sequence == seq as u32 && ack_sid == session_id {
                                     return Ok(());
                                 }
                             }

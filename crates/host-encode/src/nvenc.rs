@@ -138,7 +138,7 @@ impl NvencEncoder {
             VideoCodec::AV1 => NV_ENC_CODEC_AV1_GUID,
         };
 
-        let preset_guid = NV_ENC_PRESET_P4_GUID; // P4 = сбалансированное качество без артефактов и мыла в динамике
+        let preset_guid = NV_ENC_PRESET_P3_GUID; // P3 = оптимальный баланс высокой четкости текста и сверхнизкой задержки
 
         // 3. Получение конфигурации пресета
         let mut preset_config = NV_ENC_PRESET_CONFIG {
@@ -168,7 +168,7 @@ impl NvencEncoder {
             tracing::warn!("GetEncodePresetConfigEx вернул {:?}, используем базовую конфигурацию", status);
         }
 
-        // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, VBV буфер на 4 кадра, IDR только по запросу
+        // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, VBV буфер на 1 кадр, IDR только по запросу
         let mut encode_config = preset_config.presetCfg;
         encode_config.version = NV_ENC_CONFIG_VER;
         encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
@@ -176,25 +176,24 @@ impl NvencEncoder {
         encode_config.gopLength = 0xFFFFFFFF;
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
-        // Rate control: CBR со сбалансированным VBV буфером на 4 кадра (~67 мс при 60 FPS)
-        // Буфер в 4 кадра дает запас битрейта для сложных кадров при резком движении, не задирая QP до предела!
+        // Rate control: CBR со строгим VBV буфером на 1 кадр (~16.6 мс при 60 FPS) для минимальной задержки
         encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         encode_config.rcParams.averageBitRate = bitrate_kbps * 1000;
         encode_config.rcParams.maxBitRate = bitrate_kbps * 1000;
-        let vbv_size = ((bitrate_kbps * 1000) as u64 * 4 / fps.max(1) as u64) as u32;
+        let vbv_size = (bitrate_kbps * 1000) / fps.max(1);
         encode_config.rcParams.vbvBufferSize = vbv_size;
         encode_config.rcParams.vbvInitialDelay = vbv_size;
         encode_config.rcParams.set_zeroReorderDelay(1); // Нулевая задержка переупорядочивания
         encode_config.rcParams.set_strictGOPTarget(0);
 
-        // Двухпроходное кодирование четверти разрешения (Two-Pass Quarter Resolution)
-        // Предварительно оценивает векторы движения в сцене без задержки
-        encode_config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+        // Отключаем двухпроходное кодирование, чтобы устранить задержку вычислений на GPU
+        encode_config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
 
-        // Аппаратное адаптивное квантование: Spatial AQ (текст и контуры) + Temporal AQ (движение)
+        // Аппаратное адаптивное квантование: Spatial AQ (четкость текста и контуров без задержки!)
+        // Temporal AQ отключен: устраняет конвейерный буфер lookahead
         encode_config.rcParams.set_enableAQ(1);
         encode_config.rcParams.set_aqStrength(7);
-        encode_config.rcParams.set_enableTemporalAQ(1);
+        encode_config.rcParams.set_enableTemporalAQ(0);
 
         // Ограничение максимального QP, чтобы P-кадры не распадались на макроблоки и пиксели в динамике
         encode_config.rcParams.maxQP = NV_ENC_QP {
@@ -318,7 +317,7 @@ impl NvencEncoder {
         self.encode_config.rcParams.averageBitRate = new_bitrate_kbps * 1000;
         self.encode_config.rcParams.maxBitRate = new_bitrate_kbps * 1000;
         let effective_fps = if self.fps > 0 { self.fps } else { 60 };
-        let vbv_size = ((new_bitrate_kbps * 1000) as u64 * 4 / effective_fps.max(1) as u64) as u32;
+        let vbv_size = (new_bitrate_kbps * 1000) / effective_fps.max(1);
         self.encode_config.rcParams.vbvBufferSize = vbv_size;
         self.encode_config.rcParams.vbvInitialDelay = vbv_size;
 

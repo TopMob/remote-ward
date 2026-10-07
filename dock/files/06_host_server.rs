@@ -24,7 +24,7 @@ impl Default for HostConfig {
         Self {
             video_port: 48000,
             control_port: 48001,
-            bitrate_kbps: 45_000, // 45 Мбит/с для кристально четкого качества текста и динамики в 1440p
+            bitrate_kbps: 35_000, // 35 Мбит/с для идеальной четкости 1440p без забивания буферов роутера (bufferbloat)
             fps: 60,
             preferred_codec: VideoCodec::H264, // H.264 по умолчанию для гарантированной аппаратной совместимости
         }
@@ -262,8 +262,8 @@ impl RemoteWardHost {
                                     } => {
                                         let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
                                         if packet_loss_rate > 0.03 {
-                                            // Снижаем битрейт не ниже 20 Мбит/с (на 1440p ниже 20 Мбит/с изображение сильно мылит)
-                                            let new_bitrate = ((current_bitrate as f32 * 0.85) as u32).max(20_000);
+                                            // Снижаем битрейт не ниже 18 Мбит/с
+                                            let new_bitrate = ((current_bitrate as f32 * 0.85) as u32).max(18_000);
                                             if new_bitrate < current_bitrate {
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::warn!(
@@ -277,10 +277,22 @@ impl RemoteWardHost {
                                             if packet_loss_rate > 0.06 {
                                                 state.force_keyframe.store(true, Ordering::SeqCst);
                                             }
-                                        } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 30.0 {
-                                            let max_bitrate = 55_000;
+                                        } else if rtt_us > 35_000 && current_bitrate > 24_000 {
+                                            // Предотвращение Bufferbloat в роутере: если пинг вырос > 35 мс, плавно сбавляем битрейт
+                                            let new_bitrate = (current_bitrate.saturating_sub(2_000)).max(18_000);
+                                            if new_bitrate < current_bitrate {
+                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
+                                                tracing::info!(
+                                                    "[ABR Адаптация] Зафиксирован рост задержки (RTT {:.1} мс, bufferbloat). Снижаем битрейт: {} -> {} кбит/с",
+                                                    rtt_us as f32 / 1000.0,
+                                                    current_bitrate,
+                                                    new_bitrate
+                                                );
+                                            }
+                                        } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 25.0 && rtt_us > 0 {
+                                            let max_bitrate = 42_000;
                                             if current_bitrate < max_bitrate {
-                                                let new_bitrate = (current_bitrate + 1_500).min(max_bitrate);
+                                                let new_bitrate = (current_bitrate + 1_000).min(max_bitrate);
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::info!(
                                                     "[ABR Адаптация] Сеть стабильна (loss 0.0%, RTT {:.1} мс). Повышаем битрейт: {} -> {} кбит/с",

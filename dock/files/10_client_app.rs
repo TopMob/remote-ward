@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -52,6 +52,7 @@ pub struct RemoteWardClientApp {
     input_tx: mpsc::UnboundedSender<InputEvent>,
     frame_rx: mpsc::Receiver<DecodedFrame>,
     is_running: Arc<AtomicBool>,
+    current_rtt_us: Arc<AtomicU32>,
     cursor_grabbed: bool,
     frames_rendered: u64,
     last_stats_instant: Instant,
@@ -220,6 +221,7 @@ impl RemoteWardClientApp {
         input_tx: mpsc::UnboundedSender<InputEvent>,
         frame_rx: mpsc::Receiver<DecodedFrame>,
         is_running: Arc<AtomicBool>,
+        current_rtt_us: Arc<AtomicU32>,
     ) -> Self {
         Self {
             config,
@@ -227,6 +229,7 @@ impl RemoteWardClientApp {
             input_tx,
             frame_rx,
             is_running,
+            current_rtt_us,
             cursor_grabbed: true,
             frames_rendered: 0,
             last_stats_instant: Instant::now(),
@@ -460,7 +463,10 @@ impl ApplicationHandler for RemoteWardClientApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Минимальное время ожидания: опрашиваем цикл событий каждые 1 мс, чтобы кадры выводились мгновенно
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
+
         let mut latest_frame = None;
         let mut frames_received_this_tick = 0u64;
 
@@ -493,15 +499,17 @@ impl ApplicationHandler for RemoteWardClientApp {
                 self.frames_rendered = 0;
                 self.last_stats_instant = Instant::now();
                 let decode_ms = frame.latency_us as f64 / 1000.0;
+                let rtt_ms = self.current_rtt_us.load(Ordering::Relaxed) as f32 / 1000.0;
                 tracing::info!(
-                    "Клиент отображает видеопоток: {} FPS | Задержка декодирования кадра: {:.2} мс",
+                    "Клиент отображает видеопоток: {} FPS | RTT: {:.1} мс | Задержка декодирования кадра: {:.2} мс",
                     fps,
+                    rtt_ms,
                     decode_ms
                 );
                 if let Some(ref window) = self.window {
                     window.set_title(&format!(
-                        "Remote-Ward Client | {}x{} @ {} FPS | Декод: {:.1} мс",
-                        w, h, fps, decode_ms
+                        "Remote-Ward Client | {}x{} @ {} FPS | RTT: {:.1} мс | Декод: {:.1} мс",
+                        w, h, fps, rtt_ms, decode_ms
                     ));
                 }
             }
@@ -522,6 +530,7 @@ pub async fn run_client(
     tracing::info!("============================================================");
 
     let is_running = Arc::new(AtomicBool::new(true));
+    let current_rtt_us = Arc::new(AtomicU32::new(0));
 
     // 1. Создаем сокет для отправки управления и ввода
     let control_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -554,8 +563,8 @@ pub async fn run_client(
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 2 для минимальной задержки)
     let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(2);
-    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 32 кадра для защиты от сброса при всплесках)
-    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(32);
+    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 3 кадра для устранения накопления очереди)
+    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(3);
 
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
     let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr).await;
@@ -600,6 +609,7 @@ pub async fn run_client(
     // Фоновая задача приема управляющих сообщений (ServerHello, Pong)
     let is_running_ctrl_rx = Arc::clone(&is_running);
     let ctrl_socket_rx = Arc::clone(&control_socket);
+    let current_rtt_rx = Arc::clone(&current_rtt_us);
     tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         while is_running_ctrl_rx.load(Ordering::Relaxed) {
@@ -620,6 +630,7 @@ pub async fn run_client(
                                     .unwrap_or_default()
                                     .as_micros() as u64;
                                 let rtt_us = now_us.saturating_sub(send_timestamp_us) as u32;
+                                current_rtt_rx.store(rtt_us, Ordering::Relaxed);
                                 tracing::trace!("Активный RTT: {:.2} мс", rtt_us as f32 / 1000.0);
                             }
                             _ => {}
@@ -689,7 +700,20 @@ pub async fn run_client(
 
             while is_running_decoder.load(Ordering::Relaxed) {
                 match raw_frame_rx.blocking_recv() {
-                    Some(assembled_frame) => {
+                    Some(mut assembled_frame) => {
+                        // Оптимизация задержки: если в очереди скопились кадры,
+                        // мгновенно подтягиваем контекст или переходим к свежему Keyframe, не создавая задержки
+                        while let Ok(next_frame) = raw_frame_rx.try_recv() {
+                            if next_frame.is_keyframe {
+                                assembled_frame = next_frame;
+                            } else {
+                                if let Some(ref mut decoder) = decoder_opt {
+                                    let _ = decoder.decode(&assembled_frame.data);
+                                }
+                                assembled_frame = next_frame;
+                            }
+                        }
+
                         frames_count += 1;
                         if frames_count == 1 {
                             tracing::info!(
@@ -733,6 +757,7 @@ pub async fn run_client(
     let is_running_video = Arc::clone(&is_running);
     let video_socket_task = Arc::clone(&video_socket);
     let ctrl_socket_task = Arc::clone(&control_socket);
+    let current_rtt_stats = Arc::clone(&current_rtt_us);
 
     std::thread::Builder::new()
         .name("video-receiver".into())
@@ -764,7 +789,7 @@ pub async fn run_client(
                             0.0
                         };
                         let stats = ControlMessage::ClientStats {
-                            rtt_us: 0,
+                            rtt_us: current_rtt_stats.load(Ordering::Relaxed),
                             jitter_us: 0,
                             decode_latency_us: 0,
                             render_latency_us: 0,
@@ -851,7 +876,7 @@ pub async fn run_client(
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                         tracing::warn!("Очередь декодера переполнена! Пропущен P-кадр #{}, запрашиваем IDR", frame_id);
                                         awaiting_clean_keyframe = true;
-                                        if last_idr_request.elapsed() >= Duration::from_millis(300) {
+                                        if last_idr_request.elapsed() >= Duration::from_millis(200) {
                                             let req = ControlMessage::RequestKeyframe {
                                                 reason: "decoder queue overflow".into(),
                                             };
@@ -876,9 +901,15 @@ pub async fn run_client(
 
     // 7. Запуск оконного цикла событий Winit
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2)));
+    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
-    let mut app = RemoteWardClientApp::new(config, input_tx, frame_rx, Arc::clone(&is_running));
+    let mut app = RemoteWardClientApp::new(
+        config,
+        input_tx,
+        frame_rx,
+        Arc::clone(&is_running),
+        Arc::clone(&current_rtt_us),
+    );
     event_loop.run_app(&mut app)?;
 
     is_running.store(false, Ordering::Relaxed);

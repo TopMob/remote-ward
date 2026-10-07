@@ -15,7 +15,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY, SetStretchBltMode, HALFTONE, SetBrushOrgEx,
+    SRCCOPY, SetStretchBltMode, HALFTONE, COLORONCOLOR, SetBrushOrgEx,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -184,9 +184,15 @@ fn render_bgra_to_hwnd(
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
-        // Включаем качественную интерполяцию HALFTONE для максимальной четкости текста
-        let _ = SetStretchBltMode(hdc, HALFTONE);
-        let _ = SetBrushOrgEx(hdc, 0, 0, None);
+        // Для 1:1 попиксельного отображения используем COLORONCOLOR (без растра и шума),
+        // а при масштабировании — качественную интерполяцию HALFTONE
+        let blt_mode = if target_w == width as i32 && target_h == height as i32 {
+            COLORONCOLOR
+        } else {
+            let _ = SetBrushOrgEx(hdc, 0, 0, None);
+            HALFTONE
+        };
+        let _ = SetStretchBltMode(hdc, blt_mode);
 
         let _ = StretchDIBits(
             hdc,
@@ -548,8 +554,8 @@ pub async fn run_client(
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
     // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 2 для минимальной задержки)
     let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(2);
-    // Канал для передачи собранных кадров из сетевого потока в поток декодера
-    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(2);
+    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 32 кадра для защиты от сброса при всплесках)
+    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(32);
 
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
     let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr).await;
@@ -742,7 +748,7 @@ pub async fn run_client(
             rt.block_on(async move {
                 let mut packets_count = 0u64;
                 let mut last_frame_id_opt: Option<u32> = None;
-                let mut packets_in_window = 0u32;
+                let mut frames_in_window = 0u32;
                 let mut gaps_in_window = 0u32;
                 let mut last_stats_sent = Instant::now();
                 let mut awaiting_clean_keyframe = false;
@@ -751,9 +757,9 @@ pub async fn run_client(
                 while is_running_video.load(Ordering::Relaxed) {
                     // Периодическая отправка статистики потерь пакетов хосту (каждые 1 сек)
                     if last_stats_sent.elapsed() >= Duration::from_millis(1000) {
-                        let total = packets_in_window + gaps_in_window;
-                        let loss_rate = if total > 0 {
-                            gaps_in_window as f32 / total as f32
+                        let total_frames = frames_in_window + gaps_in_window;
+                        let loss_rate = if total_frames >= 10 {
+                            gaps_in_window as f32 / total_frames as f32
                         } else {
                             0.0
                         };
@@ -767,7 +773,7 @@ pub async fn run_client(
                         if let Ok(bytes) = stats.to_packet() {
                             let _ = ctrl_socket_task.send_to(&bytes, host_ctrl_addr).await;
                         }
-                        packets_in_window = 0;
+                        frames_in_window = 0;
                         gaps_in_window = 0;
                         last_stats_sent = Instant::now();
                     }
@@ -782,7 +788,6 @@ pub async fn run_client(
                             }
 
                             packets_count += 1;
-                            packets_in_window += 1;
                             if packets_count == 1 {
                                 tracing::info!(
                                     "Первый видеопакет успешно получен от {} ({} байт)!",
@@ -835,10 +840,29 @@ pub async fn run_client(
                                     continue;
                                 }
 
-                                last_frame_id_opt = Some(assembled_frame.frame_id);
+                                frames_in_window += 1;
+                                let frame_id = assembled_frame.frame_id;
 
-                                // Передаем кадр в поток декодера (не блокируя сетевой сокет)
-                                let _ = raw_frame_tx.try_send(assembled_frame);
+                                // Передаем кадр в поток декодера (при переполнении запрашиваем чистый IDR, не допуская артефактов)
+                                match raw_frame_tx.try_send(assembled_frame) {
+                                    Ok(()) => {
+                                        last_frame_id_opt = Some(frame_id);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::warn!("Очередь декодера переполнена! Пропущен P-кадр #{}, запрашиваем IDR", frame_id);
+                                        awaiting_clean_keyframe = true;
+                                        if last_idr_request.elapsed() >= Duration::from_millis(300) {
+                                            let req = ControlMessage::RequestKeyframe {
+                                                reason: "decoder queue overflow".into(),
+                                            };
+                                            if let Ok(req_bytes) = req.to_packet() {
+                                                let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                            }
+                                            last_idr_request = Instant::now();
+                                        }
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
                         }
                         Err(e) => {

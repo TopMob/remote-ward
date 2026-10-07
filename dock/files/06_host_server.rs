@@ -24,7 +24,7 @@ impl Default for HostConfig {
         Self {
             video_port: 48000,
             control_port: 48001,
-            bitrate_kbps: 35_000, // 35 Мбит/с для кристально четкого качества текста и графики в 1440p
+            bitrate_kbps: 45_000, // 45 Мбит/с для кристально четкого качества текста и динамики в 1440p
             fps: 60,
             preferred_codec: VideoCodec::H264, // H.264 по умолчанию для гарантированной аппаратной совместимости
         }
@@ -261,8 +261,9 @@ impl RemoteWardHost {
                                         packet_loss_rate,
                                     } => {
                                         let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
-                                        if packet_loss_rate > 0.02 {
-                                            let new_bitrate = ((current_bitrate as f32 * 0.8) as u32).max(6_000);
+                                        if packet_loss_rate > 0.03 {
+                                            // Снижаем битрейт не ниже 20 Мбит/с (на 1440p ниже 20 Мбит/с изображение сильно мылит)
+                                            let new_bitrate = ((current_bitrate as f32 * 0.85) as u32).max(20_000);
                                             if new_bitrate < current_bitrate {
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::warn!(
@@ -273,11 +274,11 @@ impl RemoteWardHost {
                                                     new_bitrate
                                                 );
                                             }
-                                            if packet_loss_rate > 0.05 {
+                                            if packet_loss_rate > 0.06 {
                                                 state.force_keyframe.store(true, Ordering::SeqCst);
                                             }
                                         } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 30.0 {
-                                            let max_bitrate = 45_000;
+                                            let max_bitrate = 55_000;
                                             if current_bitrate < max_bitrate {
                                                 let new_bitrate = (current_bitrate + 1_500).min(max_bitrate);
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);

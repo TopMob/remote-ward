@@ -185,6 +185,7 @@ impl NvencEncoder {
         encode_config.rcParams.vbvInitialDelay = vbv_size;
         encode_config.rcParams.set_zeroReorderDelay(1); // Нулевая задержка переупорядочивания
         encode_config.rcParams.set_strictGOPTarget(0);
+        encode_config.rcParams.lowDelayKeyFrameScale = 1; // Ограничивает размер IDR ключевого кадра, устраняя 200 КБ залпы пакетов!
 
         // Отключаем двухпроходное кодирование, чтобы устранить задержку вычислений на GPU
         encode_config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
@@ -320,6 +321,7 @@ impl NvencEncoder {
         let vbv_size = (new_bitrate_kbps * 1000) / effective_fps.max(1);
         self.encode_config.rcParams.vbvBufferSize = vbv_size;
         self.encode_config.rcParams.vbvInitialDelay = vbv_size;
+        self.encode_config.rcParams.lowDelayKeyFrameScale = 1;
 
         let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
             version: NV_ENC_RECONFIGURE_PARAMS_VER,

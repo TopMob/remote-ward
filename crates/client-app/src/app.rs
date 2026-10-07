@@ -15,7 +15,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY, SetStretchBltMode, HALFTONE, COLORONCOLOR, SetBrushOrgEx,
+    SRCCOPY, SetStretchBltMode, COLORONCOLOR,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -185,15 +185,10 @@ fn render_bgra_to_hwnd(
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
 
-        // Для 1:1 попиксельного отображения используем COLORONCOLOR (без растра и шума),
-        // а при масштабировании — качественную интерполяцию HALFTONE
-        let blt_mode = if target_w == width as i32 && target_h == height as i32 {
-            COLORONCOLOR
-        } else {
-            let _ = SetBrushOrgEx(hdc, 0, 0, None);
-            HALFTONE
-        };
-        let _ = SetStretchBltMode(hdc, blt_mode);
+        // Используем COLORONCOLOR для мгновенного аппаратного масштабирования (<1 мс).
+        // Режим HALFTONE блокировал поток рендера на 40-70 мс на кадр при несовпадении разрешений,
+        // что приводило к падению до 15-20 FPS на ноутбуке!
+        let _ = SetStretchBltMode(hdc, COLORONCOLOR);
 
         let _ = StretchDIBits(
             hdc,

@@ -143,11 +143,11 @@ pub async fn run_network_calibration(
     let jitter_ms = jitter.as_secs_f64() * 1000.0;
 
     let (connection_class, target_bitrate_kbps) = if avg_rtt_ms < 3.0 && packet_loss_rate < 0.02 {
-        ("Прямой LAN кабель / Wi-Fi 6 (Сверхнизкая задержка)", 42_000)
+        ("Прямой LAN кабель / Wi-Fi 6 (Сверхнизкая задержка)", 30_000)
     } else if avg_rtt_ms < 8.0 && packet_loss_rate < 0.05 {
-        ("Качественный Wi-Fi 5GHz (Низкая задержка)", 32_000)
+        ("Качественный Wi-Fi 5GHz (Низкая задержка)", 24_000)
     } else if avg_rtt_ms < 20.0 && packet_loss_rate < 0.12 {
-        ("Стандартный Wi-Fi (Средняя дальность / Стены)", 20_000)
+        ("Стандартный Wi-Fi (Средняя дальность / Стены)", 18_000)
     } else {
         ("Нестабильный Wi-Fi / Высокие помехи", 12_000)
     };

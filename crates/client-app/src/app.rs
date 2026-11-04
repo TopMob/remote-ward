@@ -54,8 +54,9 @@ pub struct RemoteWardClientApp {
     frame_rx: mpsc::Receiver<DecodedFrame>,
     is_running: Arc<AtomicBool>,
     current_rtt_us: Arc<AtomicU32>,
+    current_monitor_shared: Arc<AtomicU32>,
+    last_monitor_switch: Instant,
     cursor_grabbed: bool,
-    current_monitor_idx: u32,
     local_cursor_enabled: bool,
     frames_rendered: u64,
     last_stats_instant: Instant,
@@ -223,6 +224,7 @@ impl RemoteWardClientApp {
         frame_rx: mpsc::Receiver<DecodedFrame>,
         is_running: Arc<AtomicBool>,
         current_rtt_us: Arc<AtomicU32>,
+        current_monitor_shared: Arc<AtomicU32>,
     ) -> Self {
         Self {
             config,
@@ -232,8 +234,9 @@ impl RemoteWardClientApp {
             frame_rx,
             is_running,
             current_rtt_us,
+            current_monitor_shared,
+            last_monitor_switch: Instant::now() - Duration::from_secs(1),
             cursor_grabbed: true,
-            current_monitor_idx: 0,
             local_cursor_enabled: false,
             frames_rendered: 0,
             last_stats_instant: Instant::now(),
@@ -387,11 +390,17 @@ impl ApplicationHandler for RemoteWardClientApp {
                 if let PhysicalKey::Code(key_code) = key_event.physical_key {
                     // F8: Переключение активного монитора хоста на лету
                     if key_code == winit::keyboard::KeyCode::F8 && key_event.state == ElementState::Pressed {
-                        self.current_monitor_idx = (self.current_monitor_idx + 1) % 4;
-                        tracing::info!("F8: Запрос переключения на монитор хоста #{}", self.current_monitor_idx);
+                        if self.last_monitor_switch.elapsed() < Duration::from_millis(300) {
+                            tracing::debug!("F8: Игнорируем дребезг переключения (cooldown 300 мс)");
+                            return;
+                        }
+                        self.last_monitor_switch = Instant::now();
+                        let next_idx = self.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
+                        self.current_monitor_shared.store(next_idx, Ordering::Relaxed);
+                        tracing::info!("F8: Запрос переключения на следующий монитор хоста (#{})", next_idx);
                         let _ = self.control_tx.send(ControlMessage::SwitchMonitor {
                             session_id: 1,
-                            monitor_index: self.current_monitor_idx,
+                            monitor_index: next_idx,
                         });
                         return;
                     }
@@ -668,6 +677,10 @@ pub async fn run_client(
     // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 4 кадра)
     let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(4);
 
+    let current_monitor_shared = Arc::new(AtomicU32::new(0));
+    let current_monitor_shared_ctrl = Arc::clone(&current_monitor_shared);
+    let current_monitor_shared_app = Arc::clone(&current_monitor_shared);
+
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
     let session_id = 1u64;
     let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id).await;
@@ -741,6 +754,7 @@ pub async fn run_client(
                                     "Хост переключил трансляцию на монитор #{}: разрешение {}x{}",
                                     monitor_index, width, height
                                 );
+                                current_monitor_shared_ctrl.store(monitor_index, Ordering::Relaxed);
                             }
                             ControlMessage::Pong { sequence: _, send_timestamp_us, .. } => {
                                 let now_us = SystemTime::now()
@@ -845,11 +859,29 @@ pub async fn run_client(
                                 Ok(None) => {}
                                 Err(e) => {
                                     tracing::warn!(
-                                        "Ошибка декодирования кадра #{}: {:?}",
+                                        "Ошибка декодирования кадра #{}: {:?}. Авто-восстановление...",
                                         assembled_frame.frame_id,
                                         e
                                     );
+                                    // Если декодер споткнулся (например, смена монитора/энкодера), пересоздаем его на ключевом кадре
+                                    if assembled_frame.is_keyframe {
+                                        if let Ok(mut new_dec) = MftVideoDecoder::new(width, height, effective_codec) {
+                                            if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
+                                                let _ = frame_tx_decoder.try_send(decoded);
+                                            }
+                                            *decoder = new_dec;
+                                            tracing::info!("MFT декодер успешно пересоздан и восстановил видеопоток!");
+                                        }
+                                    }
                                 }
+                            }
+                        } else if assembled_frame.is_keyframe {
+                            if let Ok(mut new_dec) = MftVideoDecoder::new(width, height, effective_codec) {
+                                if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
+                                    let _ = frame_tx_decoder.try_send(decoded);
+                                }
+                                decoder_opt = Some(new_dec);
+                                tracing::info!("MFT декодер успешно инициализирован на ключевом кадре!");
                             }
                         }
                     }
@@ -1039,6 +1071,7 @@ pub async fn run_client(
         frame_rx,
         Arc::clone(&is_running),
         Arc::clone(&current_rtt_us),
+        current_monitor_shared_app,
     );
     event_loop.run_app(&mut app)?;
 

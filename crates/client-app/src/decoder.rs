@@ -5,7 +5,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, IMFSample, IMFTransform, MFT_OUTPUT_DATA_BUFFER,
     MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
     MFMediaType_Video, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFT_MESSAGE_COMMAND_FLUSH,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -153,8 +153,23 @@ impl MftVideoDecoder {
         self.codec
     }
 
+    /// Очистка внутренних очередей MFT декодера (например, при смене монитора или энкодера)
+    pub fn flush(&mut self) {
+        unsafe {
+            let _ = self.decoder.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        }
+    }
+
     /// Извлечение декодированного кадра из MFT
     fn pull_output(&mut self, t0: Instant) -> Result<Option<DecodedFrame>, DecodeError> {
+        self.pull_output_attempts(t0, 0)
+    }
+
+    fn pull_output_attempts(&mut self, t0: Instant, attempts: usize) -> Result<Option<DecodedFrame>, DecodeError> {
+        if attempts >= 3 {
+            return Ok(None);
+        }
+
         let stream_info = unsafe {
             self.decoder.GetOutputStreamInfo(self.output_stream_id)?
         };
@@ -204,7 +219,7 @@ impl MftVideoDecoder {
                     output_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
                     self.decoder.SetOutputType(self.output_stream_id, &output_type, 0)?;
                 }
-                return self.pull_output(t0);
+                return self.pull_output_attempts(t0, attempts + 1);
             }
             if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
@@ -270,7 +285,19 @@ impl MftVideoDecoder {
         // 2. Отправляем входной образец в MFT декодер
         let input_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
         if let Err(e) = input_res {
-            return Err(DecodeError::ProcessInputFailed(format!("{:?}", e)));
+            // Если декодер вернул ошибку (например, MF_E_NOTACCEPTING), откачиваем ожидающие кадры и пробуем снова
+            let _ = self.pull_output(t0);
+            let retry_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
+            if let Err(retry_err) = retry_res {
+                self.flush();
+                let last_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
+                if let Err(last_err) = last_res {
+                    return Err(DecodeError::ProcessInputFailed(format!(
+                        "{:?} (after retry: {:?}, initial: {:?})",
+                        last_err, retry_err, e
+                    )));
+                }
+            }
         }
 
         // 3. Получаем выходной декодированный кадр

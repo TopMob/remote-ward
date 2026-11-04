@@ -409,8 +409,14 @@ impl RemoteWardHost {
                                     }
 
                                     ControlMessage::SwitchMonitor { monitor_index, .. } => {
-                                        tracing::info!("Клиент запросил переключение на монитор #{}", monitor_index);
-                                        state.target_monitor_index.store(monitor_index, Ordering::SeqCst);
+                                        let monitors = WgcCaptureSession::enumerate_monitors().unwrap_or_default();
+                                        let count = if monitors.is_empty() { 1 } else { monitors.len() as u32 };
+                                        let actual_index = monitor_index % count;
+                                        tracing::info!(
+                                            "Клиент запросил переключение монитора: индекс {} (всего мониторов: {}) -> выбор: #{}",
+                                            monitor_index, count, actual_index
+                                        );
+                                        state.target_monitor_index.store(actual_index, Ordering::SeqCst);
                                         state.force_keyframe.store(true, Ordering::SeqCst);
                                     }
 
@@ -700,6 +706,13 @@ impl RemoteWardHost {
                         // Сбрасываем старый энкодер NVENC, так как новая сессия захвата монитора
                         // может использовать другой контекст или ID3D11Device
                         *supervisor_encoder.lock().unwrap() = None;
+
+                        // Даем 50 мс для полного завершения потока WGC и освобождения ресурсов GPU
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+
+                        // Проверяем актуальный целевой монитор после паузы (на случай серии нажатий)
+                        let target_monitor = supervisor_state.target_monitor_index.load(Ordering::Relaxed);
+                        let target_cursor = supervisor_state.local_cursor_enabled.load(Ordering::Relaxed);
 
                         let on_frame_new = Arc::clone(&on_frame);
                         match WgcCaptureSession::start_monitor(

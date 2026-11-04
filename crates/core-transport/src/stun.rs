@@ -152,7 +152,7 @@ pub async fn discover_public_endpoint(socket: &UdpSocket) -> Option<StunResult> 
             return Some(res);
         }
     }
-    tracing::warn!("[WAN NAT] Не удалось определить публичный адрес через STUN");
+    tracing::info!("[WAN NAT] Публичный STUN-адрес не определен (активен режим локальной сети LAN)");
     None
 }
 

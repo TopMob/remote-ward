@@ -1102,17 +1102,12 @@ async fn spawn_streaming_pipeline(
     let is_running_input = Arc::clone(&is_running);
     let ctrl_socket_input = Arc::clone(&control_socket);
     tokio::spawn(async move {
-        let mut input_sequence = 0u32;
-        while is_running_input.load(Ordering::Relaxed) {
-            match input_rx.recv().await {
-                Some(event) => {
-                    input_sequence = input_sequence.wrapping_add(1);
-                    let packet = core_protocol::InputPacket::new(session_id, input_sequence, event);
-                    if let Ok(bytes) = packet.to_packet() {
-                        let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
-                    }
-                }
-                None => break,
+        while let Some(event) = input_rx.recv().await {
+            if !is_running_input.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Ok(bytes) = event.to_packet() {
+                let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
             }
         }
     });

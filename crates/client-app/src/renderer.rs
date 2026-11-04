@@ -63,8 +63,7 @@ VSOutput main(uint id : SV_VertexID) {
 }
 "#;
 
-// Пиксельный шейдер для аппаратного преобразования NV12 -> RGB с калиброванным цветом (BT.709 Studio Range)
-// Использует чистое высокоточное сэмплирование без искусственного шарпенинга, чтобы не усиливать артефакты макроблоков и рябь
+// Пиксельный шейдер для аппаратного преобразования NV12 -> RGB с адаптивной резкостью текста (CAS)
 const PS_NV12_HLSL: &str = r#"
 Texture2D<float>  texY  : register(t0);
 Texture2D<float2> texUV : register(t1);
@@ -76,7 +75,21 @@ struct VSOutput {
 };
 
 float4 main(VSOutput input) : SV_Target {
-    float y = texY.Sample(samp, input.uv);
+    float2 texSize;
+    texY.GetDimensions(texSize.x, texSize.y);
+    float2 px = 1.0 / texSize;
+
+    float yCenter = texY.Sample(samp, input.uv);
+    float yUp     = texY.Sample(samp, input.uv + float2(0.0, -px.y));
+    float yDown   = texY.Sample(samp, input.uv + float2(0.0,  px.y));
+    float yLeft   = texY.Sample(samp, input.uv + float2(-px.x, 0.0));
+    float yRight  = texY.Sample(samp, input.uv + float2( px.x, 0.0));
+
+    // Адаптивная резкость (Contrast Adaptive Sharpening) для кристально четкого текста при даунскейле (1440p -> 1080p)
+    float yAvg = (yUp + yDown + yLeft + yRight) * 0.25;
+    float yDelta = yCenter - yAvg;
+    float y = clamp(yCenter + yDelta * 0.55, 0.0, 1.0);
+
     float2 uv = texUV.Sample(samp, input.uv);
     float u = uv.x - 0.5;
     float v = uv.y - 0.5;

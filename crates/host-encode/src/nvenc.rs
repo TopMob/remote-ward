@@ -27,6 +27,7 @@ pub struct NvencEncoder {
     _lib: Library,
     fn_list: NV_ENCODE_API_FUNCTION_LIST,
     encoder_ptr: *mut c_void,
+    device_ptr: *mut c_void,
     width: u32,
     height: u32,
     fps: u32,
@@ -68,6 +69,10 @@ unsafe impl Sync for NvencEncoder {}
 impl NvencEncoder {
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    pub fn device_ptr(&self) -> *mut c_void {
+        self.device_ptr
     }
 
     pub fn new(
@@ -180,39 +185,38 @@ impl NvencEncoder {
         encode_config.gopLength = 0xFFFFFFFF;
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
-        // Rate control: CBR с гибким VBV буфером (2.5 кадра) для сохранения четкости при резких поворотах
+        // Rate control: CBR с гибким VBV буфером (2 кадра) для сохранения четкости без размытия
         encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         let avg_bitrate = bitrate_kbps * 1000;
         encode_config.rcParams.averageBitRate = avg_bitrate;
-        encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.25) as u32; // +25% пиковый запас битрейта для динамики
+        encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.5) as u32; // +50% запас для резких поворотов
         let frame_bits = avg_bitrate / fps.max(1);
-        let vbv_size = (frame_bits as f64 * 2.5) as u32; // 2.5 кадра буфера устраняют размытие при резкой смене сцены
+        let vbv_size = frame_bits * 2;
         encode_config.rcParams.vbvBufferSize = vbv_size;
         encode_config.rcParams.vbvInitialDelay = vbv_size;
         encode_config.rcParams.set_zeroReorderDelay(1); // Нулевая задержка переупорядочивания
         encode_config.rcParams.set_strictGOPTarget(0);
-        encode_config.rcParams.lowDelayKeyFrameScale = 1; // Ограничивает размер IDR ключевого кадра, устраняя 200 КБ залпы пакетов!
 
         // Отключаем двухпроходное кодирование, чтобы устранить задержку вычислений на GPU
         encode_config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
 
-        // Аппаратное адаптивное квантование: Spatial AQ (сила 5 — идеальный баланс четкости текста и стабильности градиентов)
+        // Аппаратное адаптивное квантование: Spatial AQ (сила 4 — четкий текст и линии)
         encode_config.rcParams.set_enableAQ(1);
-        encode_config.rcParams.set_aqStrength(5);
+        encode_config.rcParams.set_aqStrength(4);
         encode_config.rcParams.set_enableTemporalAQ(0);
 
-        // Ограничение максимального QP: жесткий пол качества (QP 27), энкодер не сможет размывать картинку ниже этого уровня
+        // Ограничение максимального QP: жесткий пол качества (QP 28), исключающий сильное размытие
         encode_config.rcParams.maxQP = NV_ENC_QP {
-            qpInterP: 27,
-            qpInterB: 27,
-            qpIntra: 24,
+            qpInterP: 28,
+            qpInterB: 28,
+            qpIntra: 22,
         };
         encode_config.rcParams.set_enableMaxQP(1);
 
         encode_config.rcParams.minQP = NV_ENC_QP {
-            qpInterP: 8,
-            qpInterB: 8,
-            qpIntra: 8,
+            qpInterP: 10,
+            qpInterB: 10,
+            qpIntra: 10,
         };
         encode_config.rcParams.set_enableMinQP(1);
 
@@ -225,9 +229,9 @@ impl NvencEncoder {
                 h264.idrPeriod = 0xFFFFFFFF;
                 h264.maxNumRefFrames = 1;
 
-                // Включаем Intra-Refresh (Gradual Decoder Refresh) для устранения всплесков битрейта IDR-кадров
-                h264.intraRefreshPeriod = fps.max(30); // Цикл обновления раз в 1 секунду
-                h264.intraRefreshCnt = (fps / 2).max(15); // Размазываем обновление на 0.5 сек
+                // Отключаем Intra-Refresh: он вызывал полосу смазывания в динамике
+                h264.intraRefreshPeriod = 0;
+                h264.intraRefreshCnt = 0;
 
                 h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
                 h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
@@ -242,9 +246,9 @@ impl NvencEncoder {
                 hevc.idrPeriod = 0xFFFFFFFF;
                 hevc.maxNumRefFramesInDPB = 1;
 
-                // Включаем Intra-Refresh для HEVC
-                hevc.intraRefreshPeriod = fps.max(30);
-                hevc.intraRefreshCnt = (fps / 2).max(15);
+                // Отключаем Intra-Refresh для HEVC
+                hevc.intraRefreshPeriod = 0;
+                hevc.intraRefreshCnt = 0;
 
                 hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
                 hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
@@ -312,6 +316,7 @@ impl NvencEncoder {
             _lib: lib,
             fn_list,
             encoder_ptr,
+            device_ptr,
             width,
             height,
             fps,
@@ -332,13 +337,13 @@ impl NvencEncoder {
 
         let avg_bitrate = new_bitrate_kbps * 1000;
         self.encode_config.rcParams.averageBitRate = avg_bitrate;
-        self.encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.25) as u32;
+        self.encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.5) as u32;
         let effective_fps = if self.fps > 0 { self.fps } else { 60 };
         let frame_bits = avg_bitrate / effective_fps.max(1);
-        let vbv_size = (frame_bits as f64 * 2.5) as u32;
+        let vbv_size = frame_bits * 2;
         self.encode_config.rcParams.vbvBufferSize = vbv_size;
         self.encode_config.rcParams.vbvInitialDelay = vbv_size;
-        self.encode_config.rcParams.lowDelayKeyFrameScale = 1;
+        self.encode_config.rcParams.lowDelayKeyFrameScale = 0;
 
         let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
             version: NV_ENC_RECONFIGURE_PARAMS_VER,
@@ -410,14 +415,38 @@ impl NvencEncoder {
             })?;
 
             let status = unsafe { reg_fn(self.encoder_ptr, &mut register_resource) };
-            if status != NVENCSTATUS::NV_ENC_SUCCESS {
-                return Err(EncodeError::ProcessInputFailed(format!(
-                    "Ошибка регистрации текстуры: {:?}",
-                    status
-                )));
+            let handle = if status == NVENCSTATUS::NV_ENC_SUCCESS {
+                register_resource.registeredResource
+            } else {
+                // Если NVENC вернул ошибку (например, текстура сменилась), сбрасываем старый кэш
+                if let Some(unreg_fn) = self.fn_list.nvEncUnregisterResource {
+                    for (_, h) in self.registered_resources.drain() {
+                        unsafe {
+                            let _ = unreg_fn(self.encoder_ptr, h);
+                        }
+                    }
+                }
+                let retry_status = unsafe { reg_fn(self.encoder_ptr, &mut register_resource) };
+                if retry_status != NVENCSTATUS::NV_ENC_SUCCESS {
+                    return Err(EncodeError::ProcessInputFailed(format!(
+                        "Ошибка регистрации текстуры: {:?}",
+                        retry_status
+                    )));
+                }
+                register_resource.registeredResource
+            };
+
+            // Ограничиваем размер кэша дескрипторов (размер пула WGC обычно 2-4)
+            if self.registered_resources.len() >= 8 {
+                if let Some(unreg_fn) = self.fn_list.nvEncUnregisterResource {
+                    for (_, h) in self.registered_resources.drain() {
+                        unsafe {
+                            let _ = unreg_fn(self.encoder_ptr, h);
+                        }
+                    }
+                }
             }
 
-            let handle = register_resource.registeredResource;
             self.registered_resources.insert(ptr_key, handle);
             handle
         };

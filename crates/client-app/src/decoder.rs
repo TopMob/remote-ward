@@ -185,7 +185,17 @@ impl MftVideoDecoder {
 
         if let Err(e) = output_res {
             if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
-                // Декодер определил формат потока (SPS/PPS). Обновляем тип вывода на NV12
+                // Декодер определил формат потока (SPS/PPS). Обновляем разрешение и тип вывода на NV12
+                if let Ok(avail_type) = unsafe { self.decoder.GetOutputAvailableType(self.output_stream_id, 0) } {
+                    if let Ok(new_size) = unsafe { avail_type.GetUINT64(&MF_MT_FRAME_SIZE) } {
+                        let w = (new_size >> 32) as u32;
+                        let h = (new_size & 0xFFFFFFFF) as u32;
+                        if w > 0 && h > 0 {
+                            self.width = w;
+                            self.height = h;
+                        }
+                    }
+                }
                 let output_type: IMFMediaType = unsafe { MFCreateMediaType()? };
                 let frame_size = ((self.width as u64) << 32) | (self.height as u64);
                 unsafe {

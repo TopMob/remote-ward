@@ -125,6 +125,8 @@ pub struct D3D11Renderer {
     pub tearing_supported: bool,
     width: u32,
     height: u32,
+    tex_w: u32,
+    tex_h: u32,
 }
 
 impl D3D11Renderer {
@@ -246,6 +248,8 @@ impl D3D11Renderer {
             tearing_supported: allow_tearing,
             width: initial_w,
             height: initial_h,
+            tex_w: 0,
+            tex_h: 0,
         })
     }
 
@@ -284,7 +288,7 @@ impl D3D11Renderer {
         let (y_plane, uv_plane) = nv12_data.split_at(y_size);
 
         // Пересоздаем GPU-текстуры если разрешение изменилось
-        if self.tex_y.is_none() || self.width != frame_w || self.height != frame_h {
+        if self.tex_y.is_none() || self.tex_w != frame_w || self.tex_h != frame_h {
             self.create_nv12_textures(frame_w, frame_h)?;
         }
 
@@ -348,7 +352,7 @@ impl D3D11Renderer {
             return Ok(());
         }
 
-        if self.tex_bgra.is_none() || self.width != frame_w || self.height != frame_h {
+        if self.tex_bgra.is_none() || self.tex_w != frame_w || self.tex_h != frame_h {
             self.create_bgra_texture(frame_w, frame_h)?;
         }
 
@@ -473,6 +477,8 @@ impl D3D11Renderer {
             self.srv_y = srv_y;
             self.tex_uv = Some(tex_uv);
             self.srv_uv = srv_uv;
+            self.tex_w = w;
+            self.tex_h = h;
         }
         Ok(())
     }
@@ -500,6 +506,8 @@ impl D3D11Renderer {
 
             self.tex_bgra = Some(tex);
             self.srv_bgra = srv;
+            self.tex_w = w;
+            self.tex_h = h;
         }
         Ok(())
     }

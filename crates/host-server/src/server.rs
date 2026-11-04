@@ -483,6 +483,7 @@ impl RemoteWardHost {
         let last_bitrate_lock = Arc::new(std::sync::Mutex::new(bitrate_kbps));
 
         let encoder_clone = Arc::clone(&encoder_lock);
+        let supervisor_encoder = Arc::clone(&encoder_lock);
         let last_codec_clone = Arc::clone(&last_codec_lock);
         let last_bitrate_clone = Arc::clone(&last_bitrate_lock);
         let sender_tx_capture = sender_tx.clone();
@@ -530,9 +531,9 @@ impl RemoteWardHost {
             let mut last_bitrate_guard = last_bitrate_clone.lock().unwrap();
             let current_target_bitrate = state_capture.target_bitrate_kbps.load(Ordering::Relaxed);
 
-            // Инициализация или переинициализация энкодера при смене разрешения/первом кадре
+            // Инициализация или переинициализация энкодера при смене разрешения/смене устройства D3D11/первом кадре
             let need_reinit = match enc_guard.as_ref() {
-                Some(enc) => enc.dimensions() != (width, height),
+                Some(enc) => enc.dimensions() != (width, height) || enc.device_ptr() != device_raw,
                 None => true,
             };
 
@@ -696,6 +697,9 @@ impl RemoteWardHost {
                             current_monitor, target_monitor, current_cursor, target_cursor
                         );
                         capture_session.stop();
+                        // Сбрасываем старый энкодер NVENC, так как новая сессия захвата монитора
+                        // может использовать другой контекст или ID3D11Device
+                        *supervisor_encoder.lock().unwrap() = None;
 
                         let on_frame_new = Arc::clone(&on_frame);
                         match WgcCaptureSession::start_monitor(

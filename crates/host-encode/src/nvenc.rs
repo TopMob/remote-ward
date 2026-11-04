@@ -66,6 +66,10 @@ unsafe impl Sync for NvencEncoder {}
 
 
 impl NvencEncoder {
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub fn new(
         device: &ID3D11Device,
         width: u32,
@@ -138,7 +142,7 @@ impl NvencEncoder {
             VideoCodec::AV1 => NV_ENC_CODEC_AV1_GUID,
         };
 
-        let preset_guid = NV_ENC_PRESET_P3_GUID; // P3 = оптимальный баланс высокой четкости текста и сверхнизкой задержки
+        let preset_guid = NV_ENC_PRESET_P4_GUID; // P4 = оптимальный пресет высокой четкости динамики и низкого инпут-лага (<0.2 мс)
 
         // 3. Получение конфигурации пресета
         let mut preset_config = NV_ENC_PRESET_CONFIG {
@@ -176,11 +180,13 @@ impl NvencEncoder {
         encode_config.gopLength = 0xFFFFFFFF;
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
-        // Rate control: CBR со строгим VBV буфером на 1 кадр (~16.6 мс при 60 FPS) для минимальной задержки
+        // Rate control: CBR с гибким VBV буфером (2.5 кадра) для сохранения четкости при резких поворотах
         encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-        encode_config.rcParams.averageBitRate = bitrate_kbps * 1000;
-        encode_config.rcParams.maxBitRate = bitrate_kbps * 1000;
-        let vbv_size = (bitrate_kbps * 1000) / fps.max(1);
+        let avg_bitrate = bitrate_kbps * 1000;
+        encode_config.rcParams.averageBitRate = avg_bitrate;
+        encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.25) as u32; // +25% пиковый запас битрейта для динамики
+        let frame_bits = avg_bitrate / fps.max(1);
+        let vbv_size = (frame_bits as f64 * 2.5) as u32; // 2.5 кадра буфера устраняют размытие при резкой смене сцены
         encode_config.rcParams.vbvBufferSize = vbv_size;
         encode_config.rcParams.vbvInitialDelay = vbv_size;
         encode_config.rcParams.set_zeroReorderDelay(1); // Нулевая задержка переупорядочивания
@@ -190,17 +196,16 @@ impl NvencEncoder {
         // Отключаем двухпроходное кодирование, чтобы устранить задержку вычислений на GPU
         encode_config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
 
-        // Аппаратное адаптивное квантование: Spatial AQ (четкость текста и контуров без задержки!)
-        // Temporal AQ отключен: устраняет конвейерный буфер lookahead
+        // Аппаратное адаптивное квантование: Spatial AQ (сила 5 — идеальный баланс четкости текста и стабильности градиентов)
         encode_config.rcParams.set_enableAQ(1);
-        encode_config.rcParams.set_aqStrength(7);
+        encode_config.rcParams.set_aqStrength(5);
         encode_config.rcParams.set_enableTemporalAQ(0);
 
-        // Ограничение максимального QP, чтобы P-кадры не распадались на макроблоки и пиксели в динамике
+        // Ограничение максимального QP: жесткий пол качества (QP 27), энкодер не сможет размывать картинку ниже этого уровня
         encode_config.rcParams.maxQP = NV_ENC_QP {
-            qpInterP: 32,
-            qpInterB: 32,
-            qpIntra: 28,
+            qpInterP: 27,
+            qpInterB: 27,
+            qpIntra: 24,
         };
         encode_config.rcParams.set_enableMaxQP(1);
 
@@ -325,10 +330,12 @@ impl NvencEncoder {
             EncodeError::MediaTypeConfigFailed("nvEncReconfigureEncoder отсутствует".into())
         })?;
 
-        self.encode_config.rcParams.averageBitRate = new_bitrate_kbps * 1000;
-        self.encode_config.rcParams.maxBitRate = new_bitrate_kbps * 1000;
+        let avg_bitrate = new_bitrate_kbps * 1000;
+        self.encode_config.rcParams.averageBitRate = avg_bitrate;
+        self.encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.25) as u32;
         let effective_fps = if self.fps > 0 { self.fps } else { 60 };
-        let vbv_size = (new_bitrate_kbps * 1000) / effective_fps.max(1);
+        let frame_bits = avg_bitrate / effective_fps.max(1);
+        let vbv_size = (frame_bits as f64 * 2.5) as u32;
         self.encode_config.rcParams.vbvBufferSize = vbv_size;
         self.encode_config.rcParams.vbvInitialDelay = vbv_size;
         self.encode_config.rcParams.lowDelayKeyFrameScale = 1;

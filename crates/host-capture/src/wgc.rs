@@ -1,8 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use windows_capture::{
-    capture::{Context, GraphicsCaptureApiHandler},
+    capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
     monitor::Monitor,
@@ -22,12 +20,10 @@ pub type OnFrameCallback = Arc<
 
 struct WgcFlags {
     callback: OnFrameCallback,
-    stop_signal: Arc<AtomicBool>,
 }
 
 struct WgcCaptureHandler {
     callback: OnFrameCallback,
-    stop_signal: Arc<AtomicBool>,
 }
 
 impl GraphicsCaptureApiHandler for WgcCaptureHandler {
@@ -37,20 +33,14 @@ impl GraphicsCaptureApiHandler for WgcCaptureHandler {
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             callback: ctx.flags.callback,
-            stop_signal: ctx.flags.stop_signal,
         })
     }
 
     fn on_frame_arrived(
         &mut self,
         frame: &mut Frame,
-        capture_control: InternalCaptureControl,
+        _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        if self.stop_signal.load(Ordering::Relaxed) {
-            capture_control.stop();
-            return Ok(());
-        }
-
         let width = frame.width();
         let height = frame.height();
         let texture_raw: *mut std::ffi::c_void =
@@ -72,13 +62,25 @@ impl GraphicsCaptureApiHandler for WgcCaptureHandler {
 
 /// Управляемая сессия аппаратного захвата экрана через Windows Graphics Capture (WGC)
 pub struct WgcCaptureSession {
-    stop_signal: Arc<AtomicBool>,
-    thread_handle: Option<JoinHandle<Result<(), CaptureError>>>,
+    capture_control: Option<CaptureControl<WgcCaptureHandler, Box<dyn std::error::Error + Send + Sync>>>,
     pub width: u32,
     pub height: u32,
 }
 
 impl WgcCaptureSession {
+    /// Получить список всех доступных мониторов системы (индекс, ширина, высота)
+    pub fn enumerate_monitors() -> Result<Vec<(usize, u32, u32)>, CaptureError> {
+        let monitors = Monitor::enumerate()
+            .map_err(|e| CaptureError::InitializationFailed(format!("Ошибка перечисления мониторов: {:?}", e)))?;
+        let mut result = Vec::new();
+        for (i, m) in monitors.into_iter().enumerate() {
+            let w = m.width().unwrap_or(1920);
+            let h = m.height().unwrap_or(1080);
+            result.push((i, w, h));
+        }
+        Ok(result)
+    }
+
     /// Запуск сессии захвата основного дисплея с передачей каждого готового GPU кадра в колбэк
     pub fn start<F>(callback: F) -> Result<Self, CaptureError>
     where
@@ -87,23 +89,48 @@ impl WgcCaptureSession {
             + Sync
             + 'static,
     {
-        let primary_monitor = Monitor::primary()
-            .map_err(|e| CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e)))?;
+        Self::start_monitor(0, true, callback)
+    }
 
-        let width = primary_monitor
+    /// Запуск сессии захвата конкретного монитора с выбором захвата курсора
+    pub fn start_monitor<F>(monitor_index: usize, with_cursor: bool, callback: F) -> Result<Self, CaptureError>
+    where
+        F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let all_monitors = Monitor::enumerate().ok();
+        let monitor = if let Some(ref list) = all_monitors {
+            if monitor_index < list.len() {
+                list[monitor_index].clone()
+            } else {
+                Monitor::primary()
+                    .map_err(|e| CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e)))?
+            }
+        } else {
+            Monitor::primary()
+                .map_err(|e| CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e)))?
+        };
+
+        let width = monitor
             .width()
             .map_err(|e| CaptureError::InitializationFailed(format!("Ширина монитора: {:?}", e)))?;
-        let height = primary_monitor
+        let height = monitor
             .height()
             .map_err(|e| CaptureError::InitializationFailed(format!("Высота монитора: {:?}", e)))?;
 
-        let stop_signal = Arc::new(AtomicBool::new(false));
-        let stop_signal_clone = Arc::clone(&stop_signal);
         let cb_arc: OnFrameCallback = Arc::new(callback);
 
+        let cursor_setting = if with_cursor {
+            CursorCaptureSettings::WithCursor
+        } else {
+            CursorCaptureSettings::WithoutCursor
+        };
+
         let settings = Settings::new(
-            primary_monitor,
-            CursorCaptureSettings::WithCursor,
+            monitor,
+            cursor_setting,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
@@ -111,21 +138,14 @@ impl WgcCaptureSession {
             ColorFormat::Bgra8,
             WgcFlags {
                 callback: cb_arc,
-                stop_signal: stop_signal_clone,
             },
         );
 
-        let thread_handle = thread::spawn(move || {
-            let res = WgcCaptureHandler::start(settings);
-            if let Err(ref e) = res {
-                eprintln!("[WGC ERROR]: {:?}", e);
-            }
-            res.map_err(|e| CaptureError::AcquireFailed(format!("Ошибка WGC: {:?}", e)))
-        });
+        let capture_control = WgcCaptureHandler::start_free_threaded(settings)
+            .map_err(|e| CaptureError::InitializationFailed(format!("Ошибка старта WGC: {:?}", e)))?;
 
         Ok(Self {
-            stop_signal,
-            thread_handle: Some(thread_handle),
+            capture_control: Some(capture_control),
             width,
             height,
         })
@@ -133,9 +153,8 @@ impl WgcCaptureSession {
 
     /// Остановка сессии захвата
     pub fn stop(&mut self) {
-        self.stop_signal.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
+        if let Some(control) = self.capture_control.take() {
+            let _ = control.stop();
         }
     }
 }

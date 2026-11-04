@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
 use core_protocol::{
@@ -42,6 +42,8 @@ pub struct ServerState {
     pub target_bitrate_kbps: Arc<AtomicU32>,
     pub display_width: Arc<AtomicU32>,
     pub display_height: Arc<AtomicU32>,
+    pub target_monitor_index: Arc<AtomicU32>,
+    pub local_cursor_enabled: Arc<AtomicBool>,
     pub congestion: Arc<RwLock<CongestionController>>,
 }
 
@@ -68,6 +70,8 @@ impl RemoteWardHost {
             target_bitrate_kbps: Arc::new(AtomicU32::new(initial_bitrate)),
             display_width: Arc::new(AtomicU32::new(0)),
             display_height: Arc::new(AtomicU32::new(0)),
+            target_monitor_index: Arc::new(AtomicU32::new(0)),
+            local_cursor_enabled: Arc::new(AtomicBool::new(false)),
             congestion,
         });
 
@@ -146,7 +150,7 @@ impl RemoteWardHost {
         let paced_sender = Arc::new(PacedSender::new(Arc::clone(&video_socket), self.config.fps));
 
         // Фоновая задача обработки управляющих сообщений и ввода
-        let control_task = {
+        let _control_task = {
             let socket = Arc::clone(&control_socket);
             let state = Arc::clone(&self.state);
             let injector = Arc::clone(&self.input_injector);
@@ -361,6 +365,17 @@ impl RemoteWardHost {
                                         }
                                     }
 
+                                    ControlMessage::SwitchMonitor { monitor_index, .. } => {
+                                        tracing::info!("Клиент запросил переключение на монитор #{}", monitor_index);
+                                        state.target_monitor_index.store(monitor_index, Ordering::SeqCst);
+                                        state.force_keyframe.store(true, Ordering::SeqCst);
+                                    }
+
+                                    ControlMessage::SetLocalCursor { enabled, .. } => {
+                                        tracing::info!("Клиент установил локальный аппаратный курсор (0 мс задержки): {}", enabled);
+                                        state.local_cursor_enabled.store(enabled, Ordering::SeqCst);
+                                    }
+
                                     ControlMessage::Disconnect { reason, .. } => {
                                         tracing::info!("Клиент отключился: {}", reason);
                                         let mut endpoint = state.client_endpoint.write().unwrap();
@@ -381,7 +396,6 @@ impl RemoteWardHost {
         };
 
         // 3. Запуск конвейера захвата и кодирования кадров
-        let state_capture = Arc::clone(&self.state);
         let fps = self.config.fps;
         let bitrate_kbps = self.config.bitrate_kbps;
 
@@ -421,7 +435,7 @@ impl RemoteWardHost {
             })
             .unwrap();
 
-        let encoder_lock = Arc::new(std::sync::Mutex::new(None));
+        let encoder_lock: Arc<std::sync::Mutex<Option<NvencEncoder>>> = Arc::new(std::sync::Mutex::new(None));
         let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::H264));
         let last_bitrate_lock = Arc::new(std::sync::Mutex::new(bitrate_kbps));
 
@@ -430,22 +444,64 @@ impl RemoteWardHost {
         let last_bitrate_clone = Arc::clone(&last_bitrate_lock);
         let sender_tx_capture = sender_tx.clone();
 
-        // Поток захвата кадров WGC
-        let capture_session = WgcCaptureSession::start(move |texture_raw, device_raw, width, height| {
+        // 4. Запуск фонового захвата системного звука Windows (WASAPI Loopback)
+        let state_audio = Arc::clone(&self.state);
+        let video_socket_audio = Arc::clone(&video_socket);
+        let mut audio_seq = 0u32;
+
+        let _audio_capture = crate::audio_capture::WasapiAudioCapture::start(move |pcm_data, timestamp_us| {
+            if let Some(target_addr) = *state_audio.client_endpoint.read().unwrap() {
+                if pcm_data.is_empty() {
+                    return;
+                }
+                audio_seq = audio_seq.wrapping_add(1);
+
+                let mut packet = Vec::with_capacity(core_protocol::DatagramHeader::SIZE + pcm_data.len());
+                let header = core_protocol::DatagramHeader::new(
+                    1,
+                    core_protocol::ChannelId::AudioHostToClient,
+                    0,
+                    audio_seq,
+                    0,
+                    1,
+                    timestamp_us,
+                    pcm_data.len() as u16,
+                );
+                packet.extend_from_slice(header.as_bytes());
+                packet.extend_from_slice(pcm_data);
+
+                let _ = video_socket_audio.send_to(&packet, target_addr);
+            }
+        });
+
+        // 4. Пайплайн захвата экрана (WGC) и кодирования (NVENC)
+        let state_capture = Arc::clone(&self.state);
+        let on_frame: Arc<
+            dyn Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+                + Send
+                + Sync,
+        > = Arc::new(move |texture_raw, device_raw, width, height| {
             let mut enc_guard = encoder_clone.lock().unwrap();
             let mut last_codec_guard = last_codec_clone.lock().unwrap();
             let mut last_bitrate_guard = last_bitrate_clone.lock().unwrap();
             let current_target_bitrate = state_capture.target_bitrate_kbps.load(Ordering::Relaxed);
 
-            // Ленивая инициализация энкодера на GPU при первом кадре
-            if enc_guard.is_none() {
-                tracing::info!("Первый кадр WGC: {}x{}. Инициализация энкодера GPU...", width, height);
+            // Инициализация или переинициализация энкодера при смене разрешения/первом кадре
+            let need_reinit = match enc_guard.as_ref() {
+                Some(enc) => enc.dimensions() != (width, height),
+                None => true,
+            };
+
+            if need_reinit {
+                tracing::info!("(Пере)инициализация энкодера GPU для разрешения {}x{}...", width, height);
                 let codec = *state_capture.selected_codec.read().unwrap();
                 *last_codec_guard = codec;
                 match NvencEncoder::new_from_raw_device(device_raw, width, height, fps, current_target_bitrate, codec) {
                     Ok(enc) => {
                         *enc_guard = Some(enc);
                         *last_bitrate_guard = current_target_bitrate;
+                        state_capture.display_width.store(width, Ordering::Relaxed);
+                        state_capture.display_height.store(height, Ordering::Relaxed);
                         let _ = init_tx.try_send((width, height));
                         tracing::info!(
                             "Аппаратный энкодер NVENC успешно привязан к текстурам WGC: {}x{} @ {} FPS (битрейт: {} кбит/с)",
@@ -541,13 +597,25 @@ impl RemoteWardHost {
             }
 
             Ok(())
-        })?;
+        });
+
+        // Запуск начальной сессии захвата WGC
+        let initial_monitor = self.state.target_monitor_index.load(Ordering::Relaxed);
+        let initial_cursor = self.state.local_cursor_enabled.load(Ordering::Relaxed);
+        let on_frame_start = Arc::clone(&on_frame);
+
+        let mut capture_session = WgcCaptureSession::start_monitor(
+            initial_monitor as usize,
+            !initial_cursor,
+            move |tex, dev, w, h| on_frame_start(tex, dev, w, h),
+        )?;
 
         self.state.display_width.store(capture_session.width, Ordering::Relaxed);
         self.state.display_height.store(capture_session.height, Ordering::Relaxed);
 
         tracing::info!(
-            "Сессия захвата экрана запущена: разрешение дисплея {}x{}",
+            "Сессия захвата экрана запущена (монитор #{}): разрешение дисплея {}x{}",
+            initial_monitor,
             capture_session.width,
             capture_session.height
         );
@@ -556,12 +624,85 @@ impl RemoteWardHost {
             tracing::info!("Пайплайн WGC -> NVENC активен ({}x{})", w, h);
         }
 
-        // Ожидаем завершения или сигнала прерывания
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Получен сигнал завершения (Ctrl+C). Остановка сервера...");
+        // Цикл наблюдения за переключением мониторов и изменением параметров курсора
+        let mut current_monitor = initial_monitor;
+        let mut current_cursor = initial_cursor;
+        let supervisor_state = Arc::clone(&self.state);
+        let control_socket_ack = Arc::clone(&control_socket);
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Получен сигнал завершения (Ctrl+C). Остановка сервера...");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if !supervisor_state.is_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let target_monitor = supervisor_state.target_monitor_index.load(Ordering::Relaxed);
+                    let target_cursor = supervisor_state.local_cursor_enabled.load(Ordering::Relaxed);
+
+                    if target_monitor != current_monitor || target_cursor != current_cursor {
+                        tracing::info!(
+                            "Динамическое переключение источника захвата: монитор #{} -> #{}, аппаратный курсор клиента: {} -> {}",
+                            current_monitor, target_monitor, current_cursor, target_cursor
+                        );
+                        capture_session.stop();
+
+                        let on_frame_new = Arc::clone(&on_frame);
+                        match WgcCaptureSession::start_monitor(
+                            target_monitor as usize,
+                            !target_cursor,
+                            move |tex, dev, w, h| on_frame_new(tex, dev, w, h),
+                        ) {
+                            Ok(new_session) => {
+                                supervisor_state.display_width.store(new_session.width, Ordering::Relaxed);
+                                supervisor_state.display_height.store(new_session.height, Ordering::Relaxed);
+                                current_monitor = target_monitor;
+                                current_cursor = target_cursor;
+                                supervisor_state.force_keyframe.store(true, Ordering::SeqCst);
+                                tracing::info!(
+                                    "Захват успешно переключен на монитор #{}: {}x{}",
+                                    target_monitor, new_session.width, new_session.height
+                                );
+
+                                // Отправляем подтверждение клиенту о новом мониторе и его разрешении
+                                let client_target = *supervisor_state.client_endpoint.read().unwrap();
+                                if let Some(target_addr) = client_target {
+                                    let ack = ControlMessage::SwitchMonitorAck {
+                                        session_id: 1,
+                                        monitor_index: target_monitor,
+                                        width: new_session.width,
+                                        height: new_session.height,
+                                    };
+                                    if let Ok(ack_pkt) = ack.to_packet() {
+                                        let _ = control_socket_ack.send_to(&ack_pkt, target_addr).await;
+                                    }
+                                }
+
+                                capture_session = new_session;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Не удалось переключить монитор на #{}: {:?}. Возврат к монитору #{}",
+                                    target_monitor, e, current_monitor
+                                );
+                                supervisor_state.target_monitor_index.store(current_monitor, Ordering::Relaxed);
+                                let on_frame_fallback = Arc::clone(&on_frame);
+                                if let Ok(fallback_session) = WgcCaptureSession::start_monitor(
+                                    current_monitor as usize,
+                                    !current_cursor,
+                                    move |tex, dev, w, h| on_frame_fallback(tex, dev, w, h),
+                                ) {
+                                    capture_session = fallback_session;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            _ = control_task => {}
         }
 
         self.state.is_running.store(false, Ordering::Relaxed);

@@ -204,6 +204,26 @@ pub enum ControlMessage {
         loss_rate: f32,
         selected_bitrate_kbps: u32,
     },
+
+    /// Переключение активного монитора на хосте
+    SwitchMonitor {
+        session_id: u64,
+        monitor_index: u32,
+    },
+
+    /// Подтверждение переключения монитора с новыми размерами
+    SwitchMonitorAck {
+        session_id: u64,
+        monitor_index: u32,
+        width: u32,
+        height: u32,
+    },
+
+    /// Включение/выключение локального аппаратного курсора на клиенте
+    SetLocalCursor {
+        session_id: u64,
+        enabled: bool,
+    },
 }
 
 impl ControlMessage {
@@ -251,6 +271,9 @@ impl ControlMessage {
             Self::SpeedProbe { session_id, .. } => Some(*session_id),
             Self::SpeedProbeAck { session_id, .. } => Some(*session_id),
             Self::CalibrationReport { session_id, .. } => Some(*session_id),
+            Self::SwitchMonitor { session_id, .. } => Some(*session_id),
+            Self::SwitchMonitorAck { session_id, .. } => Some(*session_id),
+            Self::SetLocalCursor { session_id, .. } => Some(*session_id),
         }
     }
 }

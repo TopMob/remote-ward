@@ -50,10 +50,13 @@ pub struct RemoteWardClientApp {
     config: ClientConfig,
     window: Option<Window>,
     input_tx: mpsc::UnboundedSender<InputEvent>,
+    control_tx: mpsc::UnboundedSender<ControlMessage>,
     frame_rx: mpsc::Receiver<DecodedFrame>,
     is_running: Arc<AtomicBool>,
     current_rtt_us: Arc<AtomicU32>,
     cursor_grabbed: bool,
+    current_monitor_idx: u32,
+    local_cursor_enabled: bool,
     frames_rendered: u64,
     last_stats_instant: Instant,
     bgra_buffer: Vec<u8>,
@@ -216,6 +219,7 @@ impl RemoteWardClientApp {
     pub fn new(
         config: ClientConfig,
         input_tx: mpsc::UnboundedSender<InputEvent>,
+        control_tx: mpsc::UnboundedSender<ControlMessage>,
         frame_rx: mpsc::Receiver<DecodedFrame>,
         is_running: Arc<AtomicBool>,
         current_rtt_us: Arc<AtomicU32>,
@@ -224,10 +228,13 @@ impl RemoteWardClientApp {
             config,
             window: None,
             input_tx,
+            control_tx,
             frame_rx,
             is_running,
             current_rtt_us,
             cursor_grabbed: true,
+            current_monitor_idx: 0,
+            local_cursor_enabled: false,
             frames_rendered: 0,
             last_stats_instant: Instant::now(),
             bgra_buffer: Vec::new(),
@@ -378,6 +385,31 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if let PhysicalKey::Code(key_code) = key_event.physical_key {
+                    // F8: Переключение активного монитора хоста на лету
+                    if key_code == winit::keyboard::KeyCode::F8 && key_event.state == ElementState::Pressed {
+                        self.current_monitor_idx = (self.current_monitor_idx + 1) % 4;
+                        tracing::info!("F8: Запрос переключения на монитор хоста #{}", self.current_monitor_idx);
+                        let _ = self.control_tx.send(ControlMessage::SwitchMonitor {
+                            session_id: 1,
+                            monitor_index: self.current_monitor_idx,
+                        });
+                        return;
+                    }
+
+                    // F10: Включение/выключение локального аппаратного курсора (0 мс задержка мыши)
+                    if key_code == winit::keyboard::KeyCode::F10 && key_event.state == ElementState::Pressed {
+                        self.local_cursor_enabled = !self.local_cursor_enabled;
+                        if let Some(ref window) = self.window {
+                            window.set_cursor_visible(self.local_cursor_enabled || !self.cursor_grabbed);
+                        }
+                        tracing::info!("F10: Локальный аппаратный курсор (0 мс задержки) = {}", self.local_cursor_enabled);
+                        let _ = self.control_tx.send(ControlMessage::SetLocalCursor {
+                            session_id: 1,
+                            enabled: self.local_cursor_enabled,
+                        });
+                        return;
+                    }
+
                     // Переключение полноэкранного режима и захвата курсора по клавише F11
                     if key_code == winit::keyboard::KeyCode::F11 && key_event.state == ElementState::Pressed {
                         self.cursor_grabbed = !self.cursor_grabbed;
@@ -680,6 +712,12 @@ pub async fn run_client(
                                     hello.width, hello.height, hello.target_fps
                                 );
                             }
+                            ControlMessage::SwitchMonitorAck { monitor_index, width, height, .. } => {
+                                tracing::info!(
+                                    "Хост переключил трансляцию на монитор #{}: разрешение {}x{}",
+                                    monitor_index, width, height
+                                );
+                            }
                             ControlMessage::Pong { sequence: _, send_timestamp_us, .. } => {
                                 let now_us = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -797,7 +835,11 @@ pub async fn run_client(
         })
         .unwrap();
 
-    // 6. Выделенный поток сетевого приема и сборки видеопакетов
+    // 6. Выделенный аудио-плеер WASAPI для воспроизведения системного звука хоста
+    let audio_player = Arc::new(crate::audio_player::WasapiAudioPlayer::new().ok());
+    let audio_player_task = Arc::clone(&audio_player);
+
+    // 7. Выделенный поток сетевого приема и сборки видеопакетов
     let is_running_video = Arc::clone(&is_running);
     let video_socket_task = Arc::clone(&video_socket);
     let ctrl_socket_task = Arc::clone(&control_socket);
@@ -858,6 +900,16 @@ pub async fn run_client(
                                 continue;
                             }
                             if buf[0] == core_protocol::MSG_TYPE_CONTROL {
+                                continue;
+                            }
+
+                            // Прямая передача аудио-пакетов хоста в WASAPI плеер с нулевой задержкой
+                            if len >= core_protocol::DatagramHeader::SIZE
+                                && buf[3] == core_protocol::ChannelId::AudioHostToClient as u8
+                            {
+                                if let Some(ref player) = *audio_player_task {
+                                    player.queue_pcm(&buf[core_protocol::DatagramHeader::SIZE..len]);
+                                }
                                 continue;
                             }
 
@@ -941,13 +993,25 @@ pub async fn run_client(
         })
         .unwrap();
 
-    // 7. Запуск оконного цикла событий Winit
+    // 8. Канал для передачи команд управления из GUI приложения (F8 мониторы, F10 курсор)
+    let (control_cmd_tx, mut control_cmd_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let ctrl_socket_cmds = Arc::clone(&control_socket);
+    tokio::spawn(async move {
+        while let Some(msg) = control_cmd_rx.recv().await {
+            if let Ok(bytes) = msg.to_packet() {
+                let _ = ctrl_socket_cmds.send_to(&bytes, host_ctrl_addr).await;
+            }
+        }
+    });
+
+    // 9. Запуск оконного цикла событий Winit
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
     let mut app = RemoteWardClientApp::new(
         config,
         input_tx,
+        control_cmd_tx,
         frame_rx,
         Arc::clone(&is_running),
         Arc::clone(&current_rtt_us),

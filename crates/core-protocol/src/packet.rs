@@ -199,6 +199,11 @@ impl DatagramHeader {
         (self.flags & flags::RETRANSMIT) != 0
     }
 
+    /// Сериализация заголовка в срез байтов (Zero-Copy)
+    pub fn as_bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+
     /// Парсинг среза байтов в заголовок без выделения памяти
     pub fn parse(buf: &[u8]) -> Result<(&Self, &[u8]), PacketError> {
         if buf.len() < Self::SIZE {

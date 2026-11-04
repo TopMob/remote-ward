@@ -58,6 +58,8 @@ pub struct RemoteWardClientApp {
     last_stats_instant: Instant,
     bgra_buffer: Vec<u8>,
     last_frame_size: (u32, u32),
+    renderer: Option<crate::renderer::D3D11Renderer>,
+    keyboard_hook: Option<crate::keyboard_hook::SystemKeyboardHook>,
 }
 
 #[inline(always)]
@@ -230,6 +232,8 @@ impl RemoteWardClientApp {
             last_stats_instant: Instant::now(),
             bgra_buffer: Vec::new(),
             last_frame_size: (0, 0),
+            renderer: None,
+            keyboard_hook: None,
         }
     }
 
@@ -265,6 +269,10 @@ impl RemoteWardClientApp {
     }
 
     fn draw_current_frame(&self) {
+        // Если Direct3D 11 рендерер активен, кадры уже презентуются на GPU с минимальной задержкой
+        if self.renderer.is_some() {
+            return;
+        }
         if let Some(hwnd) = self.get_hwnd() {
             if !self.bgra_buffer.is_empty() && self.last_frame_size.0 > 0 && self.last_frame_size.1 > 0 {
                 render_bgra_to_hwnd(
@@ -291,6 +299,34 @@ impl ApplicationHandler for RemoteWardClientApp {
                     tracing::info!("Окно клиента успешно создано в полноэкранном режиме (Borderless)");
                     window.set_cursor_visible(false);
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+
+                    // Получаем HWND окна для привязки Direct3D 11 и глобального хука клавиатуры
+                    if let Ok(handle) = window.window_handle() {
+                        if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                            let hwnd = HWND(win32_handle.hwnd.get() as *mut _);
+
+                            // 1. Устанавливаем системный хук клавиатуры для перехвата Win, Alt+Tab, Ctrl+Alt+Del
+                            self.keyboard_hook = Some(crate::keyboard_hook::SystemKeyboardHook::install(
+                                hwnd,
+                                self.input_tx.clone(),
+                            ));
+
+                            // 2. Инициализируем аппаратный рендерер Direct3D 11
+                            let inner_size = window.inner_size();
+                            let render_w = if inner_size.width > 0 { inner_size.width } else { self.config.width };
+                            let render_h = if inner_size.height > 0 { inner_size.height } else { self.config.height };
+                            match crate::renderer::D3D11Renderer::new(hwnd, render_w, render_h) {
+                                Ok(d3d11) => {
+                                    tracing::info!("Аппаратный рендерер Direct3D 11 Flip Discard успешно запущен!");
+                                    self.renderer = Some(d3d11);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Не удалось инициализировать D3D11 ({:?}), используется GDI", e);
+                                }
+                            }
+                        }
+                    }
+
                     self.window = Some(window);
                 }
                 Err(e) => {
@@ -313,7 +349,16 @@ impl ApplicationHandler for RemoteWardClientApp {
                 event_loop.exit();
             }
 
+            WindowEvent::Resized(size) => {
+                if let Some(ref mut renderer) = self.renderer {
+                    renderer.resize(size.width, size.height);
+                }
+            }
+
             WindowEvent::Focused(is_focused) => {
+                if let Some(ref hook) = self.keyboard_hook {
+                    hook.set_active(is_focused);
+                }
                 if !is_focused {
                     // При потере фокуса сбрасываем зажатые кнопки мыши
                     let _ = self.input_tx.send(InputEvent::MouseButton {
@@ -476,14 +521,32 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             let w = frame.width as usize;
             let h = frame.height as usize;
-            let required_bgra_size = w * h * 4;
-            if self.bgra_buffer.len() != required_bgra_size {
-                self.bgra_buffer.resize(required_bgra_size, 0);
-            }
             self.last_frame_size = (frame.width, frame.height);
 
-            // Конвертируем только 1 самый свежий кадр
-            nv12_to_bgra(&frame.data, w, h, &mut self.bgra_buffer);
+            // Аппаратный рендерер D3D11: мгновенный вывод на GPU без программной конвертации CPU!
+            let rendered_on_gpu = if let Some(ref mut d3d11) = self.renderer {
+                match d3d11.render_nv12(&frame.data, frame.width, frame.height) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("Ошибка D3D11 render_nv12: {:?}", e);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if !rendered_on_gpu {
+                // Fallback на CPU конвертацию и GDI StretchDIBits
+                let required_bgra_size = w * h * 4;
+                if self.bgra_buffer.len() != required_bgra_size {
+                    self.bgra_buffer.resize(required_bgra_size, 0);
+                }
+                nv12_to_bgra(&frame.data, w, h, &mut self.bgra_buffer);
+                if let Some(ref window) = self.window {
+                    window.request_redraw();
+                }
+            }
 
             if self.frames_rendered == 1 {
                 tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
@@ -562,10 +625,12 @@ pub async fn run_client(
     let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(3);
 
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
-    let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr).await;
+    let session_id = 1u64;
+    let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id).await;
 
     // Отправляем хосту отчет о результатах калибровки сети
     let report_msg = ControlMessage::CalibrationReport {
+        session_id,
         min_rtt_us: calibration.min_rtt_us,
         avg_rtt_us: calibration.avg_rtt_us,
         jitter_us: calibration.jitter_us,
@@ -578,6 +643,7 @@ pub async fn run_client(
 
     // Задаем вычисленный битрейт
     let settings_msg = ControlMessage::ChangeStreamSettings {
+        session_id,
         target_bitrate_kbps: calibration.target_bitrate_kbps,
         target_fps: 60,
     };
@@ -589,12 +655,17 @@ pub async fn run_client(
     let hello = ControlMessage::ClientHello(ClientHello {
         client_name: "remote-ward-client".into(),
         client_version: "0.1.0".into(),
+        protocol_version: core_protocol::PROTOCOL_VERSION as u32,
+        client_token: 0,
         supported_codecs: MftVideoDecoder::supported_codecs(),
+        preferred_codec: Some(config.preferred_codec),
         screen_width: config.width,
         screen_height: config.height,
         target_fps: 60,
         dpi_scale: 1.0,
         video_port: config.video_port,
+        supports_nack: true,
+        supports_fec: true,
     });
 
     let hello_bytes = hello.to_packet()?;
@@ -619,7 +690,7 @@ pub async fn run_client(
                                     hello.width, hello.height, hello.target_fps
                                 );
                             }
-                            ControlMessage::Pong { sequence: _, send_timestamp_us } => {
+                            ControlMessage::Pong { sequence: _, send_timestamp_us, .. } => {
                                 let now_us = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -652,6 +723,7 @@ pub async fn run_client(
                 .unwrap_or_default()
                 .as_micros() as u64;
             let ping = ControlMessage::Ping {
+                session_id,
                 sequence: seq,
                 send_timestamp_us: now_us,
             };
@@ -784,11 +856,14 @@ pub async fn run_client(
                             0.0
                         };
                         let stats = ControlMessage::ClientStats {
+                            session_id,
                             rtt_us: current_rtt_stats.load(Ordering::Relaxed),
                             jitter_us: 0,
                             decode_latency_us: 0,
                             render_latency_us: 0,
                             packet_loss_rate: loss_rate,
+                            fec_recovered_count: 0,
+                            nack_sent_count: 0,
                         };
                         if let Ok(bytes) = stats.to_packet() {
                             let _ = ctrl_socket_task.send_to(&bytes, host_ctrl_addr).await;
@@ -831,6 +906,7 @@ pub async fn run_client(
                                     // Лимит частоты запроса IDR (не чаще 1 раза в 300 мс)
                                     if last_idr_request.elapsed() >= Duration::from_millis(300) {
                                         let req = ControlMessage::RequestKeyframe {
+                                            session_id,
                                             reason: "frame gap detected".into(),
                                         };
                                         if let Ok(req_bytes) = req.to_packet() {
@@ -850,6 +926,7 @@ pub async fn run_client(
                                 if awaiting_clean_keyframe {
                                     if last_idr_request.elapsed() >= Duration::from_millis(300) {
                                         let req = ControlMessage::RequestKeyframe {
+                                            session_id,
                                             reason: "awaiting clean keyframe".into(),
                                         };
                                         if let Ok(req_bytes) = req.to_packet() {
@@ -873,6 +950,7 @@ pub async fn run_client(
                                         awaiting_clean_keyframe = true;
                                         if last_idr_request.elapsed() >= Duration::from_millis(200) {
                                             let req = ControlMessage::RequestKeyframe {
+                                                session_id,
                                                 reason: "decoder queue overflow".into(),
                                             };
                                             if let Ok(req_bytes) = req.to_packet() {

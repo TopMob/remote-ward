@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         target_fps: 60,
         dpi_scale: 1.0,
         video_port: client_video_port,
+        ..Default::default()
     });
 
     let hello_bytes = hello.to_packet()?;

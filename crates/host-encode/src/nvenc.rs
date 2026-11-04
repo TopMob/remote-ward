@@ -181,8 +181,8 @@ impl NvencEncoder {
         let mut encode_config = preset_config.presetCfg;
         encode_config.version = NV_ENC_CONFIG_VER;
         encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-        // Бесконечный GOP: убираем ежесекундные IDR-спайки, вызывающие лаги сети и фантомные курсоры
-        encode_config.gopLength = 0xFFFFFFFF;
+        // Периодический GOP (каждые 2 секунды чистый IDR для гарантированной защиты от рассинхрона и распада)
+        encode_config.gopLength = if fps > 0 { fps * 2 } else { 120 };
         encode_config.frameIntervalP = 1; // Только I и P кадры, никаких B-кадров!
 
         // Rate control: CBR с гибким VBV буфером (2 кадра) для сохранения четкости без размытия

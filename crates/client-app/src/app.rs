@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -58,6 +58,7 @@ pub struct RemoteWardClientApp {
     last_monitor_switch: Instant,
     cursor_grabbed: bool,
     local_cursor_enabled: bool,
+    rctrl_down: bool,
     frames_rendered: u64,
     last_stats_instant: Instant,
     bgra_buffer: Vec<u8>,
@@ -238,6 +239,7 @@ impl RemoteWardClientApp {
             last_monitor_switch: Instant::now() - Duration::from_secs(1),
             cursor_grabbed: true,
             local_cursor_enabled: false,
+            rctrl_down: false,
             frames_rendered: 0,
             last_stats_instant: Instant::now(),
             bgra_buffer: Vec::new(),
@@ -318,6 +320,7 @@ impl ApplicationHandler for RemoteWardClientApp {
                             // 1. Устанавливаем системный хук клавиатуры для перехвата Win, Alt+Tab, Ctrl+Alt+Del
                             self.keyboard_hook = Some(crate::keyboard_hook::SystemKeyboardHook::install(
                                 hwnd,
+                                Arc::clone(&self.is_running),
                                 self.input_tx.clone(),
                             ));
 
@@ -388,8 +391,46 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 if let PhysicalKey::Code(key_code) = key_event.physical_key {
+                    let is_pressed = key_event.state == ElementState::Pressed;
+
+                    // Отслеживаем состояние хост-клавиши Right Control
+                    if key_code == KeyCode::ControlRight {
+                        self.rctrl_down = is_pressed;
+                    }
+
+                    // Комбинация ХОСТ-КЛАВИШ: Right Ctrl + Esc -> завершение работы
+                    if (self.rctrl_down || key_code == KeyCode::ControlRight) && key_code == KeyCode::Escape && is_pressed {
+                        tracing::info!("[HOST KEY] Нажат Right Ctrl + Esc: экстренное чистое завершение работы клиента");
+                        self.is_running.store(false, Ordering::Relaxed);
+                        event_loop.exit();
+                        return;
+                    }
+
+                    // Комбинация ХОСТ-КЛАВИШ: Right Ctrl + H -> переключение полноэкранного режима и освобождение мыши
+                    if self.rctrl_down && key_code == KeyCode::KeyH && is_pressed {
+                        self.cursor_grabbed = !self.cursor_grabbed;
+                        if let Some(ref window) = self.window {
+                            window.set_cursor_visible(!self.cursor_grabbed || self.local_cursor_enabled);
+                            let grab_mode = if self.cursor_grabbed {
+                                winit::window::CursorGrabMode::Confined
+                            } else {
+                                winit::window::CursorGrabMode::None
+                            };
+                            let _ = window.set_cursor_grab(grab_mode);
+
+                            if self.cursor_grabbed {
+                                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                                tracing::info!("[HOST KEY] Right Ctrl + H: Полноэкранный режим (Borderless) + Захват курсора ВКЛЮЧЕН");
+                            } else {
+                                window.set_fullscreen(None);
+                                tracing::info!("[HOST KEY] Right Ctrl + H: Оконный режим + Курсор ОСВОБОЖДЕН ноутбуку");
+                            }
+                        }
+                        return;
+                    }
+
                     // F8: Переключение активного монитора хоста на лету
-                    if key_code == winit::keyboard::KeyCode::F8 && key_event.state == ElementState::Pressed {
+                    if key_code == winit::keyboard::KeyCode::F8 && is_pressed {
                         if self.last_monitor_switch.elapsed() < Duration::from_millis(300) {
                             tracing::debug!("F8: Игнорируем дребезг переключения (cooldown 300 мс)");
                             return;
@@ -915,6 +956,7 @@ pub async fn run_client(
             rt.block_on(async move {
                 let mut packets_count = 0u64;
                 let mut last_frame_id_opt: Option<u32> = None;
+                let mut waiting_for_clean_keyframe = false;
                 let mut packets_received_window = 0u32;
                 let mut packets_lost_window = 0u32;
                 let mut nack_sent_window = 0u32;
@@ -984,33 +1026,49 @@ pub async fn run_client(
 
                             match reassembler.process_packet(datagram) {
                                 Ok(Some(assembled_frame)) => {
-                                    let is_gap = match last_frame_id_opt {
-                                        Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
-                                        None => false,
-                                    };
+                                    let is_kf = assembled_frame.is_keyframe;
 
-                                    if is_gap && !assembled_frame.is_keyframe {
-                                        let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
-                                        packets_lost_window += gap * 20;
+                                    if is_kf {
+                                        // Пришел чистый ключевой кадр IDR — сбрасываем ожидание,
+                                        // буфер декодера гарантированно чист и синхронизирован.
+                                        waiting_for_clean_keyframe = false;
+                                        last_frame_id_opt = Some(assembled_frame.frame_id);
+                                        let _ = raw_frame_tx.try_send(assembled_frame);
+                                    } else {
+                                        let is_gap = match last_frame_id_opt {
+                                            Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
+                                            None => true, // Еще не было получено ни одного ключевого кадра
+                                        };
 
-                                        // При сильном выпадении (>3 кадров) запрашиваем IDR, но не блокируем отображение благодаря Intra-Refresh
-                                        if gap > 3 && last_idr_request.elapsed() >= Duration::from_millis(400) {
-                                            let req = ControlMessage::RequestKeyframe {
-                                                session_id,
-                                                reason: "frame gap detected".into(),
-                                            };
-                                            if let Ok(req_bytes) = req.to_packet() {
-                                                let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                        if is_gap {
+                                            waiting_for_clean_keyframe = true;
+                                            let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
+                                            packets_lost_window += gap * 20;
+
+                                            // Мгновенный запрос IDR при выпадении хотя бы одного кадра (debounce 50 мс)
+                                            if last_idr_request.elapsed() >= Duration::from_millis(50) {
+                                                let req = ControlMessage::RequestKeyframe {
+                                                    session_id,
+                                                    reason: "frame gap detected: dropping dirty P-frames".into(),
+                                                };
+                                                if let Ok(req_bytes) = req.to_packet() {
+                                                    let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                                }
+                                                last_idr_request = Instant::now();
                                             }
-                                            last_idr_request = Instant::now();
                                         }
+
+                                        if waiting_for_clean_keyframe {
+                                            // ВАЖНО: Ни при каких обстоятельствах не отправляем осиротевшие P-кадры в декодер!
+                                            // Декодер использует предыдущие кадры как опорные. Если хотя бы один кадр был пропущен,
+                                            // последующие P-кадры вызывают кумулятивное смещение макроблоков (кислотные разводы и рябь).
+                                            // Пропускаем все P-кадры до прихода следующего чистого IDR кадра (хост генерирует его за 2-10 мс).
+                                            continue;
+                                        }
+
+                                        last_frame_id_opt = Some(assembled_frame.frame_id);
+                                        let _ = raw_frame_tx.try_send(assembled_frame);
                                     }
-
-                                    let frame_id = assembled_frame.frame_id;
-                                    last_frame_id_opt = Some(frame_id);
-
-                                    // Отправляем собранный кадр в очередь декодера
-                                    let _ = raw_frame_tx.try_send(assembled_frame);
                                 }
 
                                 Ok(None) => {

@@ -794,6 +794,7 @@ impl ApplicationHandler for RemoteWardClientApp {
                             self.cursor_grabbed = false;
                         }
                         if let Some(ref hook) = self.keyboard_hook {
+                            hook.update_sender(session.input_tx.clone());
                             hook.set_active(true);
                         }
                         self.session = Some(session);

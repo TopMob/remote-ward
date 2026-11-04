@@ -266,13 +266,18 @@ impl D3D11Renderer {
         }
         self.render_target = None;
         unsafe {
-            let _ = self.swap_chain.ResizeBuffers(
+            self.context.OMSetRenderTargets(None, None);
+            self.context.ClearState();
+            let res = self.swap_chain.ResizeBuffers(
                 2,
                 width,
                 height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 if self.tearing_supported { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0) },
             );
+            if let Err(ref e) = res {
+                tracing::error!("ResizeBuffers ({}x{}) ошибка: {:?}", width, height, e);
+            }
             if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
                 let mut rtv = None;
                 let _ = self.device.CreateRenderTargetView(&back_buffer, None, Some(&mut rtv));

@@ -319,6 +319,15 @@ impl SystemKeyboardHook {
         }
     }
 
+    /// Обновить канал передачи событий ввода на активную сессию стрима
+    pub fn update_sender(&self, input_tx: mpsc::UnboundedSender<InputEvent>) {
+        unsafe {
+            if let Some(ref mut ctx) = HOOK_CTX {
+                ctx.input_tx = input_tx;
+            }
+        }
+    }
+
     /// Включить/выключить перехват (например, при потере фокуса)
     pub fn set_active(&self, active: bool) {
         if !active {

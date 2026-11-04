@@ -966,20 +966,25 @@ async fn spawn_streaming_pipeline(
     host_ctrl_addr: SocketAddr,
     config: &AppConfig,
 ) -> Result<StreamingSession, String> {
-    let video_port = 48000u16;
+    let host_video_port = 48000u16;
     let is_running = Arc::new(AtomicBool::new(true));
     let current_rtt_us = Arc::new(AtomicU32::new(0));
 
-    // 1. Создаем сокет управления
+    // 1. Создаем сокет управления на динамическом свободном порту
     let control_socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| format!("Не удалось создать сокет управления: {:?}", e))?;
     let control_socket = Arc::new(control_socket);
     core_transport::optimize_udp_socket(&control_socket);
 
-    // 2. Создаем видеосокет с буфером 8 МБ
-    let video_socket_std = std::net::UdpSocket::bind(format!("0.0.0.0:{}", video_port))
-        .map_err(|e| format!("Не удалось открыть видеопорт {}: {:?}", video_port, e))?;
+    // 2. Создаем видеосокет на динамическом свободном порту (0.0.0.0:0) с буфером 8 МБ
+    let video_socket_std = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("Не удалось открыть локальный видеосокет: {:?}", e))?;
+    let local_video_port = video_socket_std
+        .local_addr()
+        .map_err(|e| format!("Ошибка определения локального видеопорта: {:?}", e))?
+        .port();
+
     let sock_ref = socket2::SockRef::from(&video_socket_std);
     let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
     let _ = video_socket_std.set_nonblocking(true);
@@ -988,8 +993,8 @@ async fn spawn_streaming_pipeline(
     let video_socket = Arc::new(video_socket);
     core_transport::optimize_udp_socket(&video_socket);
 
-    // 3. Фоновая отправка PUNCH пакетов для пробивки NAT
-    let host_video_addr = SocketAddr::new(host_ctrl_addr.ip(), video_port);
+    // 3. Фоновая отправка PUNCH пакетов для пробивки NAT на видеопорт хоста (48000)
+    let host_video_addr = SocketAddr::new(host_ctrl_addr.ip(), host_video_port);
     let is_running_punch = Arc::clone(&is_running);
     let video_socket_punch = Arc::clone(&video_socket);
     tokio::spawn(async move {
@@ -1022,7 +1027,7 @@ async fn spawn_streaming_pipeline(
         let _ = control_socket.send_to(&settings_bytes, host_ctrl_addr).await;
     }
 
-    // 5. Отправляем ClientHello
+    // 5. Отправляем ClientHello с динамическим портом local_video_port
     let hello = ControlMessage::ClientHello(ClientHello {
         client_name: "remote-ward-client".into(),
         client_version: "0.1.0".into(),
@@ -1036,7 +1041,7 @@ async fn spawn_streaming_pipeline(
         display_refresh_rate: target_fps,
         supports_tearing: true,
         dpi_scale: 1.0,
-        video_port,
+        video_port: local_video_port,
         supports_nack: true,
         supports_fec: true,
     });

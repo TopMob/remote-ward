@@ -305,25 +305,29 @@ impl RemoteWardHost {
                                         ..
                                     } => {
                                         let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
-                                        if packet_loss_rate > 0.03 {
-                                            // Снижаем битрейт не ниже 18 Мбит/с
-                                            let new_bitrate = ((current_bitrate as f32 * 0.85) as u32).max(18_000);
+                                        const OPTIMAL_TARGET_BITRATE: u32 = 28_000;
+                                        const MAX_BITRATE: u32 = 32_000;
+                                        const MIN_BITRATE: u32 = 14_000;
+
+                                        if packet_loss_rate > 0.02 {
+                                            // Снижаем битрейт на 10% при реальных потерях пакетов
+                                            let new_bitrate = ((current_bitrate as f32 * 0.90) as u32).max(MIN_BITRATE);
                                             if new_bitrate < current_bitrate {
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::warn!(
-                                                    "[ABR Адаптация] Потери пакетов {:.1}% (RTT {:.1} мс)! Снижаем битрейт: {} -> {} кбит/с",
+                                                    "[ABR Адаптация] Потери пакетов {:.2}% (RTT {:.1} мс)! Снижаем битрейт: {} -> {} кбит/с",
                                                     packet_loss_rate * 100.0,
                                                     rtt_us as f32 / 1000.0,
                                                     current_bitrate,
                                                     new_bitrate
                                                 );
                                             }
-                                            if packet_loss_rate > 0.06 {
+                                            if packet_loss_rate > 0.08 {
                                                 state.force_keyframe.store(true, Ordering::SeqCst);
                                             }
-                                        } else if rtt_us > 35_000 && current_bitrate > 22_000 {
-                                            // Предотвращение Bufferbloat в роутере: если пинг вырос > 35 мс, плавно сбавляем битрейт
-                                            let new_bitrate = (current_bitrate.saturating_sub(2_000)).max(16_000);
+                                        } else if rtt_us > 35_000 && current_bitrate > 20_000 {
+                                            // Защита от bufferbloat в роутере
+                                            let new_bitrate = (current_bitrate.saturating_sub(1_500)).max(MIN_BITRATE);
                                             if new_bitrate < current_bitrate {
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::info!(
@@ -334,13 +338,22 @@ impl RemoteWardHost {
                                                 );
                                             }
                                         } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 20.0 && rtt_us > 0 {
-                                            let max_bitrate = 36_000;
-                                            if current_bitrate < max_bitrate {
-                                                let new_bitrate = (current_bitrate + 1_000).min(max_bitrate);
+                                            if current_bitrate < OPTIMAL_TARGET_BITRATE {
+                                                // Плавный подъем к целевому оптимуму 28 Мбит/с
+                                                let new_bitrate = (current_bitrate + 1_000).min(OPTIMAL_TARGET_BITRATE);
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::info!(
-                                                    "[ABR Адаптация] Сеть стабильна (loss 0.0%, RTT {:.1} мс). Повышаем битрейт: {} -> {} кбит/с",
+                                                    "[ABR Адаптация] Сеть стабильна (loss 0.0%, RTT {:.1} мс). Подъем к целевому: {} -> {} кбит/с",
                                                     rtt_us as f32 / 1000.0,
+                                                    current_bitrate,
+                                                    new_bitrate
+                                                );
+                                            } else if current_bitrate < MAX_BITRATE {
+                                                // Выше 28 Мбит/с — режим удержания (Hold) с очень осторожным зондированием до 32 Мбит/с
+                                                let new_bitrate = (current_bitrate + 500).min(MAX_BITRATE);
+                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
+                                                tracing::debug!(
+                                                    "[ABR Адаптация] Режим удержания/зондирования: {} -> {} кбит/с",
                                                     current_bitrate,
                                                     new_bitrate
                                                 );
@@ -369,12 +382,44 @@ impl RemoteWardHost {
 
         // 3. Запуск конвейера захвата и кодирования кадров
         let state_capture = Arc::clone(&self.state);
-        let paced_sender_capture = Arc::clone(&paced_sender);
         let fps = self.config.fps;
         let bitrate_kbps = self.config.bitrate_kbps;
 
         // Канал синхронизации первого кадра
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
+
+        // Структура исходящего кадра для развязки захвата экрана и сетевой отправки с пейсингом
+        struct OutgoingVideoFrame {
+            frame_id: u32,
+            packets: Vec<Vec<u8>>,
+            target_addr: SocketAddr,
+        }
+
+        // Выделенный асинхронный поток отправки видеопакетов (WGC больше не блокируется пейсингом!)
+        let (sender_tx, mut sender_rx) = tokio::sync::mpsc::channel::<OutgoingVideoFrame>(4);
+        let is_running_sender = Arc::clone(&self.state.is_running);
+        let paced_sender_worker = Arc::clone(&paced_sender);
+
+        std::thread::Builder::new()
+            .name("video-sender".into())
+            .spawn(move || {
+                let _timer = core_transport::ScopedTimerPeriod::set(1);
+                while is_running_sender.load(Ordering::Relaxed) {
+                    match sender_rx.blocking_recv() {
+                        Some(frame) => {
+                            if let Err(e) = paced_sender_worker.send_frame_packets(
+                                frame.frame_id,
+                                &frame.packets,
+                                frame.target_addr,
+                            ) {
+                                tracing::warn!("Ошибка отправки видеопакетов: {:?}", e);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            })
+            .unwrap();
 
         let encoder_lock = Arc::new(std::sync::Mutex::new(None));
         let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::H264));
@@ -383,6 +428,7 @@ impl RemoteWardHost {
         let encoder_clone = Arc::clone(&encoder_lock);
         let last_codec_clone = Arc::clone(&last_codec_lock);
         let last_bitrate_clone = Arc::clone(&last_bitrate_lock);
+        let sender_tx_capture = sender_tx.clone();
 
         // Поток захвата кадров WGC
         let capture_session = WgcCaptureSession::start(move |texture_raw, device_raw, width, height| {
@@ -479,9 +525,14 @@ impl RemoteWardHost {
                         );
                     }
 
-                    // Отправка клиенту через сокет с микросекундным пейсингом и сохранением в NACK-буфер
-                    if let Err(e) = paced_sender_capture.send_frame_packets(frame_id as u32, &packets, target_addr) {
-                        tracing::warn!("Ошибка отправки видеопакетов: {:?}", e);
+                    // Неблокирующая передача в асинхронный поток отправки — WGC завершается мгновенно (< 1.5 мс)
+                    let outgoing = OutgoingVideoFrame {
+                        frame_id: frame_id as u32,
+                        packets,
+                        target_addr,
+                    };
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sender_tx_capture.try_send(outgoing) {
+                        tracing::debug!("Очередь видеопакетов заполнена, пропуск кадра #{}", frame_id);
                     }
                 }
                 Err(e) => {

@@ -504,20 +504,12 @@ impl ApplicationHandler for RemoteWardClientApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Минимальное время ожидания: опрашиваем цикл событий каждые 1 мс, чтобы кадры выводились мгновенно
+        // Минимальное время ожидания: опрашиваем цикл событий каждые 1 мс для мгновенного вывода кадров
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
-        let mut latest_frame = None;
-        let mut frames_received_this_tick = 0u64;
-
-        // Извлекаем только самый свежий кадр, пропуская устаревшие кадры из очереди!
+        // Отрисовываем каждый декодированный кадр без пропуска (D3D11 выводит за <0.2 мс)
         while let Ok(frame) = self.frame_rx.try_recv() {
-            frames_received_this_tick += 1;
-            latest_frame = Some(frame);
-        }
-
-        if let Some(frame) = latest_frame {
-            self.frames_rendered += frames_received_this_tick;
+            self.frames_rendered += 1;
 
             let w = frame.width as usize;
             let h = frame.height as usize;
@@ -571,10 +563,6 @@ impl ApplicationHandler for RemoteWardClientApp {
                     ));
                 }
             }
-
-            if let Some(ref window) = self.window {
-                window.request_redraw();
-            }
         }
     }
 }
@@ -583,6 +571,8 @@ impl ApplicationHandler for RemoteWardClientApp {
 pub async fn run_client(
     config: ClientConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _timer = core_transport::ScopedTimerPeriod::set(1);
+
     tracing::info!("============================================================");
     tracing::info!("           ЗАПУСК КЛИЕНТА REMOTE-WARD (STREAMING)           ");
     tracing::info!("============================================================");
@@ -619,10 +609,10 @@ pub async fn run_client(
 
     // Канал для передачи событий ввода из GUI потока в сетевой сокет
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
-    // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 2 для минимальной задержки)
-    let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(2);
-    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 3 кадра для устранения накопления очереди)
-    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(3);
+    // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 4 кадра для сглаживания джиттера)
+    let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(4);
+    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 4 кадра)
+    let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(4);
 
     // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
     let session_id = 1u64;
@@ -767,20 +757,7 @@ pub async fn run_client(
 
             while is_running_decoder.load(Ordering::Relaxed) {
                 match raw_frame_rx.blocking_recv() {
-                    Some(mut assembled_frame) => {
-                        // Оптимизация задержки: если в очереди скопились кадры,
-                        // мгновенно подтягиваем контекст или переходим к свежему Keyframe, не создавая задержки
-                        while let Ok(next_frame) = raw_frame_rx.try_recv() {
-                            if next_frame.is_keyframe {
-                                assembled_frame = next_frame;
-                            } else {
-                                if let Some(ref mut decoder) = decoder_opt {
-                                    let _ = decoder.decode(&assembled_frame.data);
-                                }
-                                assembled_frame = next_frame;
-                            }
-                        }
-
+                    Some(assembled_frame) => {
                         frames_count += 1;
                         if frames_count == 1 {
                             tracing::info!(
@@ -840,18 +817,19 @@ pub async fn run_client(
             rt.block_on(async move {
                 let mut packets_count = 0u64;
                 let mut last_frame_id_opt: Option<u32> = None;
-                let mut frames_in_window = 0u32;
-                let mut gaps_in_window = 0u32;
+                let mut packets_received_window = 0u32;
+                let mut packets_lost_window = 0u32;
+                let mut nack_sent_window = 0u32;
                 let mut last_stats_sent = Instant::now();
-                let mut awaiting_clean_keyframe = false;
+                let mut last_nack_instant = Instant::now() - Duration::from_millis(50);
                 let mut last_idr_request = Instant::now() - Duration::from_secs(1);
 
                 while is_running_video.load(Ordering::Relaxed) {
-                    // Периодическая отправка статистики потерь пакетов хосту (каждые 1 сек)
+                    // Периодическая отправка точной статистики потерь пакетов хосту (каждые 1 сек)
                     if last_stats_sent.elapsed() >= Duration::from_millis(1000) {
-                        let total_frames = frames_in_window + gaps_in_window;
-                        let loss_rate = if total_frames >= 10 {
-                            gaps_in_window as f32 / total_frames as f32
+                        let total_pkts = packets_received_window + packets_lost_window;
+                        let loss_rate = if total_pkts >= 50 {
+                            packets_lost_window as f32 / total_pkts as f32
                         } else {
                             0.0
                         };
@@ -863,13 +841,14 @@ pub async fn run_client(
                             render_latency_us: 0,
                             packet_loss_rate: loss_rate,
                             fec_recovered_count: 0,
-                            nack_sent_count: 0,
+                            nack_sent_count: nack_sent_window,
                         };
                         if let Ok(bytes) = stats.to_packet() {
                             let _ = ctrl_socket_task.send_to(&bytes, host_ctrl_addr).await;
                         }
-                        frames_in_window = 0;
-                        gaps_in_window = 0;
+                        packets_received_window = 0;
+                        packets_lost_window = 0;
+                        nack_sent_window = 0;
                         last_stats_sent = Instant::now();
                     }
 
@@ -883,6 +862,7 @@ pub async fn run_client(
                             }
 
                             packets_count += 1;
+                            packets_received_window += 1;
                             if packets_count == 1 {
                                 tracing::info!(
                                     "Первый видеопакет успешно получен от {} ({} байт)!",
@@ -892,66 +872,24 @@ pub async fn run_client(
                             }
 
                             let datagram = &buf[..len];
-                            if let Ok(Some(assembled_frame)) = reassembler.process_packet(datagram) {
-                                let is_gap = match last_frame_id_opt {
-                                    Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
-                                    None => false,
-                                };
+                            let parsed_header = core_protocol::DatagramHeader::parse(datagram).ok().map(|(h, _)| (h.get_frame_id(), h.get_packet_index(), h.get_total_packets()));
 
-                                if is_gap && !assembled_frame.is_keyframe {
-                                    let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
-                                    gaps_in_window += gap;
-                                    awaiting_clean_keyframe = true;
+                            match reassembler.process_packet(datagram) {
+                                Ok(Some(assembled_frame)) => {
+                                    let is_gap = match last_frame_id_opt {
+                                        Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
+                                        None => false,
+                                    };
 
-                                    // Лимит частоты запроса IDR (не чаще 1 раза в 300 мс)
-                                    if last_idr_request.elapsed() >= Duration::from_millis(300) {
-                                        let req = ControlMessage::RequestKeyframe {
-                                            session_id,
-                                            reason: "frame gap detected".into(),
-                                        };
-                                        if let Ok(req_bytes) = req.to_packet() {
-                                            let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
-                                        }
-                                        last_idr_request = Instant::now();
-                                    }
-                                }
+                                    if is_gap && !assembled_frame.is_keyframe {
+                                        let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
+                                        packets_lost_window += gap * 20;
 
-                                if assembled_frame.is_keyframe {
-                                    // Чистый ключевой кадр получен — возобновляем отображение
-                                    awaiting_clean_keyframe = false;
-                                }
-
-                                // Если опорный кадр утерян, отбрасываем битые P-кадры до прихода IDR
-                                // (устраняет эффект шлейфов и призрачных курсоров!)
-                                if awaiting_clean_keyframe {
-                                    if last_idr_request.elapsed() >= Duration::from_millis(300) {
-                                        let req = ControlMessage::RequestKeyframe {
-                                            session_id,
-                                            reason: "awaiting clean keyframe".into(),
-                                        };
-                                        if let Ok(req_bytes) = req.to_packet() {
-                                            let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
-                                        }
-                                        last_idr_request = Instant::now();
-                                    }
-                                    continue;
-                                }
-
-                                frames_in_window += 1;
-                                let frame_id = assembled_frame.frame_id;
-
-                                // Передаем кадр в поток декодера (при переполнении запрашиваем чистый IDR, не допуская артефактов)
-                                match raw_frame_tx.try_send(assembled_frame) {
-                                    Ok(()) => {
-                                        last_frame_id_opt = Some(frame_id);
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        tracing::warn!("Очередь декодера переполнена! Пропущен P-кадр #{}, запрашиваем IDR", frame_id);
-                                        awaiting_clean_keyframe = true;
-                                        if last_idr_request.elapsed() >= Duration::from_millis(200) {
+                                        // При сильном выпадении (>3 кадров) запрашиваем IDR, но не блокируем отображение благодаря Intra-Refresh
+                                        if gap > 3 && last_idr_request.elapsed() >= Duration::from_millis(400) {
                                             let req = ControlMessage::RequestKeyframe {
                                                 session_id,
-                                                reason: "decoder queue overflow".into(),
+                                                reason: "frame gap detected".into(),
                                             };
                                             if let Ok(req_bytes) = req.to_packet() {
                                                 let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
@@ -959,7 +897,38 @@ pub async fn run_client(
                                             last_idr_request = Instant::now();
                                         }
                                     }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+
+                                    let frame_id = assembled_frame.frame_id;
+                                    last_frame_id_opt = Some(frame_id);
+
+                                    // Отправляем собранный кадр в очередь декодера
+                                    let _ = raw_frame_tx.try_send(assembled_frame);
+                                }
+
+                                Ok(None) => {
+                                    // Кадр не завершен — если пришел хвостовой пакет, проверяем пропущенные фрагменты для NACK
+                                    if let Some((current_fid, packet_idx, total_pkts)) = parsed_header {
+                                        if packet_idx + 1 == total_pkts || packet_idx > 5 {
+                                            if let Some(missing) = reassembler.get_missing_packets(current_fid) {
+                                                if !missing.is_empty() && last_nack_instant.elapsed() >= Duration::from_millis(8) {
+                                                    nack_sent_window += missing.len() as u32;
+                                                    let nack_msg = ControlMessage::Nack {
+                                                        session_id,
+                                                        frame_id: current_fid,
+                                                        missing_packet_indices: missing,
+                                                    };
+                                                    if let Ok(nack_bytes) = nack_msg.to_packet() {
+                                                        let _ = ctrl_socket_task.send_to(&nack_bytes, host_ctrl_addr).await;
+                                                    }
+                                                    last_nack_instant = Instant::now();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Err(e) => {
+                                    tracing::trace!("Ошибка обработки пакета сборщиком: {:?}", e);
                                 }
                             }
                         }

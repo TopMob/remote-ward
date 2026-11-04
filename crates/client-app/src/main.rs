@@ -3,6 +3,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _timer = core_transport::ScopedTimerPeriod::set(1);
+
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,

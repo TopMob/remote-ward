@@ -8,7 +8,11 @@ license.workspace = true
 [dependencies]
 core-protocol = { path = "../core-protocol" }
 tokio = { workspace = true }
-quinn = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { workspace = true }
+parking_lot = { workspace = true }
+smallvec = { workspace = true }
+
+# FEC: Reed-Solomon erasure coding для UDP видеопотока
+reed-solomon-erasure = { workspace = true }

@@ -174,6 +174,22 @@ impl FrameReassembler {
         Ok(None)
     }
 
+    /// Получить список номеров недостающих пакетов для указанного кадра
+    pub fn get_missing_packets(&self, frame_id: u32) -> Option<Vec<u16>> {
+        let partial = self.pending_frames.get(&frame_id)?;
+        let missing: Vec<u16> = partial
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, chunk)| if chunk.is_none() { Some(idx as u16) } else { None })
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(missing)
+        }
+    }
+
     fn cleanup_stale_frames(&mut self) {
         let now = Instant::now();
         let max_age = self.max_frame_age;

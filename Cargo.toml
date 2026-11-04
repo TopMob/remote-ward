@@ -14,6 +14,7 @@ repository = "https://github.com/TopMob/remote-ward"
 [workspace.dependencies]
 # Асинхронность и многопоточность
 tokio = { version = "1.43", features = ["full"] }
+rayon = "1.10"
 
 # Логирование и диагностика
 tracing = "0.1"
@@ -30,12 +31,19 @@ bincode = "1.3"
 bytemuck = { version = "1.21", features = ["derive"] }
 
 # Сеть и криптография
-quinn = "0.11"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 socket2 = "0.5"
+
+# FEC — кодирование с исправлением ошибок (Reed-Solomon для UDP видео)
+reed-solomon-erasure = { version = "6.0", features = ["simd-accel"] }
 
 # Windows API
 windows = "0.58"
+
+# Платформонезависимые утилиты
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+smallvec = { version = "1.13", features = ["const_generics"] }
+once_cell = "1.20"
 
 # Оптимизации сборки для минимальной задержки в Release
 [profile.release]
@@ -43,8 +51,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+strip = "none"
 
 # Быстрая сборка для разработки
 [profile.dev]
-opt-level = 0
+opt-level = 1
 debug = true

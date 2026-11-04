@@ -22,6 +22,24 @@ impl std::fmt::Display for KeyframeReason {
     }
 }
 
+impl From<&str> for KeyframeReason {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "startup" => Self::Startup,
+            "decoder reset" | "decoder queue overflow" => Self::DecoderReset,
+            "stream change" => Self::StreamChange,
+            "user" | "user request" => Self::UserRequest,
+            _ => Self::PacketLoss,
+        }
+    }
+}
+
+impl From<String> for KeyframeReason {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_name: String,
@@ -35,6 +53,30 @@ pub struct ClientHello {
     pub target_fps: u32,
     pub dpi_scale: f32,
     pub video_port: u16,
+    /// Клиент поддерживает NACK (Selective Retransmit)
+    pub supports_nack: bool,
+    /// Клиент поддерживает FEC (Forward Error Correction)
+    pub supports_fec: bool,
+}
+
+impl Default for ClientHello {
+    fn default() -> Self {
+        Self {
+            client_name: "remote-ward-client".into(),
+            client_version: "0.1.0".into(),
+            protocol_version: crate::packet::PROTOCOL_VERSION as u32,
+            client_token: 0,
+            supported_codecs: vec![VideoCodec::H264],
+            preferred_codec: Some(VideoCodec::H264),
+            screen_width: 1920,
+            screen_height: 1080,
+            target_fps: 60,
+            dpi_scale: 1.0,
+            video_port: 48000,
+            supports_nack: true,
+            supports_fec: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,23 +89,64 @@ pub struct ServerHello {
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
+    /// Сервер включил NACK
+    pub nack_enabled: bool,
+    /// Сервер включил FEC
+    pub fec_enabled: bool,
+    /// Количество data-шардов в FEC-группе
+    pub fec_data_shards: u8,
+    /// Количество parity-шардов в FEC-группе
+    pub fec_parity_shards: u8,
+}
+
+impl Default for ServerHello {
+    fn default() -> Self {
+        Self {
+            server_name: "remote-ward-host".into(),
+            server_version: "0.1.0".into(),
+            protocol_version: crate::packet::PROTOCOL_VERSION as u32,
+            session_id: 0,
+            selected_codec: VideoCodec::H264,
+            width: 1920,
+            height: 1080,
+            target_fps: 60,
+            nack_enabled: true,
+            fec_enabled: true,
+            fec_data_shards: 10,
+            fec_parity_shards: 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     ClientHello(ClientHello),
     ServerHello(ServerHello),
+
     /// Запрос IDR / I-кадра (при потере пакетов или рассинхроне)
     RequestKeyframe {
         session_id: u64,
         reason: KeyframeReason,
     },
+
+    /// NACK: запрос повторной отправки конкретного пакета в кадре.
+    /// Используется вместо RequestKeyframe при наличии NACK-поддержки.
+    /// Отправляется клиентом, когда обнаружен пропуск пакета в кадре
+    /// (timeout ~6ms — меньше одного интервала кадра при 60fps).
+    Nack {
+        session_id: u64,
+        frame_id: u32,
+        /// Список индексов пропущенных пакетов (до 32 за раз)
+        missing_packet_indices: Vec<u16>,
+    },
+
     /// Изменение настроек на лету (битрейт, fps)
     ChangeStreamSettings {
         session_id: u64,
         target_bitrate_kbps: u32,
         target_fps: u32,
     },
+
     /// Телеметрия клиента
     ClientStats {
         session_id: u64,
@@ -72,36 +155,46 @@ pub enum ControlMessage {
         decode_latency_us: u32,
         render_latency_us: u32,
         packet_loss_rate: f32,
+        /// Количество успешных FEC-восстановлений с момента последнего отчёта
+        fec_recovered_count: u32,
+        /// Количество NACK-запросов с момента последнего отчёта
+        nack_sent_count: u32,
     },
+
     /// Завершение сессии
     Disconnect {
         session_id: u64,
         reason: String,
     },
+
     /// Пинг для измерения RTT и джиттера
     Ping {
         session_id: u64,
         sequence: u32,
         send_timestamp_us: u64,
     },
+
     /// Ответ на пинг
     Pong {
         session_id: u64,
         sequence: u32,
         send_timestamp_us: u64,
     },
-    /// Калибровочный тестовый пакет для замера пропускной способности (с реальной полезной нагрузкой)
+
+    /// Калибровочный тестовый пакет для замера пропускной способности
     SpeedProbe {
         session_id: u64,
         sequence: u32,
         payload_size: u32,
     },
+
     /// Подтверждение получения тестового пакета
     SpeedProbeAck {
         session_id: u64,
         sequence: u32,
         payload_size: u32,
     },
+
     /// Отчет о калибровке сети
     CalibrationReport {
         session_id: u64,
@@ -126,7 +219,7 @@ impl ControlMessage {
 
     /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_CONTROL
     pub fn to_packet(&self) -> Result<Vec<u8>, bincode::Error> {
-        let mut buf = Vec::with_capacity(64);
+        let mut buf = Vec::with_capacity(128);
         buf.push(crate::packet::MSG_TYPE_CONTROL);
         bincode::serialize_into(&mut buf, self)?;
         Ok(buf)
@@ -143,4 +236,22 @@ impl ControlMessage {
             .into())
         }
     }
+
+    /// Извлечь session_id из любого варианта ControlMessage (кроме Hello)
+    pub fn session_id(&self) -> Option<u64> {
+        match self {
+            Self::ClientHello(_) | Self::ServerHello(_) => None,
+            Self::RequestKeyframe { session_id, .. } => Some(*session_id),
+            Self::Nack { session_id, .. } => Some(*session_id),
+            Self::ChangeStreamSettings { session_id, .. } => Some(*session_id),
+            Self::ClientStats { session_id, .. } => Some(*session_id),
+            Self::Disconnect { session_id, .. } => Some(*session_id),
+            Self::Ping { session_id, .. } => Some(*session_id),
+            Self::Pong { session_id, .. } => Some(*session_id),
+            Self::SpeedProbe { session_id, .. } => Some(*session_id),
+            Self::SpeedProbeAck { session_id, .. } => Some(*session_id),
+            Self::CalibrationReport { session_id, .. } => Some(*session_id),
+        }
+    }
 }
+

@@ -95,6 +95,26 @@ impl InputEvent {
         bincode::deserialize(bytes)
     }
 
+    /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_INPUT
+    pub fn to_packet(&self) -> Result<Vec<u8>, bincode::Error> {
+        let mut buf = Vec::with_capacity(32);
+        buf.push(crate::packet::MSG_TYPE_INPUT);
+        bincode::serialize_into(&mut buf, self)?;
+        Ok(buf)
+    }
+
+    /// Десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT
+    pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
+        if packet.first() == Some(&crate::packet::MSG_TYPE_INPUT) {
+            bincode::deserialize(&packet[1..])
+        } else {
+            Err(bincode::ErrorKind::Custom(
+                "Пакет не содержит префикс MSG_TYPE_INPUT".to_string(),
+            )
+            .into())
+        }
+    }
+
     /// Упаковка события в сетевой пакет с привязкой к сессии
     pub fn to_packet_with_session(&self, session_id: u64, sequence: u32) -> Result<Vec<u8>, bincode::Error> {
         let packet = InputPacket::new(session_id, sequence, self.clone());

@@ -54,11 +54,17 @@ impl TryFrom<u8> for ChannelId {
 pub mod flags {
     pub const KEYFRAME: u8 = 1 << 0;
     pub const LAST_PACKET_IN_FRAME: u8 = 1 << 1;
+    /// Пакет является FEC-восстановительным (parity shard)
     pub const FEC_PARITY: u8 = 1 << 2;
     pub const HOLE_PUNCH: u8 = 1 << 3;
+    /// Пакет является повторной передачей по NACK-запросу
+    pub const RETRANSMIT: u8 = 1 << 4;
 }
 
-/// Фиксированный бинарный заголовок для высокоскоростных датаграмм (Zero-Copy, 40 байт)
+/// Фиксированный бинарный заголовок для высокоскоростных датаграмм (Zero-Copy, 48 байт)
+///
+/// Структура спроектирована так, что каждое поле выровнено по границе своего размера.
+/// Добавление нового поля: нужно только изменить `reserved2` и добавить getter/setter.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct DatagramHeader {
@@ -68,23 +74,27 @@ pub struct DatagramHeader {
     pub version: u8,
     /// Канал данных (ChannelId)
     pub channel: u8,
-    /// Флаги (KEYFRAME, LAST_PACKET_IN_FRAME, FEC_PARITY, HOLE_PUNCH)
+    /// Флаги (KEYFRAME, LAST_PACKET_IN_FRAME, FEC_PARITY, HOLE_PUNCH, RETRANSMIT)
     pub flags: u8,
-    /// Выравнивание до 8 байт
-    pub reserved: [u8; 3],
+    /// Индекс FEC-группы (для группировки данных + parity шардов)
+    pub fec_shard_index: u8,
+    /// Общее количество шардов в FEC-группе (data + parity)
+    pub fec_total_shards: u8,
+    /// Выравнивание
+    pub reserved: u8,
     /// Идентификатор активной сессии (Session ID, Big-Endian)
     pub session_id: [u8; 8],
     /// Порядковый номер кадра (Big-Endian)
     pub frame_id: [u8; 4],
     /// Индекс фрагмента в текущем кадре (0..total_packets-1)
     pub packet_index: [u8; 2],
-    /// Общее количество фрагментов в данном кадре
+    /// Общее количество фрагментов в данном кадре (data shards only)
     pub total_packets: [u8; 2],
     /// Монотонная метка времени хоста в микросекундах (Big-Endian)
     pub timestamp_us: [u8; 8],
     /// Длина полезной нагрузки, следующей сразу за заголовком
     pub payload_len: [u8; 2],
-    /// Выравнивание до 40 байт
+    /// Выравнивание до 48 байт
     pub reserved2: [u8; 6],
 }
 
@@ -106,7 +116,9 @@ impl DatagramHeader {
             version: PROTOCOL_VERSION,
             channel: channel as u8,
             flags,
-            reserved: [0; 3],
+            fec_shard_index: 0,
+            fec_total_shards: 0,
+            reserved: 0,
             session_id: session_id.to_be_bytes(),
             frame_id: frame_id.to_be_bytes(),
             packet_index: packet_index.to_be_bytes(),
@@ -177,6 +189,14 @@ impl DatagramHeader {
 
     pub fn is_hole_punch(&self) -> bool {
         (self.flags & flags::HOLE_PUNCH) != 0
+    }
+
+    pub fn is_fec_parity(&self) -> bool {
+        (self.flags & flags::FEC_PARITY) != 0
+    }
+
+    pub fn is_retransmit(&self) -> bool {
+        (self.flags & flags::RETRANSMIT) != 0
     }
 
     /// Парсинг среза байтов в заголовок без выделения памяти

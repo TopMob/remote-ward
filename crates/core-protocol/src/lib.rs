@@ -1,9 +1,11 @@
 pub mod control;
+pub mod discovery;
 pub mod frame;
 pub mod input;
 pub mod packet;
 
 pub use control::*;
+pub use discovery::*;
 pub use frame::*;
 pub use input::*;
 pub use packet::*;

@@ -84,6 +84,16 @@ impl RemoteWardHost {
         }
     }
 
+    /// Получить состояние сервера
+    pub fn state(&self) -> Arc<ServerState> {
+        Arc::clone(&self.state)
+    }
+
+    /// Остановка сервера
+    pub fn stop(&self) {
+        self.state.is_running.store(false, Ordering::Relaxed);
+    }
+
     /// Запуск управляющего и потокового сервера
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("============================================================");
@@ -109,6 +119,59 @@ impl RemoteWardHost {
                     tracing::info!("   ПУБЛИЧНЫЙ АДРЕС ХОСТА ДЛЯ ПОДКЛЮЧЕНИЯ ИЗ ИНТЕРНЕТА (WAN):  ");
                     tracing::info!("   -> {} (RTT: {} мс)                           ", res.public_addr, res.rtt_ms);
                     tracing::info!("============================================================");
+                }
+            });
+        }
+
+        // Фоновая рассылка UDP-маяков (LAN Discovery) для мгновенного обнаружения лаунчером клиента
+        {
+            let is_running_discovery = Arc::clone(&self.state.is_running);
+            let control_port = self.config.control_port;
+            let video_port = self.config.video_port;
+            let fps = self.config.fps;
+            let display_w_atomic = Arc::clone(&self.state.display_width);
+            let display_h_atomic = Arc::clone(&self.state.display_height);
+
+            tokio::spawn(async move {
+                let broadcast_sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => {
+                        let _ = s.set_broadcast(true);
+                        s
+                    }
+                    Err(e) => {
+                        tracing::warn!("Не удалось открыть сокет LAN Discovery: {:?}", e);
+                        return;
+                    }
+                };
+
+                let computer_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "RemoteWard-Host".to_string());
+                let local_ip = get_local_ip_str().unwrap_or_else(|| "127.0.0.1".to_string());
+                let broadcast_targets = get_broadcast_targets(&local_ip);
+
+                tracing::info!("LAN Discovery маяк активен: имя '{}', IP {}, порт {}", computer_name, local_ip, core_protocol::DISCOVERY_PORT);
+
+                while is_running_discovery.load(Ordering::Relaxed) {
+                    let w = display_w_atomic.load(Ordering::Relaxed);
+                    let h = display_h_atomic.load(Ordering::Relaxed);
+
+                    let beacon = core_protocol::HostBeacon {
+                        server_name: computer_name.clone(),
+                        host_ip: local_ip.clone(),
+                        control_port,
+                        video_port,
+                        display_width: if w > 0 { w } else { 2560 },
+                        display_height: if h > 0 { h } else { 1440 },
+                        max_fps: fps,
+                        gpu_name: "NVIDIA GeForce RTX 2060 SUPER".to_string(),
+                    };
+
+                    if let Ok(bytes) = beacon.to_bytes() {
+                        for target in &broadcast_targets {
+                            let _ = broadcast_sock.send_to(&bytes, target).await;
+                        }
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
             });
         }
@@ -774,6 +837,29 @@ impl RemoteWardHost {
 
         Ok(())
     }
+}
+
+fn get_local_ip_str() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
+}
+
+fn get_broadcast_targets(local_ip: &str) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    if let Ok(addr) = format!("255.255.255.255:{}", core_protocol::DISCOVERY_PORT).parse::<SocketAddr>() {
+        targets.push(addr);
+    }
+    if let Ok(addr) = format!("127.0.0.1:{}", core_protocol::DISCOVERY_PORT).parse::<SocketAddr>() {
+        targets.push(addr);
+    }
+    if let Ok(ip) = local_ip.parse::<std::net::Ipv4Addr>() {
+        let o = ip.octets();
+        let subnet_bcast = std::net::Ipv4Addr::new(o[0], o[1], o[2], 255);
+        targets.push(SocketAddr::new(std::net::IpAddr::V4(subnet_bcast), core_protocol::DISCOVERY_PORT));
+    }
+    targets
 }
 
 #[cfg(test)]

@@ -123,6 +123,7 @@ pub struct D3D11Renderer {
     // BGRA текстура на GPU
     tex_bgra: Option<ID3D11Texture2D>,
     srv_bgra: Option<ID3D11ShaderResourceView>,
+    egui_painter: crate::egui_painter::D3D11EguiPainter,
     pub tearing_supported: bool,
     width: u32,
     height: u32,
@@ -226,6 +227,9 @@ impl D3D11Renderer {
         }
         let sampler = sampler.unwrap();
 
+        // 6. Инициализация D3D11 Egui Painter для лаунчера и внутриигрового оверлея
+        let egui_painter = crate::egui_painter::D3D11EguiPainter::new(&device, &context)?;
+
         tracing::info!(
             "Аппаратный D3D11 SwapChain (FLIP_DISCARD) успешно инициализирован: {}x{}",
             initial_w, initial_h
@@ -246,6 +250,7 @@ impl D3D11Renderer {
             srv_uv: None,
             tex_bgra: None,
             srv_bgra: None,
+            egui_painter,
             tearing_supported: allow_tearing,
             width: initial_w,
             height: initial_h,
@@ -278,8 +283,53 @@ impl D3D11Renderer {
         self.height = height;
     }
 
-    /// Аппаратный рендер видеокадра в формате NV12 (YUV 4:2:0) напрямую через HLSL шейдер
-    pub fn render_nv12(&mut self, nv12_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    /// Очистить SwapChain буфер заданным RGBA цветом
+    pub fn clear(&self, color: [f32; 4]) {
+        if let Some(ref rtv) = self.render_target {
+            self.egui_painter.clear(rtv, color);
+        }
+    }
+
+    /// Обновить шрифтовой атлас и текстуры egui
+    pub fn update_egui_textures(&mut self, textures_delta: &egui::TexturesDelta) -> Result<(), windows::core::Error> {
+        self.egui_painter.update_textures(textures_delta)
+    }
+
+    /// Отрисовать элементы интерфейса egui поверх текущего SwapChain
+    pub fn paint_egui(
+        &mut self,
+        screen_width: u32,
+        screen_height: u32,
+        pixels_per_point: f32,
+        clipped_primitives: &[egui::ClippedPrimitive],
+    ) -> Result<(), windows::core::Error> {
+        if let Some(ref rtv) = self.render_target {
+            self.egui_painter.paint(
+                rtv,
+                screen_width,
+                screen_height,
+                pixels_per_point,
+                clipped_primitives,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Аппаратный вывод содержимого буфера на экран (Flip Model, FastSync / VSync)
+    pub fn present(&self) -> Result<(), windows::core::Error> {
+        let present_flags = if self.tearing_supported {
+            DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
+        unsafe {
+            self.swap_chain.Present(0, present_flags).ok()?;
+        }
+        Ok(())
+    }
+
+    /// Подготовка и отрисовка видеокадра NV12 (без вызова Present)
+    pub fn draw_nv12(&mut self, nv12_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
         let y_size = (frame_w * frame_h) as usize;
         let uv_size = y_size / 2;
         if nv12_data.len() < y_size + uv_size {
@@ -332,22 +382,17 @@ impl D3D11Renderer {
 
         // Рендерим через NV12 пиксельный шейдер
         self.draw_quad(true)?;
-
-        // Презентация кадра с нулевым ожиданием (FastSync / Tearing без задержки VSync)
-        let present_flags = if self.tearing_supported {
-            DXGI_PRESENT_ALLOW_TEARING
-        } else {
-            DXGI_PRESENT(0)
-        };
-        unsafe {
-            self.swap_chain.Present(0, present_flags).ok()?;
-        }
-
         Ok(())
     }
 
-    /// Рендер готового BGRA буфера через D3D11
-    pub fn render_bgra(&mut self, bgra_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    /// Аппаратный рендер видеокадра в формате NV12 (YUV 4:2:0) напрямую через HLSL шейдер с выводом
+    pub fn render_nv12(&mut self, nv12_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+        self.draw_nv12(nv12_data, frame_w, frame_h)?;
+        self.present()
+    }
+
+    /// Подготовка и отрисовка готового BGRA буфера (без вызова Present)
+    pub fn draw_bgra(&mut self, bgra_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
         let expected_size = (frame_w * frame_h * 4) as usize;
         if bgra_data.len() < expected_size {
             return Ok(());
@@ -375,17 +420,13 @@ impl D3D11Renderer {
         }
 
         self.draw_quad(false)?;
-
-        let present_flags = if self.tearing_supported {
-            DXGI_PRESENT_ALLOW_TEARING
-        } else {
-            DXGI_PRESENT(0)
-        };
-        unsafe {
-            self.swap_chain.Present(0, present_flags).ok()?;
-        }
-
         Ok(())
+    }
+
+    /// Рендер готового BGRA буфера через D3D11 с выводом
+    pub fn render_bgra(&mut self, bgra_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+        self.draw_bgra(bgra_data, frame_w, frame_h)?;
+        self.present()
     }
 
     fn draw_quad(&self, is_nv12: bool) -> Result<(), windows::core::Error> {

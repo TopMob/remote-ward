@@ -48,6 +48,10 @@ logs/
 *.key
 *.pfx
 *.p12
+
+# === Local User Runtime Config ===
+remote_ward_config.json
+
 *.cer
 *.crt
 credentials.json

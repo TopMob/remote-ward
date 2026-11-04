@@ -1,4 +1,4 @@
-use client_app::{run_client, ClientConfig};
+use client_app::{run_client, AppConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -19,19 +19,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Читаем адрес хоста из аргументов (IP или IP:PORT, по умолчанию 127.0.0.1:48001)
-    let host_arg = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:48001".into());
-    let host_addr: std::net::SocketAddr = if host_arg.contains(':') {
-        host_arg.parse().unwrap_or_else(|_| "127.0.0.1:48001".parse().unwrap())
-    } else {
-        format!("{}:48001", host_arg).parse().unwrap_or_else(|_| "127.0.0.1:48001".parse().unwrap())
-    };
+    let mut app_config = AppConfig::load();
 
-    let config = ClientConfig {
-        host_control_addr: host_addr,
-        ..Default::default()
-    };
+    // Если передан адрес хоста в аргументах (например, из client.bat 192.168.1.4), сохраняем в конфиг
+    if let Some(host_arg) = std::env::args().nth(1) {
+        let host_arg = host_arg.trim();
+        if !host_arg.is_empty() {
+            app_config.record_ip(host_arg);
+        }
+    }
 
-    run_client(config).await?;
+    run_client(app_config).await?;
     Ok(())
 }

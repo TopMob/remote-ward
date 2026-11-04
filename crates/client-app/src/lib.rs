@@ -1,16 +1,24 @@
 pub mod app;
 pub mod audio_player;
 pub mod calibration;
+pub mod config;
 pub mod decoder;
+pub mod discovery;
+pub mod egui_painter;
 pub mod input_mapper;
 pub mod keyboard_hook;
+pub mod launcher;
 pub mod renderer;
 
 pub use app::{run_client, ClientConfig, RemoteWardClientApp};
 pub use audio_player::WasapiAudioPlayer;
+pub use config::AppConfig;
 pub use decoder::{DecodeError, DecodedFrame, MftVideoDecoder};
+pub use discovery::{DiscoveredHost, LanDiscovery};
+pub use egui_painter::D3D11EguiPainter;
 pub use input_mapper::keycode_to_scancode;
 pub use keyboard_hook::SystemKeyboardHook;
+pub use launcher::{LauncherAction, LauncherTab, LauncherUI};
 pub use renderer::D3D11Renderer;
 
 #[cfg(test)]

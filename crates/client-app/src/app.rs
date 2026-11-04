@@ -23,8 +23,10 @@ use core_protocol::{
     ButtonState, ClientHello, ControlMessage, InputEvent, MouseButton, VideoCodec,
 };
 use core_transport::FrameReassembler;
+use crate::config::AppConfig;
 use crate::decoder::{DecodedFrame, MftVideoDecoder};
 use crate::input_mapper::keycode_to_scancode;
+use crate::launcher::{LauncherAction, LauncherUI};
 
 pub struct ClientConfig {
     pub host_control_addr: SocketAddr,
@@ -41,30 +43,50 @@ impl Default for ClientConfig {
             video_port: 48000,
             width: 2560,
             height: 1440,
-            preferred_codec: VideoCodec::H264, // H.264 по умолчанию для 100% аппаратной совместимости
+            preferred_codec: VideoCodec::H264,
         }
     }
 }
 
+pub struct StreamingSession {
+    pub input_tx: mpsc::UnboundedSender<InputEvent>,
+    pub control_tx: mpsc::UnboundedSender<ControlMessage>,
+    pub frame_rx: mpsc::Receiver<DecodedFrame>,
+    pub is_running: Arc<AtomicBool>,
+    pub current_rtt_us: Arc<AtomicU32>,
+    pub current_monitor_shared: Arc<AtomicU32>,
+    pub host_addr: SocketAddr,
+}
+
+pub struct HostHandle {
+    pub host: Arc<host_server::RemoteWardHost>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 pub struct RemoteWardClientApp {
-    config: ClientConfig,
-    window: Option<Window>,
-    input_tx: mpsc::UnboundedSender<InputEvent>,
-    control_tx: mpsc::UnboundedSender<ControlMessage>,
-    frame_rx: mpsc::Receiver<DecodedFrame>,
-    is_running: Arc<AtomicBool>,
-    current_rtt_us: Arc<AtomicU32>,
-    current_monitor_shared: Arc<AtomicU32>,
-    last_monitor_switch: Instant,
-    cursor_grabbed: bool,
-    local_cursor_enabled: bool,
-    rctrl_down: bool,
-    frames_rendered: u64,
-    last_stats_instant: Instant,
-    bgra_buffer: Vec<u8>,
-    last_frame_size: (u32, u32),
-    renderer: Option<crate::renderer::D3D11Renderer>,
-    keyboard_hook: Option<crate::keyboard_hook::SystemKeyboardHook>,
+    pub app_config: AppConfig,
+    pub window: Option<Window>,
+    pub launcher_ui: LauncherUI,
+    pub egui_ctx: egui::Context,
+    pub egui_winit_state: Option<egui_winit::State>,
+    pub session: Option<StreamingSession>,
+    pub session_rx: Option<mpsc::Receiver<Result<StreamingSession, String>>>,
+    pub connecting_target: Option<SocketAddr>,
+    pub host_handle: Option<HostHandle>,
+    pub renderer: Option<crate::renderer::D3D11Renderer>,
+    pub keyboard_hook: Option<crate::keyboard_hook::SystemKeyboardHook>,
+    pub cursor_grabbed: bool,
+    pub local_cursor_enabled: bool,
+    pub ctrl_down: bool,
+    pub shift_down: bool,
+    pub rctrl_down: bool,
+    pub last_monitor_switch: Instant,
+    pub frames_rendered: u64,
+    pub last_stats_instant: Instant,
+    pub last_fps: u32,
+    pub last_decode_ms: f64,
+    pub bgra_buffer: Vec<u8>,
+    pub last_frame_size: (u32, u32),
 }
 
 #[inline(always)]
@@ -72,7 +94,6 @@ fn clamp_u8(val: i32) -> u8 {
     val.clamp(0, 255) as u8
 }
 
-/// Высокоскоростное параллельное преобразование NV12 (YUV 4:2:0) в 32-bit BGRA
 pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
     use rayon::prelude::*;
 
@@ -83,7 +104,6 @@ pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
 
     let (y_plane, uv_plane) = nv12.split_at(frame_y_size);
 
-    // Обрабатываем строки параллельно парами (так как одна UV-строка приходится на две Y-строки)
     bgra.par_chunks_exact_mut(width * 4 * 2)
         .enumerate()
         .for_each(|(pair_idx, two_rows_bgra)| {
@@ -98,104 +118,93 @@ pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
 
             let y_start0 = y_row0 * width;
             let y_start1 = y_row1 * width;
+
             if y_start1 + width > y_plane.len() {
                 return;
             }
-            let y_row0_slice = &y_plane[y_start0..y_start0 + width];
-            let y_row1_slice = &y_plane[y_start1..y_start1 + width];
+
+            let y_line0 = &y_plane[y_start0..y_start0 + width];
+            let y_line1 = &y_plane[y_start1..y_start1 + width];
 
             let (row0_bgra, row1_bgra) = two_rows_bgra.split_at_mut(width * 4);
 
-            for x in (0..width).step_by(2) {
-                let u = uv_row[x] as i32 - 128;
-                let v = uv_row[x + 1] as i32 - 128;
+            for x in 0..width {
+                let uv_idx = (x / 2) * 2;
+                let u_raw = uv_row[uv_idx] as i32;
+                let v_raw = uv_row[uv_idx + 1] as i32;
 
-                // Точная матрица BT.709 Limited Range (согласовано с VUI энкодера NVENC):
-                // R = 1.16438 * (Y - 16) + 1.79274 * V
-                // G = 1.16438 * (Y - 16) - 0.21325 * U - 0.53291 * V
-                // B = 1.16438 * (Y - 16) + 2.11240 * U
-                let r_add = 459 * v + 128;
-                let g_add = -55 * u - 136 * v + 128;
-                let b_add = 541 * u + 128;
+                let u = u_raw - 128;
+                let v = v_raw - 128;
 
-                // Точка (x, y0)
-                let c00 = 298 * ((y_row0_slice[x] as i32) - 16);
-                let idx00 = x * 4;
-                row0_bgra[idx00] = clamp_u8((c00 + b_add) >> 8);
-                row0_bgra[idx00 + 1] = clamp_u8((c00 + g_add) >> 8);
-                row0_bgra[idx00 + 2] = clamp_u8((c00 + r_add) >> 8);
-                row0_bgra[idx00 + 3] = 255;
+                let r_uv = 1436 * v;
+                let g_uv = -352 * u - 731 * v;
+                let b_uv = 1814 * u;
 
-                // Точка (x + 1, y0)
-                let c01 = 298 * ((y_row0_slice[x + 1] as i32) - 16);
-                let idx01 = (x + 1) * 4;
-                row0_bgra[idx01] = clamp_u8((c01 + b_add) >> 8);
-                row0_bgra[idx01 + 1] = clamp_u8((c01 + g_add) >> 8);
-                row0_bgra[idx01 + 2] = clamp_u8((c01 + r_add) >> 8);
-                row0_bgra[idx01 + 3] = 255;
+                let y0 = (y_line0[x] as i32 - 16).max(0);
+                let c0 = 1192 * y0;
+                let idx0 = x * 4;
+                row0_bgra[idx0]     = clamp_u8((c0 + b_uv + 512) >> 10);
+                row0_bgra[idx0 + 1] = clamp_u8((c0 + g_uv + 512) >> 10);
+                row0_bgra[idx0 + 2] = clamp_u8((c0 + r_uv + 512) >> 10);
+                row0_bgra[idx0 + 3] = 255;
 
-                // Точка (x, y1)
-                let c10 = 298 * ((y_row1_slice[x] as i32) - 16);
-                let idx10 = x * 4;
-                row1_bgra[idx10] = clamp_u8((c10 + b_add) >> 8);
-                row1_bgra[idx10 + 1] = clamp_u8((c10 + g_add) >> 8);
-                row1_bgra[idx10 + 2] = clamp_u8((c10 + r_add) >> 8);
-                row1_bgra[idx10 + 3] = 255;
-
-                // Точка (x + 1, y1)
-                let c11 = 298 * ((y_row1_slice[x + 1] as i32) - 16);
-                let idx11 = (x + 1) * 4;
-                row1_bgra[idx11] = clamp_u8((c11 + b_add) >> 8);
-                row1_bgra[idx11 + 1] = clamp_u8((c11 + g_add) >> 8);
-                row1_bgra[idx11 + 2] = clamp_u8((c11 + r_add) >> 8);
-                row1_bgra[idx11 + 3] = 255;
+                let y1 = (y_line1[x] as i32 - 16).max(0);
+                let c1 = 1192 * y1;
+                let idx1 = x * 4;
+                row1_bgra[idx1]     = clamp_u8((c1 + b_uv + 512) >> 10);
+                row1_bgra[idx1 + 1] = clamp_u8((c1 + g_uv + 512) >> 10);
+                row1_bgra[idx1 + 2] = clamp_u8((c1 + r_uv + 512) >> 10);
+                row1_bgra[idx1 + 3] = 255;
             }
         });
 }
 
-fn render_bgra_to_hwnd(
-    hwnd: HWND,
-    bgra: &[u8],
-    width: u32,
-    height: u32,
-) {
+pub fn render_bgra_to_hwnd(hwnd: HWND, bgra: &[u8], width: u32, height: u32) {
     unsafe {
-        let mut rect = RECT::default();
-        if GetClientRect(hwnd, &mut rect).is_err() {
-            return;
-        }
-        let dest_w = rect.right - rect.left;
-        let dest_h = rect.bottom - rect.top;
-        if dest_w <= 0 || dest_h <= 0 {
-            return;
-        }
-
         let hdc = GetDC(hwnd);
         if hdc.is_invalid() {
             return;
         }
 
-        // Сохранение правильных пропорций кадра (Letterbox / Pillarbox)
-        let scale_x = dest_w as f64 / width as f64;
-        let scale_y = dest_h as f64 / height as f64;
-        let scale = scale_x.min(scale_y);
-        let target_w = (width as f64 * scale).round() as i32;
-        let target_h = (height as f64 * scale).round() as i32;
-        let offset_x = (dest_w - target_w) / 2;
-        let offset_y = (dest_h - target_h) / 2;
+        let mut rect = RECT::default();
+        let (offset_x, offset_y, target_w, target_h) = if GetClientRect(hwnd, &mut rect).is_ok() {
+            let dest_w = rect.right - rect.left;
+            let dest_h = rect.bottom - rect.top;
+            if dest_w > 0 && dest_h > 0 && width > 0 && height > 0 {
+                let scale_x = dest_w as f64 / width as f64;
+                let scale_y = dest_h as f64 / height as f64;
+                let scale = scale_x.min(scale_y);
 
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = width as i32;
-        bmi.bmiHeader.biHeight = -(height as i32); // Отрицательная высота для формата Top-Down
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
+                let tw = (width as f64 * scale).round() as i32;
+                let th = (height as f64 * scale).round() as i32;
+                let ox = (dest_w - tw) / 2;
+                let oy = (dest_h - th) / 2;
+                (ox, oy, tw, th)
+            } else {
+                (0, 0, dest_w, dest_h)
+            }
+        } else {
+            (0, 0, width as i32, height as i32)
+        };
 
-        // Используем COLORONCOLOR для мгновенного аппаратного масштабирования (<1 мс).
-        // Режим HALFTONE блокировал поток рендера на 40-70 мс на кадр при несовпадении разрешений,
-        // что приводило к падению до 15-20 FPS на ноутбуке!
         let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
+        };
 
         let _ = StretchDIBits(
             hdc,
@@ -218,37 +227,39 @@ fn render_bgra_to_hwnd(
 }
 
 impl RemoteWardClientApp {
-    pub fn new(
-        config: ClientConfig,
-        input_tx: mpsc::UnboundedSender<InputEvent>,
-        control_tx: mpsc::UnboundedSender<ControlMessage>,
-        frame_rx: mpsc::Receiver<DecodedFrame>,
-        is_running: Arc<AtomicBool>,
-        current_rtt_us: Arc<AtomicU32>,
-        current_monitor_shared: Arc<AtomicU32>,
-    ) -> Self {
+    pub fn new(app_config: AppConfig) -> Self {
+        let egui_ctx = egui::Context::default();
+        LauncherUI::setup_theme(&egui_ctx);
+        let launcher_ui = LauncherUI::new(&app_config);
+
         Self {
-            config,
+            app_config,
             window: None,
-            input_tx,
-            control_tx,
-            frame_rx,
-            is_running,
-            current_rtt_us,
-            current_monitor_shared,
-            last_monitor_switch: Instant::now() - Duration::from_secs(1),
-            cursor_grabbed: true,
-            local_cursor_enabled: false,
-            rctrl_down: false,
-            frames_rendered: 0,
-            last_stats_instant: Instant::now(),
-            bgra_buffer: Vec::new(),
-            last_frame_size: (0, 0),
+            launcher_ui,
+            egui_ctx,
+            egui_winit_state: None,
+            session: None,
+            session_rx: None,
+            connecting_target: None,
+            host_handle: None,
             renderer: None,
             keyboard_hook: None,
+            cursor_grabbed: false,
+            local_cursor_enabled: false,
+            ctrl_down: false,
+            shift_down: false,
+            rctrl_down: false,
+            last_monitor_switch: Instant::now() - Duration::from_secs(1),
+            frames_rendered: 0,
+            last_stats_instant: Instant::now(),
+            last_fps: 60,
+            last_decode_ms: 0.0,
+            bgra_buffer: Vec::new(),
+            last_frame_size: (0, 0),
         }
     }
 
+    #[allow(dead_code)]
     fn get_hwnd(&self) -> Option<HWND> {
         let window = self.window.as_ref()?;
         if let Ok(handle) = window.window_handle() {
@@ -259,91 +270,130 @@ impl RemoteWardClientApp {
         None
     }
 
-    fn get_letterbox(&self) -> (f64, f64, f64, f64) {
-        if let Some(hwnd) = self.get_hwnd() {
-            let mut rect = RECT::default();
-            if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
-                let dest_w = (rect.right - rect.left) as f64;
-                let dest_h = (rect.bottom - rect.top) as f64;
-                let fw = if self.last_frame_size.0 > 0 { self.last_frame_size.0 as f64 } else { self.config.width as f64 };
-                let fh = if self.last_frame_size.1 > 0 { self.last_frame_size.1 as f64 } else { self.config.height as f64 };
-                if dest_w > 0.0 && dest_h > 0.0 && fw > 0.0 && fh > 0.0 {
-                    let scale = (dest_w / fw).min(dest_h / fh);
-                    let target_w = (fw * scale).round();
-                    let target_h = (fh * scale).round();
-                    let offset_x = ((dest_w - target_w) / 2.0).round();
-                    let offset_y = ((dest_h - target_h) / 2.0).round();
-                    return (offset_x, offset_y, target_w, target_h);
+    fn toggle_hud_overlay(&mut self) {
+        self.launcher_ui.show_overlay = !self.launcher_ui.show_overlay;
+        if let Some(ref window) = self.window {
+            if self.launcher_ui.show_overlay {
+                window.set_cursor_visible(true);
+                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                self.cursor_grabbed = false;
+                if let Some(ref hook) = self.keyboard_hook {
+                    hook.set_active(false);
                 }
+                tracing::info!("HUD Оверлей ОТКРЫТ (Ctrl+Shift+O): курсор освобожден для UI");
+            } else {
+                window.set_cursor_visible(false);
+                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                self.cursor_grabbed = true;
+                if let Some(ref hook) = self.keyboard_hook {
+                    hook.set_active(true);
+                }
+                tracing::info!("HUD Оверлей ЗАКРЫТ: курсор возвращен в стрим");
             }
         }
-        (0.0, 0.0, self.config.width as f64, self.config.height as f64)
     }
 
-    fn draw_current_frame(&self) {
-        // Если Direct3D 11 рендерер активен, кадры уже презентуются на GPU с минимальной задержкой
-        if self.renderer.is_some() {
-            return;
+    fn disconnect_to_launcher(&mut self) {
+        if let Some(ref session) = self.session {
+            session.is_running.store(false, Ordering::Relaxed);
         }
-        if let Some(hwnd) = self.get_hwnd() {
-            if !self.bgra_buffer.is_empty() && self.last_frame_size.0 > 0 && self.last_frame_size.1 > 0 {
-                render_bgra_to_hwnd(
-                    hwnd,
-                    &self.bgra_buffer,
-                    self.last_frame_size.0,
-                    self.last_frame_size.1,
-                );
-            }
+        self.session = None;
+        self.connecting_target = None;
+        self.session_rx = None;
+        self.launcher_ui.show_overlay = false;
+
+        if let Some(ref window) = self.window {
+            window.set_fullscreen(None);
+            window.set_resizable(false);
+            let _ = window.request_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
+            window.set_cursor_visible(true);
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            self.cursor_grabbed = false;
+            window.set_title("Remote-Ward");
         }
+
+        if let Some(ref hook) = self.keyboard_hook {
+            hook.set_active(false);
+        }
+
+        tracing::info!("Сеанс стриминга завершен. Окно вернулось в лаунчер Remote-Ward!");
+    }
+
+    fn start_connection(&mut self, target_addr: SocketAddr) {
+        self.connecting_target = Some(target_addr);
+        self.launcher_ui.error_message = None;
+
+        let (tx, rx) = mpsc::channel(1);
+        self.session_rx = Some(rx);
+
+        let config_clone = self.app_config.clone();
+        tokio::spawn(async move {
+            let res = spawn_streaming_pipeline(target_addr, &config_clone).await;
+            let _ = tx.send(res).await;
+        });
     }
 }
 
 impl ApplicationHandler for RemoteWardClientApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
+            // Лаунчер открывается в аккуратном компактном окне 960x640
             let window_attributes = Window::default_attributes()
-                .with_title("Remote-Ward Client (Ultra-Low Latency Streaming)")
-                .with_fullscreen(Some(Fullscreen::Borderless(None)))
+                .with_title("Remote-Ward")
+                .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0))
+                .with_resizable(false)
                 .with_drag_and_drop(false);
 
             match event_loop.create_window(window_attributes) {
                 Ok(window) => {
-                    tracing::info!("Окно клиента успешно создано в полноэкранном режиме (Borderless)");
-                    window.set_cursor_visible(false);
-                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                    tracing::info!("Окно лаунчера Remote-Ward успешно создано (960x640)");
+                    window.set_cursor_visible(true);
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
 
-                    // Получаем HWND окна для привязки Direct3D 11 и глобального хука клавиатуры
                     if let Ok(handle) = window.window_handle() {
                         if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
                             let hwnd = HWND(win32_handle.hwnd.get() as *mut _);
 
-                            // 1. Устанавливаем системный хук клавиатуры для перехвата Win, Alt+Tab, Ctrl+Alt+Del
-                            self.keyboard_hook = Some(crate::keyboard_hook::SystemKeyboardHook::install(
+                            // Dummy input_tx для хука в режиме лаунчера
+                            let (dummy_tx, _) = mpsc::unbounded_channel();
+                            let is_running_dummy = Arc::new(AtomicBool::new(true));
+                            let hook = crate::keyboard_hook::SystemKeyboardHook::install(
                                 hwnd,
-                                Arc::clone(&self.is_running),
-                                self.input_tx.clone(),
-                            ));
+                                is_running_dummy,
+                                dummy_tx,
+                            );
+                            hook.set_active(false);
+                            self.keyboard_hook = Some(hook);
 
-                            // 2. Инициализируем аппаратный рендерер Direct3D 11
                             let inner_size = window.inner_size();
-                            let render_w = if inner_size.width > 0 { inner_size.width } else { self.config.width };
-                            let render_h = if inner_size.height > 0 { inner_size.height } else { self.config.height };
+                            let render_w = if inner_size.width > 0 { inner_size.width } else { 960 };
+                            let render_h = if inner_size.height > 0 { inner_size.height } else { 640 };
                             match crate::renderer::D3D11Renderer::new(hwnd, render_w, render_h) {
                                 Ok(d3d11) => {
-                                    tracing::info!("Аппаратный рендерер Direct3D 11 Flip Discard успешно запущен!");
+                                    tracing::info!("Аппаратный рендерер Direct3D 11 для лаунчера и стрима готов!");
                                     self.renderer = Some(d3d11);
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Не удалось инициализировать D3D11 ({:?}), используется GDI", e);
+                                    tracing::warn!("Не удалось инициализировать D3D11: {:?}", e);
                                 }
                             }
                         }
                     }
 
+                    // Инициализация egui-winit состояния
+                    let egui_state = egui_winit::State::new(
+                        self.egui_ctx.clone(),
+                        egui::ViewportId::ROOT,
+                        &window,
+                        Some(window.scale_factor() as f32),
+                        None,
+                        None,
+                    );
+                    self.egui_winit_state = Some(egui_state);
                     self.window = Some(window);
                 }
                 Err(e) => {
-                    tracing::error!("Ошибка создания окна клиента: {:?}", e);
+                    tracing::error!("Ошибка создания окна приложения: {:?}", e);
                 }
             }
         }
@@ -355,10 +405,31 @@ impl ApplicationHandler for RemoteWardClientApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        let is_overlay = self.launcher_ui.show_overlay;
+        let is_streaming = self.session.is_some() && !is_overlay;
+
+        // Если активен лаунчер или открыт оверлей, события окна передаются в egui
+        if !is_streaming {
+            if let Some(ref window) = self.window {
+                if let Some(ref mut state) = self.egui_winit_state {
+                    let response = state.on_window_event(window, &event);
+                    if response.consumed {
+                        return;
+                    }
+                }
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
-                tracing::info!("Закрытие окна клиентом...");
-                self.is_running.store(false, Ordering::Relaxed);
+                tracing::info!("Закрытие окна приложения Remote-Ward...");
+                if let Some(ref session) = self.session {
+                    session.is_running.store(false, Ordering::Relaxed);
+                }
+                if let Some(h) = self.host_handle.take() {
+                    h.host.stop();
+                    h.task.abort();
+                }
                 event_loop.exit();
             }
 
@@ -370,22 +441,19 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             WindowEvent::Focused(is_focused) => {
                 if let Some(ref hook) = self.keyboard_hook {
-                    hook.set_active(is_focused);
+                    hook.set_active(is_focused && self.session.is_some() && !self.launcher_ui.show_overlay);
                 }
-                if !is_focused {
-                    // При потере фокуса сбрасываем зажатые кнопки мыши
-                    let _ = self.input_tx.send(InputEvent::MouseButton {
-                        button: MouseButton::Left,
-                        state: ButtonState::Released,
-                    });
-                    let _ = self.input_tx.send(InputEvent::MouseButton {
-                        button: MouseButton::Right,
-                        state: ButtonState::Released,
-                    });
-                    let _ = self.input_tx.send(InputEvent::MouseButton {
-                        button: MouseButton::Middle,
-                        state: ButtonState::Released,
-                    });
+                if !is_focused && is_streaming {
+                    if let Some(ref session) = self.session {
+                        let _ = session.input_tx.send(InputEvent::MouseButton {
+                            button: MouseButton::Left,
+                            state: ButtonState::Released,
+                        });
+                        let _ = session.input_tx.send(InputEvent::MouseButton {
+                            button: MouseButton::Right,
+                            state: ButtonState::Released,
+                        });
+                    }
                 }
             }
 
@@ -393,170 +461,132 @@ impl ApplicationHandler for RemoteWardClientApp {
                 if let PhysicalKey::Code(key_code) = key_event.physical_key {
                     let is_pressed = key_event.state == ElementState::Pressed;
 
-                    // Отслеживаем состояние хост-клавиши Right Control
+                    if key_code == KeyCode::ControlLeft || key_code == KeyCode::ControlRight {
+                        self.ctrl_down = is_pressed;
+                    }
+                    if key_code == KeyCode::ShiftLeft || key_code == KeyCode::ShiftRight {
+                        self.shift_down = is_pressed;
+                    }
                     if key_code == KeyCode::ControlRight {
                         self.rctrl_down = is_pressed;
                     }
 
-                    // Комбинация ХОСТ-КЛАВИШ: Right Ctrl + Esc -> завершение работы
-                    if (self.rctrl_down || key_code == KeyCode::ControlRight) && key_code == KeyCode::Escape && is_pressed {
-                        tracing::info!("[HOST KEY] Нажат Right Ctrl + Esc: экстренное чистое завершение работы клиента");
-                        self.is_running.store(false, Ordering::Relaxed);
-                        event_loop.exit();
-                        return;
-                    }
-
-                    // Комбинация ХОСТ-КЛАВИШ: Right Ctrl + H -> переключение полноэкранного режима и освобождение мыши
-                    if self.rctrl_down && key_code == KeyCode::KeyH && is_pressed {
-                        self.cursor_grabbed = !self.cursor_grabbed;
-                        if let Some(ref window) = self.window {
-                            window.set_cursor_visible(!self.cursor_grabbed || self.local_cursor_enabled);
-                            let grab_mode = if self.cursor_grabbed {
-                                winit::window::CursorGrabMode::Confined
-                            } else {
-                                winit::window::CursorGrabMode::None
-                            };
-                            let _ = window.set_cursor_grab(grab_mode);
-
-                            if self.cursor_grabbed {
-                                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                                tracing::info!("[HOST KEY] Right Ctrl + H: Полноэкранный режим (Borderless) + Захват курсора ВКЛЮЧЕН");
-                            } else {
-                                window.set_fullscreen(None);
-                                tracing::info!("[HOST KEY] Right Ctrl + H: Оконный режим + Курсор ОСВОБОЖДЕН ноутбуку");
-                            }
-                        }
-                        return;
-                    }
-
-                    // F8: Переключение активного монитора хоста на лету
-                    if key_code == winit::keyboard::KeyCode::F8 && is_pressed {
-                        if self.last_monitor_switch.elapsed() < Duration::from_millis(300) {
-                            tracing::debug!("F8: Игнорируем дребезг переключения (cooldown 300 мс)");
+                    // ШОРТКАТ Ctrl + Shift + O: Внутриигровой HUD оверлей
+                    if self.ctrl_down && self.shift_down && key_code == KeyCode::KeyO && is_pressed {
+                        if self.session.is_some() {
+                            self.toggle_hud_overlay();
                             return;
                         }
-                        self.last_monitor_switch = Instant::now();
-                        let next_idx = self.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
-                        self.current_monitor_shared.store(next_idx, Ordering::Relaxed);
-                        tracing::info!("F8: Запрос переключения на следующий монитор хоста (#{})", next_idx);
-                        let _ = self.control_tx.send(ControlMessage::SwitchMonitor {
-                            session_id: 1,
-                            monitor_index: next_idx,
-                        });
+                    }
+
+                    // В режиме оверлея: клавиша Escape закрывает оверлей и возвращает мышь в игру
+                    if is_overlay && key_code == KeyCode::Escape && is_pressed {
+                        self.toggle_hud_overlay();
                         return;
                     }
 
-                    // F10: Включение/выключение локального аппаратного курсора (0 мс задержка мыши)
-                    if key_code == winit::keyboard::KeyCode::F10 && key_event.state == ElementState::Pressed {
-                        self.local_cursor_enabled = !self.local_cursor_enabled;
-                        if let Some(ref window) = self.window {
-                            window.set_cursor_visible(self.local_cursor_enabled || !self.cursor_grabbed);
+                    // Экстренное завершение стрима: Right Ctrl + Esc
+                    if (self.rctrl_down || key_code == KeyCode::ControlRight) && key_code == KeyCode::Escape && is_pressed {
+                        if self.session.is_some() {
+                            self.disconnect_to_launcher();
+                            return;
+                        } else {
+                            event_loop.exit();
+                            return;
                         }
-                        tracing::info!("F10: Локальный аппаратный курсор (0 мс задержки) = {}", self.local_cursor_enabled);
-                        let _ = self.control_tx.send(ControlMessage::SetLocalCursor {
-                            session_id: 1,
-                            enabled: self.local_cursor_enabled,
-                        });
-                        return;
                     }
 
-                    // Переключение полноэкранного режима и захвата курсора по клавише F11
-                    if key_code == winit::keyboard::KeyCode::F11 && key_event.state == ElementState::Pressed {
-                        self.cursor_grabbed = !self.cursor_grabbed;
-                        if let Some(ref window) = self.window {
-                            window.set_cursor_visible(!self.cursor_grabbed);
-                            let grab_mode = if self.cursor_grabbed {
-                                winit::window::CursorGrabMode::Confined
-                            } else {
-                                winit::window::CursorGrabMode::None
-                            };
-                            let _ = window.set_cursor_grab(grab_mode);
+                    // Если мы находимся в активном стриме, обрабатываем управление и транслируем на хост
+                    if let Some(ref session) = self.session {
+                        if !is_overlay {
+                            // F8: Переключение активного монитора хоста
+                            if key_code == KeyCode::F8 && is_pressed {
+                                if self.last_monitor_switch.elapsed() >= Duration::from_millis(300) {
+                                    self.last_monitor_switch = Instant::now();
+                                    let next_idx = session.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
+                                    session.current_monitor_shared.store(next_idx, Ordering::Relaxed);
+                                    let _ = session.control_tx.send(ControlMessage::SwitchMonitor {
+                                        session_id: 1,
+                                        monitor_index: next_idx,
+                                    });
+                                }
+                                return;
+                            }
 
-                            if self.cursor_grabbed {
-                                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                                tracing::info!("F11: Полноэкранный режим (Borderless) + Захват курсора ВКЛЮЧЕН");
-                            } else {
-                                window.set_fullscreen(None);
-                                tracing::info!("F11: Оконный режим + Захват курсора ВЫКЛЮЧЕН");
+                            // F10: Локальный аппаратный курсор
+                            if key_code == KeyCode::F10 && is_pressed {
+                                self.local_cursor_enabled = !self.local_cursor_enabled;
+                                if let Some(ref window) = self.window {
+                                    window.set_cursor_visible(self.local_cursor_enabled);
+                                }
+                                let _ = session.control_tx.send(ControlMessage::SetLocalCursor {
+                                    session_id: 1,
+                                    enabled: self.local_cursor_enabled,
+                                });
+                                return;
+                            }
+
+                            // Трансляция клавиши на хост через аппаратный Scan Code
+                            if let Some((scan_code, is_extended)) = keycode_to_scancode(key_code) {
+                                let state = match key_event.state {
+                                    ElementState::Pressed => ButtonState::Pressed,
+                                    ElementState::Released => ButtonState::Released,
+                                };
+                                let _ = session.input_tx.send(InputEvent::Keyboard {
+                                    scan_code,
+                                    is_extended,
+                                    state,
+                                });
                             }
                         }
-                        return;
                     }
+                }
+            }
 
-                    if let Some((scan_code, is_extended)) = keycode_to_scancode(key_code) {
-                        let state = match key_event.state {
+            WindowEvent::CursorMoved { position: _, .. } => {}
+
+            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                if let Some(ref session) = self.session {
+                    if !is_overlay {
+                        let mb = match button {
+                            WinitMouseButton::Left => MouseButton::Left,
+                            WinitMouseButton::Right => MouseButton::Right,
+                            WinitMouseButton::Middle => MouseButton::Middle,
+                            WinitMouseButton::Back => MouseButton::X1,
+                            WinitMouseButton::Forward => MouseButton::X2,
+                            _ => MouseButton::Left,
+                        };
+
+                        let state = match btn_state {
                             ElementState::Pressed => ButtonState::Pressed,
                             ElementState::Released => ButtonState::Released,
                         };
 
-                        let input_event = InputEvent::Keyboard {
-                            scan_code,
-                            is_extended,
+                        let _ = session.input_tx.send(InputEvent::MouseButton {
+                            button: mb,
                             state,
-                        };
-                        let _ = self.input_tx.send(input_event);
-                    }
-                }
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                // В обычном оконном режиме передаем точные координаты курсора с учетом Letterbox
-                if !self.cursor_grabbed {
-                    let (ox, oy, tw, th) = self.get_letterbox();
-                    let fw = if self.last_frame_size.0 > 0 { self.last_frame_size.0 as f64 } else { self.config.width as f64 };
-                    let fh = if self.last_frame_size.1 > 0 { self.last_frame_size.1 as f64 } else { self.config.height as f64 };
-                    if tw > 0.0 && th > 0.0 {
-                        let norm_x = ((position.x - ox) / tw).clamp(0.0, 1.0);
-                        let norm_y = ((position.y - oy) / th).clamp(0.0, 1.0);
-                        let host_x = (norm_x * (fw - 1.0)).round() as u32;
-                        let host_y = (norm_y * (fh - 1.0)).round() as u32;
-                        let _ = self.input_tx.send(InputEvent::MouseMoveAbsolute {
-                            x: host_x,
-                            y: host_y,
                         });
                     }
                 }
             }
 
-            WindowEvent::MouseInput { state: btn_state, button, .. } => {
-                let mb = match button {
-                    WinitMouseButton::Left => MouseButton::Left,
-                    WinitMouseButton::Right => MouseButton::Right,
-                    WinitMouseButton::Middle => MouseButton::Middle,
-                    WinitMouseButton::Back => MouseButton::X1,
-                    WinitMouseButton::Forward => MouseButton::X2,
-                    _ => MouseButton::Left,
-                };
-
-                let state = match btn_state {
-                    ElementState::Pressed => ButtonState::Pressed,
-                    ElementState::Released => ButtonState::Released,
-                };
-
-                let _ = self.input_tx.send(InputEvent::MouseButton {
-                    button: mb,
-                    state,
-                });
-            }
-
             WindowEvent::MouseWheel { delta, .. } => {
-                let (delta_x, delta_y) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        ((x * 120.0) as i16, (y * 120.0) as i16)
+                if let Some(ref session) = self.session {
+                    if !is_overlay {
+                        let (delta_x, delta_y) = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                                ((x * 120.0) as i16, (y * 120.0) as i16)
+                            }
+                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                                (pos.x as i16, pos.y as i16)
+                            }
+                        };
+                        let _ = session.input_tx.send(InputEvent::MouseWheel { delta_y, delta_x });
                     }
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                        (pos.x as i16, pos.y as i16)
-                    }
-                };
-
-                let _ = self.input_tx.send(InputEvent::MouseWheel {
-                    delta_y,
-                    delta_x,
-                });
+                }
             }
 
             WindowEvent::RedrawRequested => {
-                self.draw_current_frame();
                 if let Some(ref window) = self.window {
                     window.pre_present_notify();
                 }
@@ -572,135 +602,235 @@ impl ApplicationHandler for RemoteWardClientApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        // Относительное движение мыши для игр (Raw Mouse Input) передаем только при захваченном курсоре
-        if self.cursor_grabbed {
+        if self.session.is_some() && self.cursor_grabbed && !self.launcher_ui.show_overlay {
             if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
                 if dx != 0.0 || dy != 0.0 {
-                    let _ = self.input_tx.send(InputEvent::MouseMoveRelative {
-                        dx: dx as i32,
-                        dy: dy as i32,
-                    });
+                    if let Some(ref session) = self.session {
+                        let _ = session.input_tx.send(InputEvent::MouseMoveRelative {
+                            dx: dx as i32,
+                            dy: dy as i32,
+                        });
+                    }
                 }
             }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Минимальное время ожидания: опрашиваем цикл событий каждые 1 мс для мгновенного вывода кадров
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
-        // Zero-Buffer Lag: Опустошаем очередь кадров, чтобы отображать только самый свежий кадр
-        // Если пришло 2 или 3 кадра из-за сетевого микро-всплеска, устаревшие кадры сбрасываются
-        let mut latest_frame = None;
-        let mut skipped_stale = 0usize;
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            if latest_frame.is_some() {
-                skipped_stale += 1;
-            }
-            latest_frame = Some(frame);
-        }
-
-        if skipped_stale > 0 {
-            tracing::trace!("Zero-Buffer Lag: пропущено {} устаревших кадров в пользу новейшего", skipped_stale);
-        }
-
-        if let Some(frame) = latest_frame {
-            self.frames_rendered += 1;
-
-            let w = frame.width as usize;
-            let h = frame.height as usize;
-            self.last_frame_size = (frame.width, frame.height);
-
-            // Аппаратный рендерер D3D11: мгновенный вывод на GPU без программной конвертации CPU!
-            let rendered_on_gpu = if let Some(ref mut d3d11) = self.renderer {
-                match d3d11.render_nv12(&frame.data, frame.width, frame.height) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!("Ошибка D3D11 render_nv12: {:?}", e);
-                        false
+        // 1. Проверяем результат асинхронного подключения
+        if let Some(ref mut rx) = self.session_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.session_rx = None;
+                self.connecting_target = None;
+                match res {
+                    Ok(session) => {
+                        tracing::info!("Подключение успешно! Разворачиваем окно в полноэкранный стрим.");
+                        if let Some(ref window) = self.window {
+                            window.set_resizable(true);
+                            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                            window.set_cursor_visible(false);
+                            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                            self.cursor_grabbed = true;
+                        }
+                        if let Some(ref hook) = self.keyboard_hook {
+                            hook.set_active(true);
+                        }
+                        self.session = Some(session);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Не удалось подключиться к хосту: {}", err);
+                        self.launcher_ui.error_message = Some(format!("Ошибка подключения: {}", err));
+                        self.disconnect_to_launcher();
                     }
                 }
-            } else {
-                false
-            };
+            }
+        }
 
-            if !rendered_on_gpu {
-                // Fallback на CPU конвертацию и GDI StretchDIBits
-                let required_bgra_size = w * h * 4;
-                if self.bgra_buffer.len() != required_bgra_size {
-                    self.bgra_buffer.resize(required_bgra_size, 0);
-                }
-                nv12_to_bgra(&frame.data, w, h, &mut self.bgra_buffer);
-                if let Some(ref window) = self.window {
-                    window.request_redraw();
+        // 2. Отрисовка кадров
+        let window = match self.window.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+
+        let inner_size = window.inner_size();
+        let screen_w = inner_size.width;
+        let screen_h = inner_size.height;
+
+        if let Some(ref mut session) = self.session {
+            // Режим СТРИМИНГА
+            let mut latest_frame = None;
+            while let Ok(frame) = session.frame_rx.try_recv() {
+                latest_frame = Some(frame);
+            }
+
+            let mut hud_action = LauncherAction::None;
+            let mut overlay_draw_data = None;
+
+            // Если открыт HUD оверлей, формируем интерфейс egui
+            if self.launcher_ui.show_overlay {
+                if let Some(ref mut state) = self.egui_winit_state {
+                    let raw_input = state.take_egui_input(window);
+                    let rtt = session.current_rtt_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let fps = self.last_fps;
+                    let decode_ms = self.last_decode_ms;
+                    let bitrate = self.app_config.bitrate_mbps as f32;
+
+                    let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                        hud_action = self.launcher_ui.draw_in_stream_hud(ctx, rtt, fps, decode_ms, bitrate);
+                    });
+                    state.handle_platform_output(window, full_output.platform_output);
+                    overlay_draw_data = Some((full_output.shapes, full_output.textures_delta, full_output.pixels_per_point));
                 }
             }
 
-            if self.frames_rendered == 1 {
-                tracing::info!("Первый видеокадр успешно выведен на экран клиента!");
+            match hud_action {
+                LauncherAction::Disconnect => {
+                    self.disconnect_to_launcher();
+                    return;
+                }
+                LauncherAction::SwitchMonitor => {
+                    let next_idx = session.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
+                    session.current_monitor_shared.store(next_idx, Ordering::Relaxed);
+                    let _ = session.control_tx.send(ControlMessage::SwitchMonitor {
+                        session_id: 1,
+                        monitor_index: next_idx,
+                    });
+                }
+                _ => {}
             }
 
+            if let Some(frame) = latest_frame {
+                self.frames_rendered += 1;
+                self.last_decode_ms = frame.latency_us as f64 / 1000.0;
+                self.last_frame_size = (frame.width, frame.height);
+
+                if let Some(ref mut d3d11) = self.renderer {
+                    let _ = d3d11.draw_nv12(&frame.data, frame.width, frame.height);
+
+                    // Если оверлей открыт, рисуем его поверх видеокадра
+                    if let Some((shapes, delta, ppp)) = overlay_draw_data {
+                        let _ = d3d11.update_egui_textures(&delta);
+                        let clipped = self.egui_ctx.tessellate(shapes, ppp);
+                        let _ = d3d11.paint_egui(screen_w, screen_h, ppp, &clipped);
+                    }
+
+                    let _ = d3d11.present();
+                }
+            }
+
+            // Статистика FPS
             if self.last_stats_instant.elapsed() >= Duration::from_secs(1) {
-                let fps = self.frames_rendered;
+                self.last_fps = self.frames_rendered as u32;
                 self.frames_rendered = 0;
                 self.last_stats_instant = Instant::now();
-                let decode_ms = frame.latency_us as f64 / 1000.0;
-                let rtt_ms = self.current_rtt_us.load(Ordering::Relaxed) as f32 / 1000.0;
-                let tearing_str = if let Some(ref d) = self.renderer {
-                    if d.tearing_supported { "FastSync" } else { "VSync" }
-                } else {
-                    "GDI"
-                };
-                tracing::info!(
-                    "Клиент отображает видеопоток: {} FPS [{}] | RTT: {:.1} мс | Декод: {:.2} мс",
-                    fps,
-                    tearing_str,
-                    rtt_ms,
-                    decode_ms
-                );
-                if let Some(ref window) = self.window {
-                    window.set_title(&format!(
-                        "Remote-Ward Client | {}x{} @ {} FPS [{}] | RTT: {:.1} мс | Декод: {:.1} мс",
-                        w, h, fps, tearing_str, rtt_ms, decode_ms
-                    ));
+                let rtt_ms = session.current_rtt_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                window.set_title(&format!(
+                    "Remote-Ward | {} FPS [FastSync] | RTT: {:.1} мс | Декод: {:.1} мс (Ctrl+Shift+O: меню)",
+                    self.last_fps, rtt_ms, self.last_decode_ms
+                ));
+            }
+        } else {
+            // Режим ЛАУНЧЕРА
+            // Обновляем статус встроенного хост-сервера для отображения в UI
+            if let Some(ref h) = self.host_handle {
+                let state = h.host.state();
+                let is_running = state.is_running.load(Ordering::Relaxed);
+                let client = *state.client_endpoint.read().unwrap();
+                let frames = state.frame_counter.load(Ordering::Relaxed);
+                self.launcher_ui.host_server_info = Some(crate::launcher::HostLiveInfo {
+                    is_running,
+                    client_addr: client,
+                    frames_streamed: frames,
+                });
+            } else {
+                self.launcher_ui.host_server_info = None;
+            }
+
+            let mut launcher_action = LauncherAction::None;
+            let mut launcher_draw_data = None;
+
+            if let Some(ref mut state) = self.egui_winit_state {
+                let raw_input = state.take_egui_input(window);
+                let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                    launcher_action = self.launcher_ui.draw_launcher(ctx, &mut self.app_config);
+                });
+                state.handle_platform_output(window, full_output.platform_output);
+                launcher_draw_data = Some((full_output.shapes, full_output.textures_delta, full_output.pixels_per_point));
+            }
+
+            match launcher_action {
+                LauncherAction::Connect(target_addr) => {
+                    self.start_connection(target_addr);
                 }
+                LauncherAction::ToggleHostServer => {
+                    if self.host_handle.is_none() {
+                        tracing::info!("Запуск встроенного хост-сервера Remote-Ward...");
+                        let host = Arc::new(host_server::RemoteWardHost::new(host_server::HostConfig::default()));
+                        let host_clone = Arc::clone(&host);
+                        let task = tokio::spawn(async move {
+                            if let Err(e) = host_clone.run().await {
+                                tracing::error!("Ошибка работы хост-сервера: {:?}", e);
+                            }
+                        });
+                        self.host_handle = Some(HostHandle { host, task });
+                    } else {
+                        tracing::info!("Остановка встроенного хост-сервера Remote-Ward...");
+                        if let Some(h) = self.host_handle.take() {
+                            h.host.stop();
+                            h.task.abort();
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(ref mut d3d11) = self.renderer {
+                // Очистка SwapChain глубоким обсидиановым фоном #0c0a14
+                d3d11.clear([0.047, 0.039, 0.078, 1.0]);
+
+                if let Some((shapes, delta, ppp)) = launcher_draw_data {
+                    let _ = d3d11.update_egui_textures(&delta);
+                    let clipped = self.egui_ctx.tessellate(shapes, ppp);
+                    let _ = d3d11.paint_egui(screen_w, screen_h, ppp, &clipped);
+                }
+
+                let _ = d3d11.present();
             }
         }
     }
 }
 
-/// Запуск клиента Remote-Ward с сетевым потоком и циклом оконного приложения
-pub async fn run_client(
-    config: ClientConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _timer = core_transport::ScopedTimerPeriod::set(1);
-
-    tracing::info!("============================================================");
-    tracing::info!("           ЗАПУСК КЛИЕНТА REMOTE-WARD (STREAMING)           ");
-    tracing::info!("============================================================");
-
+/// Асинхронное создание и запуск всех сетевых компонентов стрима
+async fn spawn_streaming_pipeline(
+    host_ctrl_addr: SocketAddr,
+    config: &AppConfig,
+) -> Result<StreamingSession, String> {
+    let video_port = 48000u16;
     let is_running = Arc::new(AtomicBool::new(true));
     let current_rtt_us = Arc::new(AtomicU32::new(0));
 
-    // 1. Создаем сокет для отправки управления и ввода
-    let control_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    // 1. Создаем сокет управления
+    let control_socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("Не удалось создать сокет управления: {:?}", e))?;
+    let control_socket = Arc::new(control_socket);
     core_transport::optimize_udp_socket(&control_socket);
-    let host_ctrl_addr = config.host_control_addr;
 
-    // 2. Создаем сокет для приема видео с расширенным системным буфером SO_RCVBUF (8 МБ)
-    let video_socket_std = std::net::UdpSocket::bind(format!("0.0.0.0:{}", config.video_port))?;
+    // 2. Создаем видеосокет с буфером 8 МБ
+    let video_socket_std = std::net::UdpSocket::bind(format!("0.0.0.0:{}", video_port))
+        .map_err(|e| format!("Не удалось открыть видеопорт {}: {:?}", video_port, e))?;
     let sock_ref = socket2::SockRef::from(&video_socket_std);
     let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
-    video_socket_std.set_nonblocking(true)?;
-    let video_socket = Arc::new(UdpSocket::from_std(video_socket_std)?);
+    let _ = video_socket_std.set_nonblocking(true);
+    let video_socket = UdpSocket::from_std(video_socket_std)
+        .map_err(|e| format!("Tokio UDP socket error: {:?}", e))?;
+    let video_socket = Arc::new(video_socket);
     core_transport::optimize_udp_socket(&video_socket);
-    tracing::info!(
-        "Сетевой видеосокет клиента открыт на порту {} с буфером SO_RCVBUF 8 МБ и QoS DSCP 46",
-        config.video_port
-    );
 
-    // Фоновая задача пробивки порта в Windows Firewall / NAT и отправки Heartbeat на видеопорт хоста
-    let host_video_addr = SocketAddr::new(config.host_control_addr.ip(), config.video_port);
+    // 3. Фоновая отправка PUNCH пакетов для пробивки NAT
+    let host_video_addr = SocketAddr::new(host_ctrl_addr.ip(), video_port);
     let is_running_punch = Arc::clone(&is_running);
     let video_socket_punch = Arc::clone(&video_socket);
     tokio::spawn(async move {
@@ -711,45 +841,29 @@ pub async fn run_client(
         }
     });
 
-    // Канал для передачи событий ввода из GUI потока в сетевой сокет
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
-    // Канал для передачи декодированных кадров из потока декодера в GUI поток (емкость 4 кадра для сглаживания джиттера)
     let (frame_tx, frame_rx) = mpsc::channel::<DecodedFrame>(4);
-    // Канал для передачи собранных кадров из сетевого потока в поток декодера (емкость 4 кадра)
     let (raw_frame_tx, mut raw_frame_rx) = mpsc::channel::<core_transport::ReassembledFrame>(4);
-
     let current_monitor_shared = Arc::new(AtomicU32::new(0));
     let current_monitor_shared_ctrl = Arc::clone(&current_monitor_shared);
-    let current_monitor_shared_app = Arc::clone(&current_monitor_shared);
 
-    // 3. Быстрая калибровка сети перед началом трансляции (RTT, джиттер, потери, пропускная способность)
+    // 4. Сетевая калибровка
     let session_id = 1u64;
-    let calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id).await;
+    let _calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id).await;
 
-    // Отправляем хосту отчет о результатах калибровки сети
-    let report_msg = ControlMessage::CalibrationReport {
-        session_id,
-        min_rtt_us: calibration.min_rtt_us,
-        avg_rtt_us: calibration.avg_rtt_us,
-        jitter_us: calibration.jitter_us,
-        loss_rate: calibration.packet_loss_rate,
-        selected_bitrate_kbps: calibration.target_bitrate_kbps,
-    };
-    if let Ok(report_bytes) = report_msg.to_packet() {
-        let _ = control_socket.send_to(&report_bytes, host_ctrl_addr).await;
-    }
+    let target_bitrate = (config.bitrate_mbps * 1000).max(10_000);
+    let target_fps = config.target_fps;
 
-    // Задаем вычисленный битрейт
     let settings_msg = ControlMessage::ChangeStreamSettings {
         session_id,
-        target_bitrate_kbps: calibration.target_bitrate_kbps,
-        target_fps: 60,
+        target_bitrate_kbps: target_bitrate,
+        target_fps,
     };
     if let Ok(settings_bytes) = settings_msg.to_packet() {
         let _ = control_socket.send_to(&settings_bytes, host_ctrl_addr).await;
     }
 
-    // 4. Отправляем ClientHello на хост с информацией о возможностях экрана и FastSync Tearing
+    // 5. Отправляем ClientHello
     let hello = ControlMessage::ClientHello(ClientHello {
         client_name: "remote-ward-client".into(),
         client_version: "0.1.0".into(),
@@ -757,22 +871,20 @@ pub async fn run_client(
         client_token: 0,
         supported_codecs: MftVideoDecoder::supported_codecs(),
         preferred_codec: Some(config.preferred_codec),
-        screen_width: config.width,
-        screen_height: config.height,
-        target_fps: 60,
-        display_refresh_rate: 60,
+        screen_width: 2560,
+        screen_height: 1440,
+        target_fps,
+        display_refresh_rate: target_fps,
         supports_tearing: true,
         dpi_scale: 1.0,
-        video_port: config.video_port,
+        video_port,
         supports_nack: true,
         supports_fec: true,
     });
+    let hello_bytes = hello.to_packet().map_err(|e| format!("{:?}", e))?;
+    control_socket.send_to(&hello_bytes, host_ctrl_addr).await.map_err(|e| format!("{:?}", e))?;
 
-    let hello_bytes = hello.to_packet()?;
-    control_socket.send_to(&hello_bytes, host_ctrl_addr).await?;
-    tracing::info!("Отправлен ClientHello на хост {}", host_ctrl_addr);
-
-    // Фоновая задача приема управляющих сообщений (ServerHello, Pong)
+    // 6. Фоновый прием ServerHello, Pong
     let is_running_ctrl_rx = Arc::clone(&is_running);
     let ctrl_socket_rx = Arc::clone(&control_socket);
     let current_rtt_rx = Arc::clone(&current_rtt_us);
@@ -783,28 +895,16 @@ pub async fn run_client(
                 Ok((len, _src)) => {
                     if let Ok(msg) = ControlMessage::from_packet(&buf[..len]) {
                         match msg {
-                            ControlMessage::ServerHello(hello) => {
-                                tracing::info!(
-                                    "Хост подтвердил подключение: {} (v{}) [Стратегия: {:?}, Кодек: {:?}, {}x{} @ {} FPS, FEC {}:{}]",
-                                    hello.server_name, hello.server_version, hello.strategy, hello.selected_codec,
-                                    hello.width, hello.height, hello.target_fps, hello.fec_data_shards, hello.fec_parity_shards
-                                );
+                            ControlMessage::ServerHello(h) => {
+                                tracing::info!("Хост подтвердил сеанс: {} [{}x{} @ {} FPS]", h.server_name, h.width, h.height, h.target_fps);
                             }
-                            ControlMessage::SwitchMonitorAck { monitor_index, width, height, .. } => {
-                                tracing::info!(
-                                    "Хост переключил трансляцию на монитор #{}: разрешение {}x{}",
-                                    monitor_index, width, height
-                                );
+                            ControlMessage::SwitchMonitorAck { monitor_index, .. } => {
                                 current_monitor_shared_ctrl.store(monitor_index, Ordering::Relaxed);
                             }
-                            ControlMessage::Pong { sequence: _, send_timestamp_us, .. } => {
-                                let now_us = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u64;
-                                let rtt_us = now_us.saturating_sub(send_timestamp_us) as u32;
-                                current_rtt_rx.store(rtt_us, Ordering::Relaxed);
-                                tracing::trace!("Активный RTT: {:.2} мс", rtt_us as f32 / 1000.0);
+                            ControlMessage::Pong { send_timestamp_us, .. } => {
+                                let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+                                let rtt = now_us.saturating_sub(send_timestamp_us) as u32;
+                                current_rtt_rx.store(rtt, Ordering::Relaxed);
                             }
                             _ => {}
                         }
@@ -817,7 +917,7 @@ pub async fn run_client(
         }
     });
 
-    // Фоновая задача периодического Ping (каждые 1.5 секунды для контроля канала)
+    // 7. Фоновый Ping каждые 1.5 секунды
     let is_running_ping = Arc::clone(&is_running);
     let ctrl_socket_ping = Arc::clone(&control_socket);
     tokio::spawn(async move {
@@ -825,41 +925,39 @@ pub async fn run_client(
         while is_running_ping.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(1500)).await;
             seq += 1;
-            let now_us = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64;
-            let ping = ControlMessage::Ping {
-                session_id,
-                sequence: seq,
-                send_timestamp_us: now_us,
-            };
-            if let Ok(bytes) = ping.to_packet() {
-                let _ = ctrl_socket_ping.send_to(&bytes, host_ctrl_addr).await;
+            let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+            let ping = ControlMessage::Ping { session_id, sequence: seq, send_timestamp_us: now_us };
+            if let Ok(b) = ping.to_packet() {
+                let _ = ctrl_socket_ping.send_to(&b, host_ctrl_addr).await;
             }
         }
     });
 
-    // Фоновая задача отправки пользовательского ввода с минимальной задержкой (без 100% CPU спина)
+    // 8. Передача пользовательского ввода
     let is_running_input = Arc::clone(&is_running);
     let ctrl_socket_input = Arc::clone(&control_socket);
     tokio::spawn(async move {
-        while let Some(event) = input_rx.recv().await {
-            if !is_running_input.load(Ordering::Relaxed) {
-                break;
-            }
-            if let Ok(bytes) = event.to_packet() {
-                let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
+        let mut input_sequence = 0u32;
+        while is_running_input.load(Ordering::Relaxed) {
+            match input_rx.recv().await {
+                Some(event) => {
+                    input_sequence = input_sequence.wrapping_add(1);
+                    let packet = core_protocol::InputPacket::new(session_id, input_sequence, event);
+                    if let Ok(bytes) = packet.to_packet() {
+                        let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
+                    }
+                }
+                None => break,
             }
         }
     });
 
-    // 5. Выделенный поток аппаратного декодирования MFT (полностью развязан от сетевого сокета)
-    let is_running_decoder = Arc::clone(&is_running);
-    let width = config.width;
-    let height = config.height;
+    // 9. Поток декодера MFT
+    let is_running_dec = Arc::clone(&is_running);
     let preferred_codec = config.preferred_codec;
     let frame_tx_decoder = frame_tx.clone();
+    let initial_width = 2560u32;
+    let initial_height = 1440u32;
 
     std::thread::Builder::new()
         .name("video-decoder".into())
@@ -869,60 +967,35 @@ pub async fn run_client(
             } else {
                 VideoCodec::H264
             };
-            let mut decoder_opt = MftVideoDecoder::new(width, height, effective_codec).ok();
-            let mut frames_count = 0u64;
+            let mut decoder_opt = MftVideoDecoder::new(initial_width, initial_height, effective_codec).ok();
 
-            while is_running_decoder.load(Ordering::Relaxed) {
+            while is_running_dec.load(Ordering::Relaxed) {
                 match raw_frame_rx.blocking_recv() {
                     Some(assembled_frame) => {
-                        frames_count += 1;
-                        if frames_count == 1 {
-                            tracing::info!(
-                                "Первый видеокадр #{} отправлен в аппаратный декодер ({} байт, keyframe={})!",
-                                assembled_frame.frame_id,
-                                assembled_frame.data.len(),
-                                assembled_frame.is_keyframe
-                            );
-                        }
-
                         if let Some(ref mut decoder) = decoder_opt {
                             match decoder.decode(&assembled_frame.data) {
                                 Ok(Some(decoded)) => {
-                                    if frames_count == 1 {
-                                        tracing::info!(
-                                            "Первый видеокадр успешно декодирован в NV12 ({}x{})!",
-                                            decoded.width,
-                                            decoded.height
-                                        );
-                                    }
                                     let _ = frame_tx_decoder.try_send(decoded);
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Ошибка декодирования кадра #{}: {:?}. Авто-восстановление...",
-                                        assembled_frame.frame_id,
-                                        e
-                                    );
-                                    // Если декодер споткнулся (например, смена монитора/энкодера), пересоздаем его на ключевом кадре
+                                    tracing::warn!("Ошибка декодера: {:?}", e);
                                     if assembled_frame.is_keyframe {
-                                        if let Ok(mut new_dec) = MftVideoDecoder::new(width, height, effective_codec) {
+                                        if let Ok(mut new_dec) = MftVideoDecoder::new(initial_width, initial_height, effective_codec) {
                                             if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
                                                 let _ = frame_tx_decoder.try_send(decoded);
                                             }
                                             *decoder = new_dec;
-                                            tracing::info!("MFT декодер успешно пересоздан и восстановил видеопоток!");
                                         }
                                     }
                                 }
                             }
                         } else if assembled_frame.is_keyframe {
-                            if let Ok(mut new_dec) = MftVideoDecoder::new(width, height, effective_codec) {
+                            if let Ok(mut new_dec) = MftVideoDecoder::new(initial_width, initial_height, effective_codec) {
                                 if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
                                     let _ = frame_tx_decoder.try_send(decoded);
                                 }
                                 decoder_opt = Some(new_dec);
-                                tracing::info!("MFT декодер успешно инициализирован на ключевом кадре!");
                             }
                         }
                     }
@@ -930,17 +1003,15 @@ pub async fn run_client(
                 }
             }
         })
-        .unwrap();
+        .map_err(|e| format!("Не удалось запустить поток декодера: {:?}", e))?;
 
-    // 6. Выделенный аудио-плеер WASAPI для воспроизведения системного звука хоста
-    let audio_player = Arc::new(crate::audio_player::WasapiAudioPlayer::new().ok());
-    let audio_player_task = Arc::clone(&audio_player);
-
-    // 7. Выделенный поток сетевого приема и сборки видеопакетов
-    let is_running_video = Arc::clone(&is_running);
+    // 10. Поток сборки видеопакетов (FrameReassembler + NACK + FEC)
+    let is_running_rx = Arc::clone(&is_running);
     let video_socket_task = Arc::clone(&video_socket);
     let ctrl_socket_task = Arc::clone(&control_socket);
     let current_rtt_stats = Arc::clone(&current_rtt_us);
+    let audio_player = Arc::new(crate::audio_player::WasapiAudioPlayer::new().ok());
+    let audio_player_task = Arc::clone(&audio_player);
 
     std::thread::Builder::new()
         .name("video-receiver".into())
@@ -954,7 +1025,6 @@ pub async fn run_client(
                 .unwrap();
 
             rt.block_on(async move {
-                let mut packets_count = 0u64;
                 let mut last_frame_id_opt: Option<u32> = None;
                 let mut waiting_for_clean_keyframe = false;
                 let mut packets_received_window = 0u32;
@@ -964,8 +1034,7 @@ pub async fn run_client(
                 let mut last_nack_instant = Instant::now() - Duration::from_millis(50);
                 let mut last_idr_request = Instant::now() - Duration::from_secs(1);
 
-                while is_running_video.load(Ordering::Relaxed) {
-                    // Периодическая отправка точной статистики потерь пакетов хосту (каждые 1 сек)
+                while is_running_rx.load(Ordering::Relaxed) {
                     if last_stats_sent.elapsed() >= Duration::from_millis(1000) {
                         let total_pkts = packets_received_window + packets_lost_window;
                         let loss_rate = if total_pkts >= 50 {
@@ -993,15 +1062,11 @@ pub async fn run_client(
                     }
 
                     match video_socket_task.recv_from(&mut buf).await {
-                        Ok((len, src)) => {
-                            if len < 4 {
-                                continue;
-                            }
-                            if buf[0] == core_protocol::MSG_TYPE_CONTROL {
+                        Ok((len, _src)) => {
+                            if len < 4 || buf[0] == core_protocol::MSG_TYPE_CONTROL {
                                 continue;
                             }
 
-                            // Прямая передача аудио-пакетов хоста в WASAPI плеер с нулевой задержкой
                             if len >= core_protocol::DatagramHeader::SIZE
                                 && buf[3] == core_protocol::ChannelId::AudioHostToClient as u8
                             {
@@ -1011,33 +1076,20 @@ pub async fn run_client(
                                 continue;
                             }
 
-                            packets_count += 1;
                             packets_received_window += 1;
-                            if packets_count == 1 {
-                                tracing::info!(
-                                    "Первый видеопакет успешно получен от {} ({} байт)!",
-                                    src,
-                                    len
-                                );
-                            }
-
                             let datagram = &buf[..len];
                             let parsed_header = core_protocol::DatagramHeader::parse(datagram).ok().map(|(h, _)| (h.get_frame_id(), h.get_packet_index(), h.get_total_packets()));
 
                             match reassembler.process_packet(datagram) {
                                 Ok(Some(assembled_frame)) => {
-                                    let is_kf = assembled_frame.is_keyframe;
-
-                                    if is_kf {
-                                        // Пришел чистый ключевой кадр IDR — сбрасываем ожидание,
-                                        // буфер декодера гарантированно чист и синхронизирован.
+                                    if assembled_frame.is_keyframe {
                                         waiting_for_clean_keyframe = false;
                                         last_frame_id_opt = Some(assembled_frame.frame_id);
                                         let _ = raw_frame_tx.try_send(assembled_frame);
                                     } else {
                                         let is_gap = match last_frame_id_opt {
                                             Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
-                                            None => true, // Еще не было получено ни одного ключевого кадра
+                                            None => true,
                                         };
 
                                         if is_gap {
@@ -1045,7 +1097,6 @@ pub async fn run_client(
                                             let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
                                             packets_lost_window += gap * 20;
 
-                                            // Мгновенный запрос IDR при выпадении хотя бы одного кадра (debounce 50 мс)
                                             if last_idr_request.elapsed() >= Duration::from_millis(50) {
                                                 let req = ControlMessage::RequestKeyframe {
                                                     session_id,
@@ -1059,10 +1110,6 @@ pub async fn run_client(
                                         }
 
                                         if waiting_for_clean_keyframe {
-                                            // ВАЖНО: Ни при каких обстоятельствах не отправляем осиротевшие P-кадры в декодер!
-                                            // Декодер использует предыдущие кадры как опорные. Если хотя бы один кадр был пропущен,
-                                            // последующие P-кадры вызывают кумулятивное смещение макроблоков (кислотные разводы и рябь).
-                                            // Пропускаем все P-кадры до прихода следующего чистого IDR кадра (хост генерирует его за 2-10 мс).
                                             continue;
                                         }
 
@@ -1072,7 +1119,6 @@ pub async fn run_client(
                                 }
 
                                 Ok(None) => {
-                                    // Кадр не завершен — если пришел хвостовой пакет, проверяем пропущенные фрагменты для NACK
                                     if let Some((current_fid, packet_idx, total_pkts)) = parsed_header {
                                         if packet_idx + 1 == total_pkts || packet_idx > 5 {
                                             if let Some(missing) = reassembler.get_missing_packets(current_fid) {
@@ -1092,22 +1138,19 @@ pub async fn run_client(
                                         }
                                     }
                                 }
-
-                                Err(e) => {
-                                    tracing::trace!("Ошибка обработки пакета сборщиком: {:?}", e);
-                                }
+                                Err(_) => {}
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("Ошибка чтения видеосокета: {:?}", e);
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                     }
                 }
             });
         })
-        .unwrap();
+        .map_err(|e| format!("Не удалось запустить видеоприемник: {:?}", e))?;
 
-    // 8. Канал для передачи команд управления из GUI приложения (F8 мониторы, F10 курсор)
+    // 11. Канал команд управления
     let (control_cmd_tx, mut control_cmd_rx) = mpsc::unbounded_channel::<ControlMessage>();
     let ctrl_socket_cmds = Arc::clone(&control_socket);
     tokio::spawn(async move {
@@ -1118,21 +1161,32 @@ pub async fn run_client(
         }
     });
 
-    // 9. Запуск оконного цикла событий Winit
+    Ok(StreamingSession {
+        input_tx,
+        control_tx: control_cmd_tx,
+        frame_rx,
+        is_running,
+        current_rtt_us,
+        current_monitor_shared,
+        host_addr: host_ctrl_addr,
+    })
+}
+
+/// Запуск клиента Remote-Ward (открывает Launcher UI с возможностью перехода в стрим)
+pub async fn run_client(
+    app_config: AppConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _timer = core_transport::ScopedTimerPeriod::set(1);
+
+    tracing::info!("============================================================");
+    tracing::info!("              ЗАПУСК REMOTE-WARD LAUNCHER GUI               ");
+    tracing::info!("============================================================");
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
-    let mut app = RemoteWardClientApp::new(
-        config,
-        input_tx,
-        control_cmd_tx,
-        frame_rx,
-        Arc::clone(&is_running),
-        Arc::clone(&current_rtt_us),
-        current_monitor_shared_app,
-    );
+    let mut app = RemoteWardClientApp::new(app_config);
     event_loop.run_app(&mut app)?;
 
-    is_running.store(false, Ordering::Relaxed);
     Ok(())
 }

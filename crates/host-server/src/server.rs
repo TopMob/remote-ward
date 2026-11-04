@@ -25,7 +25,7 @@ impl Default for HostConfig {
         Self {
             video_port: 48000,
             control_port: 48001,
-            bitrate_kbps: 30_000, // 30 Мбит/с для идеального баланса четкости 1440p и плавности Wi-Fi
+            bitrate_kbps: 45_000, // 45 Мбит/с для кристальной четкости в динамике без "мыла"
             fps: 60,
             preferred_codec: VideoCodec::H264, // H.264 по умолчанию для гарантированной аппаратной совместимости
         }
@@ -352,8 +352,8 @@ impl RemoteWardHost {
                                         ..
                                     } => {
                                         let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
-                                        const OPTIMAL_TARGET_BITRATE: u32 = 28_000;
-                                        const MAX_BITRATE: u32 = 32_000;
+                                        const OPTIMAL_TARGET_BITRATE: u32 = 45_000;
+                                        const MAX_BITRATE: u32 = 60_000;
                                         const MIN_BITRATE: u32 = 14_000;
 
                                         if packet_loss_rate > 0.02 {
@@ -372,9 +372,9 @@ impl RemoteWardHost {
                                             if packet_loss_rate > 0.08 {
                                                 state.force_keyframe.store(true, Ordering::SeqCst);
                                             }
-                                        } else if rtt_us > 35_000 && current_bitrate > 20_000 {
+                                        } else if rtt_us > 35_000 && current_bitrate > 25_000 {
                                             // Защита от bufferbloat в роутере
-                                            let new_bitrate = (current_bitrate.saturating_sub(1_500)).max(MIN_BITRATE);
+                                            let new_bitrate = (current_bitrate.saturating_sub(2_000)).max(MIN_BITRATE);
                                             if new_bitrate < current_bitrate {
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::info!(
@@ -386,8 +386,8 @@ impl RemoteWardHost {
                                             }
                                         } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 20.0 && rtt_us > 0 {
                                             if current_bitrate < OPTIMAL_TARGET_BITRATE {
-                                                // Плавный подъем к целевому оптимуму 28 Мбит/с
-                                                let new_bitrate = (current_bitrate + 1_000).min(OPTIMAL_TARGET_BITRATE);
+                                                // Плавный подъем к целевому оптимуму 45 Мбит/с
+                                                let new_bitrate = (current_bitrate + 1_500).min(OPTIMAL_TARGET_BITRATE);
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::info!(
                                                     "[ABR Адаптация] Сеть стабильна (loss 0.0%, RTT {:.1} мс). Подъем к целевому: {} -> {} кбит/с",
@@ -396,7 +396,7 @@ impl RemoteWardHost {
                                                     new_bitrate
                                                 );
                                             } else if current_bitrate < MAX_BITRATE {
-                                                // Выше 28 Мбит/с — режим удержания (Hold) с очень осторожным зондированием до 32 Мбит/с
+                                                // Выше 45 Мбит/с — режим осторожного зондирования до 60 Мбит/с
                                                 let new_bitrate = (current_bitrate + 500).min(MAX_BITRATE);
                                                 state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
                                                 tracing::debug!(

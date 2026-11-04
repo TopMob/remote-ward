@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Remote-Ward Host Server
 echo [Remote-Ward] Проверка обновлений...
 git pull --ff-only

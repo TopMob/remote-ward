@@ -1,41 +1,53 @@
 //! # Windows Low-Level Keyboard Hook (WH_KEYBOARD_LL)
 //!
 //! Перехватывает системные клавиши Windows (клавиши Win, Alt+Tab, Ctrl+Esc,
-//! системные шорткаты Win+D, Win+E, Win+R и т.д.), которые операционная система
+//! системные шорткаты Win+D, Win+E, Win+R, Win+Tab, Alt+F4 и т.д.), которые операционная система
 //! клиента обычно перехватывает до того, как они дойдут до окна приложения.
 //!
 //! При активном окне удаленного сеанса:
 //! 1. Клавиша отправляется на хост через `input_tx`.
-//! 2. Локальная обработка блокируется (возврат 1 из хука), чтобы клиентский ПК
-//!    не открывал меню Пуск и не переключал локальные окна.
+//! 2. Локальная обработка блокируется (возврат 1 из хука), чтобы клиентский ПК (ноутбук)
+//!    не открывал меню Пуск, не сворачивал окна и не переключал локальные задачи.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW,
-    PostMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-    GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL,
-    WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow,
+    GetMessageW, GetWindowThreadProcessId, PostMessageW, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use core_protocol::{ButtonState, InputEvent};
 
 const VK_TAB: u32 = 0x09;
 const VK_ESCAPE: u32 = 0x1B;
+const VK_SPACE: u32 = 0x20;
 const VK_CONTROL: i32 = 0x11;
-const VK_RCONTROL: i32 = 0xA3;
+const VK_LCONTROL: u32 = 0xA2;
+const VK_RCONTROL: u32 = 0xA3;
 const VK_MENU: i32 = 0x12; // Alt
+const VK_LMENU: u32 = 0xA4;
+const VK_RMENU: u32 = 0xA5;
 const VK_END: u32 = 0x23;
+const VK_F4: u32 = 0x73;
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
 
 // Флаг в KBDLLHOOKSTRUCT.flags: нажата клавиша Alt
 const LLKHF_ALTDOWN: u32 = 0x20;
 const LLKHF_EXTENDED: u32 = 0x01;
+
+/// Атомарное отслеживание состояния системных модификаторов в памяти хука
+static WIN_DOWN: AtomicBool = AtomicBool::new(false);
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Глобальное состояние для обратного вызова хука Windows
 struct HookContext {
@@ -48,6 +60,16 @@ struct HookContext {
 static mut HOOK_HANDLE: HHOOK = HHOOK(std::ptr::null_mut());
 static mut HOOK_CTX: Option<HookContext> = None;
 
+#[inline]
+fn resolve_scancode(kbd: &KBDLLHOOKSTRUCT) -> u16 {
+    let raw = (kbd.scanCode & 0xFF) as u16;
+    if raw != 0 {
+        raw
+    } else {
+        unsafe { MapVirtualKeyW(kbd.vkCode, MAPVK_VK_TO_VSC) as u16 }
+    }
+}
+
 /// Процедура хука WH_KEYBOARD_LL
 unsafe extern "system" fn low_level_keyboard_proc(
     n_code: i32,
@@ -59,20 +81,24 @@ unsafe extern "system" fn low_level_keyboard_proc(
             // Проверяем: включен ли захват и активно ли наше окно
             if ctx.is_active.load(Ordering::Relaxed) {
                 let fg = GetForegroundWindow();
-                let is_target_focused = if fg == ctx.target_hwnd {
-                    true
-                } else {
-                    let fg_root = GetAncestor(fg, GA_ROOT);
-                    let target_root = GetAncestor(ctx.target_hwnd, GA_ROOT);
-                    fg_root == target_root && fg_root != HWND(std::ptr::null_mut())
-                };
+                let mut fg_pid = 0u32;
+                GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+                let current_pid = windows::Win32::System::Threading::GetCurrentProcessId();
+
+                let is_target_focused = (fg_pid != 0 && fg_pid == current_pid)
+                    || fg == ctx.target_hwnd
+                    || {
+                        let fg_root = GetAncestor(fg, GA_ROOT);
+                        let target_root = GetAncestor(ctx.target_hwnd, GA_ROOT);
+                        fg_root == target_root && fg_root != HWND(std::ptr::null_mut())
+                    };
 
                 if is_target_focused {
                     let kbd = &*(l_param.0 as *const KBDLLHOOKSTRUCT);
                     let vk = kbd.vkCode;
                     let flags = kbd.flags.0;
                     let is_extended = (flags & LLKHF_EXTENDED) != 0;
-                    let alt_down = (flags & LLKHF_ALTDOWN) != 0;
+                    let alt_flag = (flags & LLKHF_ALTDOWN) != 0;
 
                     let msg_type = w_param.0 as u32;
                     let is_down = msg_type == WM_KEYDOWN || msg_type == WM_SYSKEYDOWN;
@@ -85,8 +111,16 @@ unsafe extern "system" fn low_level_keyboard_proc(
                             ButtonState::Released
                         };
 
-                        // 0. ХОСТ-КЛАВИША: Проверяем Right Control
-                        let rctrl_down = (GetAsyncKeyState(VK_RCONTROL) as u16 & 0x8000) != 0;
+                        // Обновляем состояния модификаторов в памяти хука
+                        if vk == VK_LMENU || vk == VK_RMENU || vk == VK_MENU as u32 {
+                            ALT_DOWN.store(is_down, Ordering::Relaxed);
+                        }
+                        if vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_CONTROL as u32 {
+                            CTRL_DOWN.store(is_down, Ordering::Relaxed);
+                        }
+
+                        // 0. ХОСТ-КЛАВИША: Right Control
+                        let rctrl_down = vk == VK_RCONTROL || (GetAsyncKeyState(VK_RCONTROL as i32) as u16 & 0x8000) != 0;
                         if rctrl_down {
                             // Right Control + Esc: экстренное чистое закрытие клиента
                             if vk == VK_ESCAPE {
@@ -100,31 +134,27 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
                             // Right Control + H: освобождение мыши и выход из полноэкранного режима
                             if vk == 0x48 /* Key 'H' */ {
-                                // Пропускаем событие в Winit (app.rs) для переключения окна и курсора
                                 return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
                             }
                         }
 
-                        // 1. Проверяем комбинацию Ctrl + Alt + End (шорткат для Ctrl+Alt+Del на удаленном хосте)
-                        if vk == VK_END && alt_down {
-                            let ctrl_down = (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
-                            if ctrl_down {
-                                tracing::info!("[KEY_HOOK] Перехвачен Ctrl+Alt+End -> отправка Ctrl+Alt+Del на хост");
-                                let _ = ctx.input_tx.send(InputEvent::Keyboard {
-                                    scan_code: 0x53, // Scan code Delete
-                                    is_extended: true,
-                                    state,
-                                });
-                                return LRESULT(1);
-                            }
+                        // 1. Комбинация Ctrl + Alt + End -> отправка Ctrl+Alt+Del на хост
+                        let alt_pressed = alt_flag || ALT_DOWN.load(Ordering::Relaxed) || (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
+                        let ctrl_pressed = CTRL_DOWN.load(Ordering::Relaxed) || (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
+
+                        if vk == VK_END && alt_pressed && ctrl_pressed {
+                            tracing::info!("[KEY_HOOK] Перехвачен Ctrl+Alt+End -> отправка Ctrl+Alt+Del на хост");
+                            let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                scan_code: 0x53, // Scan code Delete
+                                is_extended: true,
+                                state,
+                            });
+                            return LRESULT(1);
                         }
 
-                        // 2. Системные клавиши Win и комбинации (Win+D, Win+E, Win+R, Win+Tab и т.д.)
-                        let lwin_phys = (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0;
-                        let rwin_phys = (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0;
-                        let win_down = lwin_phys || rwin_phys;
-
+                        // 2. Системные клавиши Win (Пуск) и комбинации (Win+D, Win+E, Win+R, Win+Tab, Win+1..9 и т.д.)
                         if vk == VK_LWIN || vk == VK_RWIN {
+                            WIN_DOWN.store(is_down, Ordering::Relaxed);
                             let scan_code = if vk == VK_LWIN { 0x5B } else { 0x5C };
                             let _ = ctx.input_tx.send(InputEvent::Keyboard {
                                 scan_code,
@@ -135,9 +165,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
                             return LRESULT(1);
                         }
 
-                        if win_down {
-                            // При зажатом Win перехватываем любую сопутствующую клавишу (например D в Win+D)
-                            let scan_code = (kbd.scanCode & 0xFF) as u16;
+                        if WIN_DOWN.load(Ordering::Relaxed) {
+                            // При зажатом Win перехватываем ЛЮБУЮ клавишу (Win+D, Win+E, Win+R, Win+Tab, Win+Стрелки...)
+                            let scan_code = resolve_scancode(kbd);
                             let _ = ctx.input_tx.send(InputEvent::Keyboard {
                                 scan_code,
                                 is_extended,
@@ -147,22 +177,19 @@ unsafe extern "system" fn low_level_keyboard_proc(
                             return LRESULT(1);
                         }
 
-                        // 3. Alt + Tab (переключение окон на хосте, а не на клиенте!)
-                        let is_alt_pressed = alt_down || (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
-                        if vk == VK_TAB && is_alt_pressed {
-                            let _ = ctx.input_tx.send(InputEvent::Keyboard {
-                                scan_code: 0x0F, // Scan code Tab
-                                is_extended: false,
-                                state,
-                            });
-                            // Блокируем локальный Alt+Tab переключатель задач на клиенте!
-                            return LRESULT(1);
-                        }
+                        // 3. Alt + Tab, Alt + Shift + Tab, Alt + Esc, Alt + Space, Alt + F4
+                        if alt_pressed {
+                            if vk == VK_TAB {
+                                let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                    scan_code: 0x0F, // Scan code Tab
+                                    is_extended: false,
+                                    state,
+                                });
+                                // Блокируем локальный Alt+Tab переключатель задач на клиенте!
+                                return LRESULT(1);
+                            }
 
-                        // 4. Ctrl + Esc (еще один системный способ открыть Пуск на хосте)
-                        if vk == VK_ESCAPE {
-                            let ctrl_down = (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
-                            if ctrl_down && !rctrl_down {
+                            if vk == VK_ESCAPE {
                                 let _ = ctx.input_tx.send(InputEvent::Keyboard {
                                     scan_code: 0x01, // Esc
                                     is_extended: false,
@@ -170,9 +197,43 @@ unsafe extern "system" fn low_level_keyboard_proc(
                                 });
                                 return LRESULT(1);
                             }
+
+                            if vk == VK_SPACE {
+                                let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                    scan_code: 0x39, // Space
+                                    is_extended: false,
+                                    state,
+                                });
+                                return LRESULT(1);
+                            }
+
+                            if vk == VK_F4 {
+                                let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                    scan_code: 0x3E, // F4
+                                    is_extended: false,
+                                    state,
+                                });
+                                // Передаем Alt+F4 на хост для закрытия активного окна на ПК, не закрывая окно клиента
+                                return LRESULT(1);
+                            }
+                        }
+
+                        // 4. Ctrl + Esc (еще один системный способ открыть Пуск на хосте)
+                        if vk == VK_ESCAPE && ctrl_pressed && !rctrl_down {
+                            let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                scan_code: 0x01, // Esc
+                                is_extended: false,
+                                state,
+                            });
+                            return LRESULT(1);
                         }
                     }
                 }
+            } else {
+                // Если окно не активно, сбрасываем состояние зажатых модификаторов
+                WIN_DOWN.store(false, Ordering::Relaxed);
+                ALT_DOWN.store(false, Ordering::Relaxed);
+                CTRL_DOWN.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -214,10 +275,11 @@ impl SystemKeyboardHook {
                     input_tx,
                 });
 
+                let hmod = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
                 let hook = SetWindowsHookExW(
                     WH_KEYBOARD_LL,
                     Some(low_level_keyboard_proc),
-                    HMODULE(std::ptr::null_mut()),
+                    hmod,
                     0,
                 );
 
@@ -244,6 +306,9 @@ impl SystemKeyboardHook {
                 let _ = UnhookWindowsHookEx(HOOK_HANDLE);
                 HOOK_HANDLE = HHOOK(std::ptr::null_mut());
                 HOOK_CTX = None;
+                WIN_DOWN.store(false, Ordering::Relaxed);
+                ALT_DOWN.store(false, Ordering::Relaxed);
+                CTRL_DOWN.store(false, Ordering::Relaxed);
                 tracing::info!("Глобальный хук WH_KEYBOARD_LL снят");
             })
             .expect("Failed to spawn keyboard-hook thread");
@@ -256,6 +321,11 @@ impl SystemKeyboardHook {
 
     /// Включить/выключить перехват (например, при потере фокуса)
     pub fn set_active(&self, active: bool) {
+        if !active {
+            WIN_DOWN.store(false, Ordering::Relaxed);
+            ALT_DOWN.store(false, Ordering::Relaxed);
+            CTRL_DOWN.store(false, Ordering::Relaxed);
+        }
         self.is_active.store(active, Ordering::SeqCst);
     }
 }

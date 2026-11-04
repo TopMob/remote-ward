@@ -63,7 +63,8 @@ VSOutput main(uint id : SV_VertexID) {
 }
 "#;
 
-// Пиксельный шейдер для аппаратного преобразования NV12 -> RGB с калиброванным цветом (BT.709 Studio Range + Coring CAS)
+// Пиксельный шейдер для аппаратного преобразования NV12 -> RGB с калиброванным цветом (BT.709 Studio Range)
+// Использует чистое высокоточное сэмплирование без искусственного шарпенинга, чтобы не усиливать артефакты макроблоков и рябь
 const PS_NV12_HLSL: &str = r#"
 Texture2D<float>  texY  : register(t0);
 Texture2D<float2> texUV : register(t1);
@@ -75,27 +76,12 @@ struct VSOutput {
 };
 
 float4 main(VSOutput input) : SV_Target {
-    float2 texSize;
-    texY.GetDimensions(texSize.x, texSize.y);
-    float2 px = 1.0 / texSize;
-
-    float yCenter = texY.Sample(samp, input.uv);
-    float yUp     = texY.Sample(samp, input.uv + float2(0.0, -px.y));
-    float yDown   = texY.Sample(samp, input.uv + float2(0.0,  px.y));
-    float yLeft   = texY.Sample(samp, input.uv + float2(-px.x, 0.0));
-    float yRight  = texY.Sample(samp, input.uv + float2( px.x, 0.0));
-
-    // Мягкий CAS фильтр с порогом (coring): сохраняет шрифты резкими, но устраняет рябь и шум в играх
-    float yAvg = (yUp + yDown + yLeft + yRight) * 0.25;
-    float yDelta = yCenter - yAvg;
-    float sharpDelta = clamp(yDelta * 0.25, -0.04, 0.04);
-    float y = clamp(yCenter + sharpDelta, 0.0, 1.0);
-
+    float y = texY.Sample(samp, input.uv);
     float2 uv = texUV.Sample(samp, input.uv);
     float u = uv.x - 0.5;
     float v = uv.y - 0.5;
 
-    // Калиброванная матрица BT.709 Limited Range (NVENC Studio Swing) — естественные цвета без кислотности
+    // Калиброванная матрица BT.709 Limited Range (NVENC Studio Swing) — естественные цвета без искажений
     float c = 1.16438356 * (y - 0.0627451);
     float r = c + 1.79274107 * v;
     float g = c - 0.21324861 * u - 0.53290933 * v;

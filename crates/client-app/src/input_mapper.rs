@@ -127,3 +127,39 @@ pub fn keycode_to_scancode(key: KeyCode) -> Option<(u16, bool)> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wasd_gaming_scancodes() {
+        assert_eq!(keycode_to_scancode(KeyCode::KeyW), Some((0x11, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::KeyA), Some((0x1E, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::KeyS), Some((0x1F, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::KeyD), Some((0x20, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::Space), Some((0x39, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::ShiftLeft), Some((0x2A, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::ControlLeft), Some((0x1D, false)));
+    }
+
+    #[test]
+    fn test_extended_keys() {
+        // Стрелки должны иметь флаг is_extended = true
+        assert_eq!(keycode_to_scancode(KeyCode::ArrowUp), Some((0x48, true)));
+        assert_eq!(keycode_to_scancode(KeyCode::ArrowDown), Some((0x50, true)));
+        assert_eq!(keycode_to_scancode(KeyCode::ArrowLeft), Some((0x4B, true)));
+        assert_eq!(keycode_to_scancode(KeyCode::ArrowRight), Some((0x4D, true)));
+        assert_eq!(keycode_to_scancode(KeyCode::SuperLeft), Some((0x5B, true)));
+    }
+
+    #[test]
+    fn test_function_keys() {
+        assert_eq!(keycode_to_scancode(KeyCode::F1), Some((0x3B, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::F5), Some((0x3F, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::F8), Some((0x42, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::F10), Some((0x44, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::F11), Some((0x57, false)));
+        assert_eq!(keycode_to_scancode(KeyCode::F12), Some((0x58, false)));
+    }
+}

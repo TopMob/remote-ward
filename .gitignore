@@ -40,6 +40,8 @@ logs/
 *.pcm
 *.dmp
 *.crash
+*.tmp
+*.bak
 
 # === Secrets, Certificates & Keys ===
 *.pem

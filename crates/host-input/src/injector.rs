@@ -206,13 +206,22 @@ impl WindowsInputInjector {
                 is_extended,
                 state,
             } => {
-                {
+                let is_ctrl_alt_del = {
                     let mut held = self.pressed_keys.lock().unwrap();
                     if *state == ButtonState::Pressed {
                         held.insert((*scan_code, *is_extended));
                     } else {
                         held.remove(&(*scan_code, *is_extended));
                     }
+                    // Детектируем Ctrl + Alt + Del
+                    let ctrl_held = held.contains(&(0x1D, false)) || held.contains(&(0x1D, true));
+                    let alt_held = held.contains(&(0x38, false)) || held.contains(&(0x38, true));
+                    *scan_code == 0x53 && ctrl_held && alt_held && *state == ButtonState::Pressed
+                };
+
+                if is_ctrl_alt_del {
+                    tracing::info!("[ИНЖЕКТОР] Обнаружена комбинация Ctrl+Alt+Del -> вызов Secure Attention Sequence (SAS)");
+                    self.send_sas();
                 }
 
                 let mut flags = KEYEVENTF_SCANCODE;
@@ -259,6 +268,29 @@ impl WindowsInputInjector {
             });
         }
         Ok(())
+    }
+
+    /// Отправка Secure Attention Sequence (Ctrl+Alt+Del) в Windows через sas.dll
+    pub fn send_sas(&self) -> bool {
+        unsafe {
+            use windows::core::s;
+            use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+            let h_module = LoadLibraryA(s!("sas.dll"));
+            if let Ok(module) = h_module {
+                if !module.is_invalid() {
+                    let proc = GetProcAddress(module, s!("SendSAS"));
+                    if let Some(proc) = proc {
+                        type SendSasFn = unsafe extern "system" fn(i32);
+                        let send_sas_fn: SendSasFn = std::mem::transmute(proc);
+                        send_sas_fn(0); // 0 = FALSE (system SAS)
+                        tracing::info!("Успешно вызван SendSAS (Secure Attention Sequence)");
+                        return true;
+                    }
+                }
+            }
+            tracing::debug!("sas.dll SendSAS недоступен, используется стандартный ввод");
+            false
+        }
     }
 
     /// Гарантированный сброс всех зажатых клавиш и кнопок мыши при обрыве соединения или завершении сессии

@@ -219,6 +219,11 @@ impl NvencEncoder {
                 h264.set_repeatSPSPPS(1);
                 h264.idrPeriod = 0xFFFFFFFF;
                 h264.maxNumRefFrames = 1;
+
+                // Включаем Intra-Refresh (Gradual Decoder Refresh) для устранения всплесков битрейта IDR-кадров
+                h264.intraRefreshPeriod = fps.max(30); // Цикл обновления раз в 1 секунду
+                h264.intraRefreshCnt = (fps / 2).max(15); // Размазываем обновление на 0.5 сек
+
                 h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
                 h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
                 h264.h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
@@ -231,6 +236,11 @@ impl NvencEncoder {
                 hevc.set_repeatSPSPPS(1);
                 hevc.idrPeriod = 0xFFFFFFFF;
                 hevc.maxNumRefFramesInDPB = 1;
+
+                // Включаем Intra-Refresh для HEVC
+                hevc.intraRefreshPeriod = fps.max(30);
+                hevc.intraRefreshCnt = (fps / 2).max(15);
+
                 hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
                 hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
                 hevc.hevcVUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;

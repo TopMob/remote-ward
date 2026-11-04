@@ -5,10 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
 use core_protocol::{
-    flags, ControlMessage, DatagramHeader, FramePacketizer, InputPacket, KeyframeReason,
-    ServerHello, VideoCodec, DEFAULT_MAX_PAYLOAD_SIZE, PROTOCOL_VERSION,
+    ControlMessage, FramePacketizer, InputEvent, ServerHello, VideoCodec, PROTOCOL_VERSION,
 };
-use core_transport::{CongestionConfig, CongestionController};
+use core_transport::{CongestionConfig, CongestionController, PacedSender};
 use host_capture::WgcCaptureSession;
 use host_encode::NvencEncoder;
 use host_input::WindowsInputInjector;
@@ -96,6 +95,19 @@ impl RemoteWardHost {
             self.config.control_port
         );
 
+        // Определение публичного адреса хоста через STUN для удаленного подключения извне дома (WAN)
+        {
+            let stun_socket = Arc::clone(&control_socket);
+            tokio::spawn(async move {
+                if let Some(res) = core_transport::discover_public_endpoint(&stun_socket).await {
+                    tracing::info!("============================================================");
+                    tracing::info!("   ПУБЛИЧНЫЙ АДРЕС ХОСТА ДЛЯ ПОДКЛЮЧЕНИЯ ИЗ ИНТЕРНЕТА (WAN):  ");
+                    tracing::info!("   -> {} (RTT: {} мс)                           ", res.public_addr, res.rtt_ms);
+                    tracing::info!("============================================================");
+                }
+            });
+        }
+
         // 2. Создаем сокет для видеопотока с буфером 4 МБ для защиты от сброса пакетов ОС
         let video_socket_raw = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?;
         let sock_ref = socket2::SockRef::from(&video_socket_raw);
@@ -131,11 +143,14 @@ impl RemoteWardHost {
             });
         }
 
+        let paced_sender = Arc::new(PacedSender::new(Arc::clone(&video_socket), self.config.fps));
+
         // Фоновая задача обработки управляющих сообщений и ввода
         let control_task = {
             let socket = Arc::clone(&control_socket);
             let state = Arc::clone(&self.state);
             let injector = Arc::clone(&self.input_injector);
+            let paced_sender_ctrl = Arc::clone(&paced_sender);
             let config_fps = self.config.fps;
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
@@ -200,11 +215,16 @@ impl RemoteWardHost {
                                         let response = ControlMessage::ServerHello(ServerHello {
                                             server_name: "remote-ward-host".into(),
                                             server_version: "0.1.0".into(),
+                                            protocol_version: PROTOCOL_VERSION as u32,
+                                            session_id: 1,
                                             selected_codec: selected,
                                             width: if real_w > 0 { real_w } else { hello.screen_width },
                                             height: if real_h > 0 { real_h } else { hello.screen_height },
                                             target_fps: config_fps,
-                                            session_id: "session-001".into(),
+                                            nack_enabled: hello.supports_nack,
+                                            fec_enabled: hello.supports_fec,
+                                            fec_data_shards: 10,
+                                            fec_parity_shards: 2,
                                         });
 
                                         if let Ok(resp_bytes) = response.to_packet() {
@@ -216,13 +236,28 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::RequestKeyframe { reason } => {
+                                    ControlMessage::RequestKeyframe { reason, .. } => {
                                         tracing::debug!("Клиент запросил ключевой кадр: {}", reason);
                                         state.force_keyframe.store(true, Ordering::SeqCst);
                                     }
 
-                                    ControlMessage::Ping { sequence, send_timestamp_us } => {
+                                    ControlMessage::Nack { frame_id, missing_packet_indices, .. } => {
+                                        if let Some(target) = *state.client_endpoint.read().unwrap() {
+                                            let count = paced_sender_ctrl.handle_nack_retransmit(
+                                                frame_id,
+                                                &missing_packet_indices,
+                                                target,
+                                            );
+                                            tracing::trace!(
+                                                "[NACK] Повторно отправлено {} пакетов для кадра #{}",
+                                                count, frame_id
+                                            );
+                                        }
+                                    }
+
+                                    ControlMessage::Ping { sequence, send_timestamp_us, .. } => {
                                         let pong = ControlMessage::Pong {
+                                            session_id: 1,
                                             sequence,
                                             send_timestamp_us,
                                         };
@@ -231,8 +266,9 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::SpeedProbe { sequence, payload_size } => {
+                                    ControlMessage::SpeedProbe { sequence, payload_size, .. } => {
                                         let ack = ControlMessage::SpeedProbeAck {
+                                            session_id: 1,
                                             sequence,
                                             payload_size,
                                         };
@@ -241,7 +277,7 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::ChangeStreamSettings { target_bitrate_kbps, target_fps: _ } => {
+                                    ControlMessage::ChangeStreamSettings { target_bitrate_kbps, .. } => {
                                         let clamped = target_bitrate_kbps.clamp(4_000, 60_000);
                                         let old = state.target_bitrate_kbps.swap(clamped, Ordering::SeqCst);
                                         tracing::info!(
@@ -250,7 +286,7 @@ impl RemoteWardHost {
                                         );
                                     }
 
-                                    ControlMessage::CalibrationReport { min_rtt_us, avg_rtt_us, jitter_us, loss_rate, selected_bitrate_kbps } => {
+                                    ControlMessage::CalibrationReport { min_rtt_us, avg_rtt_us, jitter_us, loss_rate, selected_bitrate_kbps, .. } => {
                                         let clamped = selected_bitrate_kbps.clamp(4_000, 60_000);
                                         state.target_bitrate_kbps.store(clamped, Ordering::SeqCst);
                                         tracing::info!(
@@ -265,10 +301,8 @@ impl RemoteWardHost {
 
                                     ControlMessage::ClientStats {
                                         rtt_us,
-                                        jitter_us: _,
-                                        decode_latency_us: _,
-                                        render_latency_us: _,
                                         packet_loss_rate,
+                                        ..
                                     } => {
                                         let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
                                         if packet_loss_rate > 0.03 {
@@ -314,7 +348,7 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::Disconnect { reason } => {
+                                    ControlMessage::Disconnect { reason, .. } => {
                                         tracing::info!("Клиент отключился: {}", reason);
                                         let mut endpoint = state.client_endpoint.write().unwrap();
                                         *endpoint = None;
@@ -335,7 +369,7 @@ impl RemoteWardHost {
 
         // 3. Запуск конвейера захвата и кодирования кадров
         let state_capture = Arc::clone(&self.state);
-        let video_socket_clone = Arc::clone(&video_socket);
+        let paced_sender_capture = Arc::clone(&paced_sender);
         let fps = self.config.fps;
         let bitrate_kbps = self.config.bitrate_kbps;
 
@@ -425,6 +459,7 @@ impl RemoteWardHost {
                 Ok(encoded) => {
                     // Фрагментация на UDP-датаграммы MTU 1380
                     let packets = FramePacketizer::packetize_to_datagrams(
+                        1,
                         frame_id as u32,
                         timestamp_us,
                         encoded.is_keyframe,
@@ -444,12 +479,9 @@ impl RemoteWardHost {
                         );
                     }
 
-                    // Отправка клиенту через UDP сокет с буфером SO_SNDBUF 4 МБ БЕЗ блокировки колбэка захвата
-                    let socket = &video_socket_clone;
-                    for packet in &packets {
-                        if let Err(e) = socket.send_to(packet, target_addr) {
-                            tracing::warn!("Ошибка отправки видеопакета: {:?}", e);
-                        }
+                    // Отправка клиенту через сокет с микросекундным пейсингом и сохранением в NACK-буфер
+                    if let Err(e) = paced_sender_capture.send_frame_packets(frame_id as u32, &packets, target_addr) {
+                        tracing::warn!("Ошибка отправки видеопакетов: {:?}", e);
                     }
                 }
                 Err(e) => {

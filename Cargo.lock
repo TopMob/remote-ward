@@ -315,6 +315,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "reed-solomon-erasure",
  "smallvec",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

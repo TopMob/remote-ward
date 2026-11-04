@@ -90,12 +90,13 @@ impl RemoteWardHost {
         tracing::info!("       ЗАПУСК СЕРВЕРА REMOTE-WARD НА ХОСТЕ (RTX 2060)       ");
         tracing::info!("============================================================");
 
-        // 1. Создаем сокет для управления и ввода
+        // 1. Создаем сокет для управления и ввода с оптимизацией буферов и QoS DSCP
         let control_socket = Arc::new(
             UdpSocket::bind(format!("0.0.0.0:{}", self.config.control_port)).await?,
         );
+        core_transport::optimize_udp_socket(&control_socket);
         tracing::info!(
-            "Управляющий сокет (Control & Input) слушает на порту {}",
+            "Управляющий сокет (Control & Input) слушает на порту {} с QoS DSCP 46",
             self.config.control_port
         );
 
@@ -112,14 +113,15 @@ impl RemoteWardHost {
             });
         }
 
-        // 2. Создаем сокет для видеопотока с буфером 4 МБ для защиты от сброса пакетов ОС
+        // 2. Создаем сокет для видеопотока с буфером 4 МБ для защиты от сброса пакетов ОС и QoS
         let video_socket_raw = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?;
         let sock_ref = socket2::SockRef::from(&video_socket_raw);
         let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
         let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+        let _ = sock_ref.set_tos(0xB8); // DSCP 46 (Expedited Forwarding для приоритета WMM в роутерах)
         let video_socket = Arc::new(video_socket_raw);
         tracing::info!(
-            "Видеосокет (UDP Stream) открыт на порту {} с буфером SO_SNDBUF 4 МБ",
+            "Видеосокет (UDP Stream) открыт на порту {} с буфером SO_SNDBUF 4 МБ и QoS DSCP 46",
             self.config.video_port
         );
 
@@ -213,22 +215,63 @@ impl RemoteWardHost {
                                         // Форсируем первый I-кадр (IDR) для немедленного отображения
                                         state.force_keyframe.store(true, Ordering::SeqCst);
 
-                                        // Отправляем ответ ServerHello с реальным разрешением захваченного экрана хоста
+                                        // Синхронизируем инжектор ввода с реальным разрешением экрана хоста
                                         let real_w = state.display_width.load(Ordering::Relaxed);
                                         let real_h = state.display_height.load(Ordering::Relaxed);
+                                        if real_w > 0 && real_h > 0 {
+                                            injector.update_dimensions(real_w, real_h);
+                                        }
+
+                                        // Авто-согласование стратегии трансляции (UltraLAN, StandardWiFi, WanRemote)
+                                        let is_local_lan = src.ip().is_loopback() || match src.ip() {
+                                            std::net::IpAddr::V4(ipv4) => ipv4.is_private(),
+                                            std::net::IpAddr::V6(_) => false,
+                                        };
+
+                                        let client_refresh_rate = hello.display_refresh_rate;
+                                        let negotiated_fps = if is_local_lan && client_refresh_rate >= 120 {
+                                            120
+                                        } else if is_local_lan && client_refresh_rate >= 90 {
+                                            90
+                                        } else {
+                                            config_fps
+                                        };
+
+                                        let strategy = if is_local_lan {
+                                            if client_refresh_rate >= 90 {
+                                                core_protocol::StreamingStrategy::UltraLan
+                                            } else {
+                                                core_protocol::StreamingStrategy::StandardWifi
+                                            }
+                                        } else {
+                                            core_protocol::StreamingStrategy::WanRemote
+                                        };
+
+                                        let (fec_data, fec_parity) = match strategy {
+                                            core_protocol::StreamingStrategy::UltraLan => (10, 1),
+                                            core_protocol::StreamingStrategy::StandardWifi => (10, 2),
+                                            core_protocol::StreamingStrategy::WanRemote => (10, 3),
+                                        };
+
+                                        tracing::info!(
+                                            "[АВТО-СТРАТЕГИЯ] Согласована стратегия: {:?} [FPS: {}, FastSync: {}, Кодек: {:?}, FEC: {}:{}]",
+                                            strategy, negotiated_fps, hello.supports_tearing, selected, fec_data, fec_parity
+                                        );
+
                                         let response = ControlMessage::ServerHello(ServerHello {
                                             server_name: "remote-ward-host".into(),
                                             server_version: "0.1.0".into(),
                                             protocol_version: PROTOCOL_VERSION as u32,
                                             session_id: 1,
                                             selected_codec: selected,
+                                            strategy,
                                             width: if real_w > 0 { real_w } else { hello.screen_width },
                                             height: if real_h > 0 { real_h } else { hello.screen_height },
-                                            target_fps: config_fps,
+                                            target_fps: negotiated_fps,
                                             nack_enabled: hello.supports_nack,
                                             fec_enabled: hello.supports_fec,
-                                            fec_data_shards: 10,
-                                            fec_parity_shards: 2,
+                                            fec_data_shards: fec_data,
+                                            fec_parity_shards: fec_parity,
                                         });
 
                                         if let Ok(resp_bytes) = response.to_packet() {
@@ -476,6 +519,7 @@ impl RemoteWardHost {
 
         // 4. Пайплайн захвата экрана (WGC) и кодирования (NVENC)
         let state_capture = Arc::clone(&self.state);
+        let injector_frame = Arc::clone(&self.input_injector);
         let on_frame: Arc<
             dyn Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
                 + Send
@@ -494,6 +538,7 @@ impl RemoteWardHost {
 
             if need_reinit {
                 tracing::info!("(Пере)инициализация энкодера GPU для разрешения {}x{}...", width, height);
+                injector_frame.update_dimensions(width, height);
                 let codec = *state_capture.selected_codec.read().unwrap();
                 *last_codec_guard = codec;
                 match NvencEncoder::new_from_raw_device(device_raw, width, height, fps, current_target_bitrate, codec) {
@@ -628,6 +673,7 @@ impl RemoteWardHost {
         let mut current_monitor = initial_monitor;
         let mut current_cursor = initial_cursor;
         let supervisor_state = Arc::clone(&self.state);
+        let supervisor_injector = Arc::clone(&self.input_injector);
         let control_socket_ack = Arc::clone(&control_socket);
 
         loop {
@@ -660,6 +706,7 @@ impl RemoteWardHost {
                             Ok(new_session) => {
                                 supervisor_state.display_width.store(new_session.width, Ordering::Relaxed);
                                 supervisor_state.display_height.store(new_session.height, Ordering::Relaxed);
+                                supervisor_injector.update_dimensions(new_session.width, new_session.height);
                                 current_monitor = target_monitor;
                                 current_cursor = target_cursor;
                                 supervisor_state.force_keyframe.store(true, Ordering::SeqCst);

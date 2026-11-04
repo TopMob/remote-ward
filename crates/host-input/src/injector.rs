@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
     MOUSEEVENTF_XUP, VIRTUAL_KEY,
@@ -12,7 +13,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 const XBUTTON1: u32 = 0x0001;
 const XBUTTON2: u32 = 0x0002;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    GetSystemMetrics, SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 use core_protocol::{ButtonState, InputEvent, MouseButton};
@@ -20,8 +21,8 @@ use crate::error::InputError;
 
 /// Высокоточный инжектор пользовательского ввода в Windows с отслеживанием зажатых клавиш
 pub struct WindowsInputInjector {
-    screen_width: u32,
-    screen_height: u32,
+    screen_width: AtomicU32,
+    screen_height: AtomicU32,
     pressed_keys: Mutex<HashSet<(u16, bool)>>,
     pressed_mouse_buttons: Mutex<HashSet<MouseButton>>,
 }
@@ -33,8 +34,8 @@ impl WindowsInputInjector {
         let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as u32;
 
         Self {
-            screen_width: if screen_width > 0 { screen_width } else { 1920 },
-            screen_height: if screen_height > 0 { screen_height } else { 1080 },
+            screen_width: AtomicU32::new(if screen_width > 0 { screen_width } else { 1920 }),
+            screen_height: AtomicU32::new(if screen_height > 0 { screen_height } else { 1080 }),
             pressed_keys: Mutex::new(HashSet::new()),
             pressed_mouse_buttons: Mutex::new(HashSet::new()),
         }
@@ -43,10 +44,20 @@ impl WindowsInputInjector {
     /// Создает инжектор с явно заданным разрешением целевого захвата
     pub fn with_dimensions(width: u32, height: u32) -> Self {
         Self {
-            screen_width: if width > 0 { width } else { 1920 },
-            screen_height: if height > 0 { height } else { 1080 },
+            screen_width: AtomicU32::new(if width > 0 { width } else { 1920 }),
+            screen_height: AtomicU32::new(if height > 0 { height } else { 1080 }),
             pressed_keys: Mutex::new(HashSet::new()),
             pressed_mouse_buttons: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Обновление целевых габаритов экрана при смене монитора или разрешения
+    pub fn update_dimensions(&self, width: u32, height: u32) {
+        if width > 0 {
+            self.screen_width.store(width, Ordering::Relaxed);
+        }
+        if height > 0 {
+            self.screen_height.store(height, Ordering::Relaxed);
         }
     }
 
@@ -71,24 +82,11 @@ impl WindowsInputInjector {
             }
 
             InputEvent::MouseMoveAbsolute { x, y } => {
-                // Преобразование координат пикселей в нормализованный диапазон 0..65535 для основного монитора
-                let norm_x = ((*x as u64 * 65535) / self.screen_width as u64) as i32;
-                let norm_y = ((*y as u64 * 65535) / self.screen_height as u64) as i32;
-
-                let input = INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx: norm_x,
-                            dy: norm_y,
-                            mouseData: 0,
-                            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                };
-                self.send(&[input])
+                // Прямая субпиксельная установка курсора через SetCursorPos без кривых ускорения мыши
+                unsafe {
+                    let _ = SetCursorPos(*x as i32, *y as i32);
+                }
+                Ok(())
             }
 
             InputEvent::MouseButton { button, state } => {

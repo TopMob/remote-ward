@@ -539,8 +539,22 @@ impl ApplicationHandler for RemoteWardClientApp {
         // Минимальное время ожидания: опрашиваем цикл событий каждые 1 мс для мгновенного вывода кадров
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
 
-        // Отрисовываем каждый декодированный кадр без пропуска (D3D11 выводит за <0.2 мс)
+        // Zero-Buffer Lag: Опустошаем очередь кадров, чтобы отображать только самый свежий кадр
+        // Если пришло 2 или 3 кадра из-за сетевого микро-всплеска, устаревшие кадры сбрасываются
+        let mut latest_frame = None;
+        let mut skipped_stale = 0usize;
         while let Ok(frame) = self.frame_rx.try_recv() {
+            if latest_frame.is_some() {
+                skipped_stale += 1;
+            }
+            latest_frame = Some(frame);
+        }
+
+        if skipped_stale > 0 {
+            tracing::trace!("Zero-Buffer Lag: пропущено {} устаревших кадров в пользу новейшего", skipped_stale);
+        }
+
+        if let Some(frame) = latest_frame {
             self.frames_rendered += 1;
 
             let w = frame.width as usize;
@@ -582,16 +596,22 @@ impl ApplicationHandler for RemoteWardClientApp {
                 self.last_stats_instant = Instant::now();
                 let decode_ms = frame.latency_us as f64 / 1000.0;
                 let rtt_ms = self.current_rtt_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                let tearing_str = if let Some(ref d) = self.renderer {
+                    if d.tearing_supported { "FastSync" } else { "VSync" }
+                } else {
+                    "GDI"
+                };
                 tracing::info!(
-                    "Клиент отображает видеопоток: {} FPS | RTT: {:.1} мс | Задержка декодирования кадра: {:.2} мс",
+                    "Клиент отображает видеопоток: {} FPS [{}] | RTT: {:.1} мс | Декод: {:.2} мс",
                     fps,
+                    tearing_str,
                     rtt_ms,
                     decode_ms
                 );
                 if let Some(ref window) = self.window {
                     window.set_title(&format!(
-                        "Remote-Ward Client | {}x{} @ {} FPS | RTT: {:.1} мс | Декод: {:.1} мс",
-                        w, h, fps, rtt_ms, decode_ms
+                        "Remote-Ward Client | {}x{} @ {} FPS [{}] | RTT: {:.1} мс | Декод: {:.1} мс",
+                        w, h, fps, tearing_str, rtt_ms, decode_ms
                     ));
                 }
             }
@@ -614,6 +634,7 @@ pub async fn run_client(
 
     // 1. Создаем сокет для отправки управления и ввода
     let control_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    core_transport::optimize_udp_socket(&control_socket);
     let host_ctrl_addr = config.host_control_addr;
 
     // 2. Создаем сокет для приема видео с расширенным системным буфером SO_RCVBUF (8 МБ)
@@ -622,8 +643,9 @@ pub async fn run_client(
     let _ = sock_ref.set_recv_buffer_size(8 * 1024 * 1024);
     video_socket_std.set_nonblocking(true)?;
     let video_socket = Arc::new(UdpSocket::from_std(video_socket_std)?);
+    core_transport::optimize_udp_socket(&video_socket);
     tracing::info!(
-        "Сетевой видеосокет клиента открыт на порту {} с буфером SO_RCVBUF 8 МБ",
+        "Сетевой видеосокет клиента открыт на порту {} с буфером SO_RCVBUF 8 МБ и QoS DSCP 46",
         config.video_port
     );
 
@@ -673,7 +695,7 @@ pub async fn run_client(
         let _ = control_socket.send_to(&settings_bytes, host_ctrl_addr).await;
     }
 
-    // 4. Отправляем ClientHello на хост
+    // 4. Отправляем ClientHello на хост с информацией о возможностях экрана и FastSync Tearing
     let hello = ControlMessage::ClientHello(ClientHello {
         client_name: "remote-ward-client".into(),
         client_version: "0.1.0".into(),
@@ -684,6 +706,8 @@ pub async fn run_client(
         screen_width: config.width,
         screen_height: config.height,
         target_fps: 60,
+        display_refresh_rate: 60,
+        supports_tearing: true,
         dpi_scale: 1.0,
         video_port: config.video_port,
         supports_nack: true,
@@ -707,9 +731,9 @@ pub async fn run_client(
                         match msg {
                             ControlMessage::ServerHello(hello) => {
                                 tracing::info!(
-                                    "Хост подтвердил подключение: {} (v{}) [Кодек: {:?}, {}x{} @ {} FPS]",
-                                    hello.server_name, hello.server_version, hello.selected_codec,
-                                    hello.width, hello.height, hello.target_fps
+                                    "Хост подтвердил подключение: {} (v{}) [Стратегия: {:?}, Кодек: {:?}, {}x{} @ {} FPS, FEC {}:{}]",
+                                    hello.server_name, hello.server_version, hello.strategy, hello.selected_codec,
+                                    hello.width, hello.height, hello.target_fps, hello.fec_data_shards, hello.fec_parity_shards
                                 );
                             }
                             ControlMessage::SwitchMonitorAck { monitor_index, width, height, .. } => {

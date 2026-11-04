@@ -40,6 +40,26 @@ impl From<String> for KeyframeReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamingStrategy {
+    /// Локальная сеть Ethernet / сверхбыстрый Wi-Fi 5-6GHz (RTT < 3 мс, 90-120 FPS, битрейт до 45 Мбит/с, FastSync)
+    UltraLan,
+    /// Стандартный домашний Wi-Fi (RTT 3-15 мс, 60 FPS, WMM QoS, сбалансированный FEC и NACK)
+    StandardWifi,
+    /// Удаленное подключение через интернет / WAN (RTT > 15 мс, усиленный FEC 10:3, консервативный битрейт)
+    WanRemote,
+}
+
+impl Default for StreamingStrategy {
+    fn default() -> Self {
+        Self::StandardWifi
+    }
+}
+
+fn default_refresh_rate() -> u32 {
+    60
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_name: String,
@@ -51,6 +71,10 @@ pub struct ClientHello {
     pub screen_width: u32,
     pub screen_height: u32,
     pub target_fps: u32,
+    #[serde(default = "default_refresh_rate")]
+    pub display_refresh_rate: u32,
+    #[serde(default)]
+    pub supports_tearing: bool,
     pub dpi_scale: f32,
     pub video_port: u16,
     /// Клиент поддерживает NACK (Selective Retransmit)
@@ -71,6 +95,8 @@ impl Default for ClientHello {
             screen_width: 1920,
             screen_height: 1080,
             target_fps: 60,
+            display_refresh_rate: 60,
+            supports_tearing: true,
             dpi_scale: 1.0,
             video_port: 48000,
             supports_nack: true,
@@ -86,6 +112,8 @@ pub struct ServerHello {
     pub protocol_version: u32,
     pub session_id: u64,
     pub selected_codec: VideoCodec,
+    #[serde(default)]
+    pub strategy: StreamingStrategy,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
@@ -107,6 +135,7 @@ impl Default for ServerHello {
             protocol_version: crate::packet::PROTOCOL_VERSION as u32,
             session_id: 0,
             selected_codec: VideoCodec::H264,
+            strategy: StreamingStrategy::StandardWifi,
             width: 1920,
             height: 1080,
             target_fps: 60,

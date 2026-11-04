@@ -7,7 +7,7 @@
 //! 2. Аппаратное масштабирование и конвертация цвета на GPU через пиксельный шейдер.
 //! 3. Полное отсутствие разрывов кадров (tearing) и нулевая нагрузка на CPU при выводе.
 
-use windows::core::s;
+use windows::core::{s, Interface};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
@@ -29,9 +29,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIFactory2, IDXGISwapChain1,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    CreateDXGIFactory2, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1,
+    DXGI_CREATE_FACTORY_FLAGS, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT,
+    DXGI_PRESENT_ALLOW_TEARING, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 const VS_HLSL: &str = r#"
@@ -120,6 +122,7 @@ pub struct D3D11Renderer {
     // BGRA текстура на GPU
     tex_bgra: Option<ID3D11Texture2D>,
     srv_bgra: Option<ID3D11ShaderResourceView>,
+    pub tearing_supported: bool,
     width: u32,
     height: u32,
 }
@@ -147,8 +150,30 @@ impl D3D11Renderer {
         let device = device.unwrap();
         let context = context.unwrap();
 
-        // 2. Создаем DXGI Factory2 и SwapChain1 с FLIP_DISCARD
+        // 2. Создаем DXGI Factory2 и проверяем поддержку FastSync / Tearing
         let dxgi_factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
+
+        let mut allow_tearing = false;
+        let swap_chain_flags = match dxgi_factory.cast::<IDXGIFactory5>() {
+            Ok(factory5) => {
+                let mut feature_support = windows::Win32::Foundation::BOOL(0);
+                let res = unsafe {
+                    factory5.CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        &mut feature_support as *mut _ as *mut _,
+                        std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
+                    )
+                };
+                if res.is_ok() && feature_support.as_bool() {
+                    allow_tearing = true;
+                    tracing::info!("Аппаратный FastSync / Tearing (0 мс VSync lag) поддерживается монитором и GPU!");
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        };
 
         let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: initial_w,
@@ -161,7 +186,7 @@ impl D3D11Renderer {
             Scaling: DXGI_SCALING_STRETCH,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
+            Flags: swap_chain_flags,
         };
 
         let swap_chain = unsafe {
@@ -218,6 +243,7 @@ impl D3D11Renderer {
             srv_uv: None,
             tex_bgra: None,
             srv_bgra: None,
+            tearing_supported: allow_tearing,
             width: initial_w,
             height: initial_h,
         })
@@ -235,7 +261,7 @@ impl D3D11Renderer {
                 width,
                 height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
+                if self.tearing_supported { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0) },
             );
             if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
                 let mut rtv = None;
@@ -302,9 +328,14 @@ impl D3D11Renderer {
         // Рендерим через NV12 пиксельный шейдер
         self.draw_quad(true)?;
 
-        // Презентация кадра с нулевым ожиданием (DXGI_SWAP_EFFECT_FLIP_DISCARD)
+        // Презентация кадра с нулевым ожиданием (FastSync / Tearing без задержки VSync)
+        let present_flags = if self.tearing_supported {
+            DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
         unsafe {
-            self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+            self.swap_chain.Present(0, present_flags).ok()?;
         }
 
         Ok(())
@@ -340,8 +371,13 @@ impl D3D11Renderer {
 
         self.draw_quad(false)?;
 
+        let present_flags = if self.tearing_supported {
+            DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
         unsafe {
-            self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+            self.swap_chain.Present(0, present_flags).ok()?;
         }
 
         Ok(())

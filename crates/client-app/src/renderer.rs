@@ -436,12 +436,26 @@ impl D3D11Renderer {
         };
 
         unsafe {
-            // Настройка Viewport
+            // Расчет пропорционального Viewport с сохранением соотношения сторон (Letterbox)
+            let (vp_x, vp_y, vp_w, vp_h) = if self.tex_w > 0 && self.tex_h > 0 && self.width > 0 && self.height > 0 {
+                let scale = (self.width as f32 / self.tex_w as f32).min(self.height as f32 / self.tex_h as f32);
+                let tw = (self.tex_w as f32 * scale).round();
+                let th = (self.tex_h as f32 * scale).round();
+                let ox = ((self.width as f32 - tw) / 2.0).round();
+                let oy = ((self.height as f32 - th) / 2.0).round();
+                (ox, oy, tw, th)
+            } else {
+                (0.0, 0.0, self.width as f32, self.height as f32)
+            };
+
+            // Очищаем буфер черным для полос letterbox при несовпадении аспектов
+            self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+
             let viewport = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: self.width as f32,
-                Height: self.height as f32,
+                TopLeftX: vp_x,
+                TopLeftY: vp_y,
+                Width: vp_w,
+                Height: vp_h,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };

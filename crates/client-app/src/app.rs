@@ -16,8 +16,13 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
     SRCCOPY, SetStretchBltMode, COLORONCOLOR,
+    MonitorFromWindow, MONITOR_DEFAULTTONEAREST, GetMonitorInfoW, MONITORINFO,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetWindowLongW, SetWindowLongW, GWL_STYLE, SetWindowPos,
+    HWND_TOP, HWND_NOTOPMOST, WS_POPUP, WS_OVERLAPPED, WS_CAPTION, WS_SYSMENU,
+    WS_MINIMIZEBOX, WS_MAXIMIZEBOX, WS_THICKFRAME, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SWP_NOZORDER,
+};
 
 use core_protocol::{
     ButtonState, ClientHello, ControlMessage, InputEvent, MouseButton, VideoCodec,
@@ -270,6 +275,115 @@ impl RemoteWardClientApp {
         None
     }
 
+    fn get_letterbox(&self) -> (f64, f64, f64, f64) {
+        if let Some(hwnd) = self.get_hwnd() {
+            let mut rect = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
+                let dest_w = (rect.right - rect.left) as f64;
+                let dest_h = (rect.bottom - rect.top) as f64;
+                let (host_w, host_h) = if self.last_frame_size.0 > 0 && self.last_frame_size.1 > 0 {
+                    (self.last_frame_size.0 as f64, self.last_frame_size.1 as f64)
+                } else {
+                    (2560.0, 1440.0)
+                };
+
+                if dest_w > 0.0 && dest_h > 0.0 && host_w > 0.0 && host_h > 0.0 {
+                    let scale = (dest_w / host_w).min(dest_h / host_h);
+                    let target_w = (host_w * scale).round();
+                    let target_h = (host_h * scale).round();
+                    let offset_x = ((dest_w - target_w) / 2.0).round();
+                    let offset_y = ((dest_h - target_h) / 2.0).round();
+                    return (offset_x, offset_y, target_w, target_h);
+                }
+            }
+        }
+        (0.0, 0.0, 1920.0, 1080.0)
+    }
+
+    pub fn set_fullscreen_mode(&mut self, fullscreen: bool) {
+        let window = match self.window.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+
+        if fullscreen {
+            tracing::info!("Переключение окна в честный полноэкранный режим (Borderless Fullscreen)...");
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+
+            // Гарантируем через Win32 API, что окно занимает весь физический экран монитора
+            if let Some(hwnd) = self.get_hwnd() {
+                unsafe {
+                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                        let rc = mi.rcMonitor;
+                        let w = rc.right - rc.left;
+                        let h = rc.bottom - rc.top;
+
+                        let style = GetWindowLongW(hwnd, GWL_STYLE);
+                        let clean_style = (style & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32 | WS_MINIMIZEBOX.0 as i32 | WS_MAXIMIZEBOX.0 as i32 | WS_SYSMENU.0 as i32)) | WS_POPUP.0 as i32;
+                        SetWindowLongW(hwnd, GWL_STYLE, clean_style);
+
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOP,
+                            rc.left,
+                            rc.top,
+                            w,
+                            h,
+                            SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                        );
+
+                        if let Some(ref mut renderer) = self.renderer {
+                            renderer.resize(w as u32, h as u32);
+                        }
+                    }
+                }
+            }
+        } else {
+            tracing::info!("Возврат окна в режим компактного лаунчера (960x640)...");
+            window.set_fullscreen(None);
+
+            if let Some(hwnd) = self.get_hwnd() {
+                unsafe {
+                    let style = GetWindowLongW(hwnd, GWL_STYLE);
+                    let windowed_style = (style & !(WS_POPUP.0 as i32)) | (WS_OVERLAPPED.0 as i32 | WS_CAPTION.0 as i32 | WS_SYSMENU.0 as i32 | WS_MINIMIZEBOX.0 as i32);
+                    SetWindowLongW(hwnd, GWL_STYLE, windowed_style);
+
+                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let (x, y) = if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                        let mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
+                        let mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                        (mi.rcMonitor.left + (mon_w - 960) / 2, mi.rcMonitor.top + (mon_h - 640) / 2)
+                    } else {
+                        (100, 100)
+                    };
+
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_NOTOPMOST,
+                        x,
+                        y,
+                        960,
+                        640,
+                        SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+                    );
+
+                    if let Some(ref mut renderer) = self.renderer {
+                        renderer.resize(960, 640);
+                    }
+                }
+            }
+        }
+    }
+
     fn toggle_hud_overlay(&mut self) {
         self.launcher_ui.show_overlay = !self.launcher_ui.show_overlay;
         if let Some(ref window) = self.window {
@@ -282,9 +396,13 @@ impl RemoteWardClientApp {
                 }
                 tracing::info!("HUD Оверлей ОТКРЫТ (Ctrl+Shift+O): курсор освобожден для UI");
             } else {
-                window.set_cursor_visible(false);
-                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
-                self.cursor_grabbed = true;
+                window.set_cursor_visible(true);
+                let grab_mode = if self.cursor_grabbed {
+                    winit::window::CursorGrabMode::Confined
+                } else {
+                    winit::window::CursorGrabMode::None
+                };
+                let _ = window.set_cursor_grab(grab_mode);
                 if let Some(ref hook) = self.keyboard_hook {
                     hook.set_active(true);
                 }
@@ -302,10 +420,9 @@ impl RemoteWardClientApp {
         self.session_rx = None;
         self.launcher_ui.show_overlay = false;
 
+        self.set_fullscreen_mode(false);
+
         if let Some(ref window) = self.window {
-            window.set_fullscreen(None);
-            window.set_resizable(false);
-            let _ = window.request_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
             window.set_cursor_visible(true);
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
             self.cursor_grabbed = false;
@@ -341,7 +458,7 @@ impl ApplicationHandler for RemoteWardClientApp {
             let window_attributes = Window::default_attributes()
                 .with_title("Remote-Ward")
                 .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0))
-                .with_resizable(false)
+                .with_resizable(true)
                 .with_drag_and_drop(false);
 
             match event_loop.create_window(window_attributes) {
@@ -526,6 +643,26 @@ impl ApplicationHandler for RemoteWardClientApp {
                                 return;
                             }
 
+                            // F11 / Right Ctrl + H: Переключение режима мыши (Рабочий стол / Игровой захват 3D камеры)
+                            if (key_code == KeyCode::F11 || (self.rctrl_down && key_code == KeyCode::KeyH)) && is_pressed {
+                                self.cursor_grabbed = !self.cursor_grabbed;
+                                if let Some(ref window) = self.window {
+                                    window.set_cursor_visible(!self.cursor_grabbed);
+                                    let grab_mode = if self.cursor_grabbed {
+                                        winit::window::CursorGrabMode::Confined
+                                    } else {
+                                        winit::window::CursorGrabMode::None
+                                    };
+                                    let _ = window.set_cursor_grab(grab_mode);
+                                }
+                                if self.cursor_grabbed {
+                                    tracing::info!("Игровой режим (Raw Relative Mouse): курсор скрыт и захвачен для 3D-камеры");
+                                } else {
+                                    tracing::info!("Режим рабочего стола (Absolute Mouse): курсор виден для управления окнами");
+                                }
+                                return;
+                            }
+
                             // Трансляция клавиши на хост через аппаратный Scan Code
                             if let Some((scan_code, is_extended)) = keycode_to_scancode(key_code) {
                                 let state = match key_event.state {
@@ -543,7 +680,29 @@ impl ApplicationHandler for RemoteWardClientApp {
                 }
             }
 
-            WindowEvent::CursorMoved { position: _, .. } => {}
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(ref session) = self.session {
+                    if !is_overlay && !self.cursor_grabbed {
+                        let (ox, oy, tw, th) = self.get_letterbox();
+                        let (fw, fh) = if self.last_frame_size.0 > 0 && self.last_frame_size.1 > 0 {
+                            (self.last_frame_size.0 as f64, self.last_frame_size.1 as f64)
+                        } else {
+                            (2560.0, 1440.0)
+                        };
+
+                        if tw > 0.0 && th > 0.0 {
+                            let norm_x = ((position.x - ox) / tw).clamp(0.0, 1.0);
+                            let norm_y = ((position.y - oy) / th).clamp(0.0, 1.0);
+                            let host_x = (norm_x * (fw - 1.0)).round() as u32;
+                            let host_y = (norm_y * (fh - 1.0)).round() as u32;
+                            let _ = session.input_tx.send(InputEvent::MouseMoveAbsolute {
+                                x: host_x,
+                                y: host_y,
+                            });
+                        }
+                    }
+                }
+            }
 
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 if let Some(ref session) = self.session {
@@ -627,12 +786,12 @@ impl ApplicationHandler for RemoteWardClientApp {
                 match res {
                     Ok(session) => {
                         tracing::info!("Подключение успешно! Разворачиваем окно в полноэкранный стрим.");
+                        self.set_fullscreen_mode(true);
+
                         if let Some(ref window) = self.window {
-                            window.set_resizable(true);
-                            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                            window.set_cursor_visible(false);
-                            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
-                            self.cursor_grabbed = true;
+                            window.set_cursor_visible(true);
+                            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                            self.cursor_grabbed = false;
                         }
                         if let Some(ref hook) = self.keyboard_hook {
                             hook.set_active(true);

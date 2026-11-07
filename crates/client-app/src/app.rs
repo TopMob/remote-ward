@@ -350,6 +350,8 @@ impl RemoteWardClientApp {
                             h,
                             SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
                         );
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
 
                         if let Some(ref mut renderer) = self.renderer {
                             renderer.resize(w as u32, h as u32);
@@ -591,9 +593,12 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             WindowEvent::Focused(is_focused) => {
                 if let Some(ref hook) = self.keyboard_hook {
-                    hook.set_active(
-                        is_focused && self.session.is_some() && !self.launcher_ui.show_overlay,
-                    );
+                    let active = if self.session.is_some() && !self.launcher_ui.show_overlay {
+                        true
+                    } else {
+                        is_focused
+                    };
+                    hook.set_active(active);
                 }
                 if !is_focused && is_streaming {
                     if let Some(ref session) = self.session {

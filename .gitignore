@@ -30,6 +30,7 @@ $RECYCLE.BIN/
 logs/
 *.raw
 *.yuv
+*.bmp
 *.h264
 *.h265
 *.hevc

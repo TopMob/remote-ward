@@ -113,9 +113,15 @@ unsafe extern "system" fn low_level_keyboard_proc(
                             ButtonState::Released
                         };
 
-                        // Обновляем состояния модификаторов в памяти хука
+                        // Обновляем состояния модификаторов в памяти хука и сразу синхронизируем с хостом
                         if vk == VK_LMENU || vk == VK_RMENU || vk == VK_MENU as u32 {
                             ALT_DOWN.store(is_down, Ordering::Relaxed);
+                            let is_ext = vk == VK_RMENU;
+                            let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                scan_code: 0x38, // Alt
+                                is_extended: is_ext,
+                                state,
+                            });
                         }
                         if vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_CONTROL as u32 {
                             CTRL_DOWN.store(is_down, Ordering::Relaxed);
@@ -194,6 +200,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
                         // 3. Alt + Tab, Alt + Shift + Tab, Alt + Esc, Alt + Space, Alt + F4
                         if alt_pressed {
                             if vk == VK_TAB {
+                                // Гарантируем, что на хосте Alt гарантированно зажат перед нажатием Tab
+                                if is_down {
+                                    let _ = ctx.input_tx.send(InputEvent::Keyboard {
+                                        scan_code: 0x38, // Alt
+                                        is_extended: false,
+                                        state: ButtonState::Pressed,
+                                    });
+                                }
                                 let _ = ctx.input_tx.send(InputEvent::Keyboard {
                                     scan_code: 0x0F, // Scan code Tab
                                     is_extended: false,

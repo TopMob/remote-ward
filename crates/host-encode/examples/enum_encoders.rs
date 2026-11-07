@@ -1,7 +1,6 @@
 use windows::Win32::Media::MediaFoundation::{
-    MFShutdown, MFStartup, MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_H264, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MF_VERSION,
+    MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL, MFT_REGISTER_TYPE_INFO, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 

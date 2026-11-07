@@ -33,9 +33,7 @@ mod tests {
         let uv_size = width * height / 2; // 8
         let mut nv12 = vec![128u8; y_size + uv_size];
         // Заполняем Y белым (255), U/V нейтральным (128)
-        for i in 0..y_size {
-            nv12[i] = 255;
-        }
+        nv12[..y_size].fill(255);
 
         let mut bgra = vec![0u8; width * height * 4];
         nv12_to_bgra(&nv12, width, height, &mut bgra);
@@ -61,9 +59,7 @@ mod tests {
         let uv_size = width * height / 2;
         let mut nv12 = vec![128u8; y_size + uv_size];
         // Заполняем Y черным (0)
-        for i in 0..y_size {
-            nv12[i] = 0;
-        }
+        nv12[..y_size].fill(0);
 
         let mut bgra = vec![255u8; width * height * 4];
         nv12_to_bgra(&nv12, width, height, &mut bgra);
@@ -80,6 +76,3 @@ mod tests {
         }
     }
 }
-
-
-

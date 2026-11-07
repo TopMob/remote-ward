@@ -28,6 +28,24 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
 ];
 
+#[derive(Debug, thiserror::Error)]
+pub enum StunError {
+    #[error("Ошибка ввода-вывода или DNS резолва STUN сервера: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("STUN сервер не вернул сетевых адресов по DNS")]
+    NoAddressesFound,
+    #[error("Таймаут ожидания ответа STUN сервера")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error("STUN ответ слишком короткий ({0} байт)")]
+    ResponseTooShort(usize),
+    #[error("Неверный тип сообщения или Magic Cookie в ответе STUN")]
+    InvalidResponse,
+    #[error("Несовпадение Transaction ID в ответе STUN")]
+    TransactionIdMismatch,
+    #[error("В ответе STUN не найден атрибут Mapped Address")]
+    NoMappedAddress,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StunResult {
     /// Внешний публичный адрес
@@ -41,11 +59,11 @@ pub async fn resolve_public_address(
     socket: &UdpSocket,
     stun_server: &str,
     timeout: Duration,
-) -> Result<StunResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<StunResult, StunError> {
     let server_addr: SocketAddr = tokio::net::lookup_host(stun_server)
         .await?
         .next()
-        .ok_or_else(|| std::io::Error::other("STUN server DNS lookup failed"))?;
+        .ok_or(StunError::NoAddressesFound)?;
 
     // 1. Формируем заголовок STUN Binding Request (20 байт)
     let mut request = [0u8; 20];
@@ -56,7 +74,9 @@ pub async fn resolve_public_address(
     // 12 случайных байт Transaction ID
     let mut tx_id = [0u8; 12];
     for (i, b) in tx_id.iter_mut().enumerate() {
-        *b = (std::process::id() as u8).wrapping_add(i as u8).wrapping_mul(31);
+        *b = (std::process::id() as u8)
+            .wrapping_add(i as u8)
+            .wrapping_mul(31);
     }
     request[8..20].copy_from_slice(&tx_id);
 
@@ -68,19 +88,19 @@ pub async fn resolve_public_address(
     let (len, _src) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
 
     if len < 20 {
-        return Err(Box::new(std::io::Error::other("STUN response too short")));
+        return Err(StunError::ResponseTooShort(len));
     }
 
     let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
     let magic = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
     if msg_type != BINDING_RESPONSE || magic != STUN_MAGIC_COOKIE {
-        return Err(Box::new(std::io::Error::other("Invalid STUN response")));
+        return Err(StunError::InvalidResponse);
     }
 
     // Проверяем совпадение Transaction ID
-    if &buf[8..20] != tx_id {
-        return Err(Box::new(std::io::Error::other("STUN transaction ID mismatch")));
+    if buf[8..20] != tx_id {
+        return Err(StunError::TransactionIdMismatch);
     }
 
     let rtt_ms = t0.elapsed().as_millis() as u32;
@@ -138,7 +158,7 @@ pub async fn resolve_public_address(
         offset += (attr_len + 3) & !3;
     }
 
-    Err(Box::new(std::io::Error::other("No mapped address found in STUN response")))
+    Err(StunError::NoMappedAddress)
 }
 
 /// Пытается определить внешний адрес, опрашивая список серверов по очереди
@@ -147,12 +167,16 @@ pub async fn discover_public_endpoint(socket: &UdpSocket) -> Option<StunResult> 
         if let Ok(res) = resolve_public_address(socket, server, Duration::from_millis(1500)).await {
             tracing::info!(
                 "[WAN NAT] Внешний публичный адрес определен через {}: {} (RTT: {} мс)",
-                server, res.public_addr, res.rtt_ms
+                server,
+                res.public_addr,
+                res.rtt_ms
             );
             return Some(res);
         }
     }
-    tracing::info!("[WAN NAT] Публичный STUN-адрес не определен (активен режим локальной сети LAN)");
+    tracing::info!(
+        "[WAN NAT] Публичный STUN-адрес не определен (активен режим локальной сети LAN)"
+    );
     None
 }
 
@@ -167,7 +191,9 @@ mod tests {
         request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
 
         assert_eq!(u16::from_be_bytes([request[0], request[1]]), 0x0001);
-        assert_eq!(u32::from_be_bytes([request[4], request[5], request[6], request[7]]), 0x2112_A442);
+        assert_eq!(
+            u32::from_be_bytes([request[4], request[5], request[6], request[7]]),
+            0x2112_A442
+        );
     }
 }
-

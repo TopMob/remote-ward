@@ -63,7 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
@@ -120,10 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Передаем DXGI Device Manager энкодеру
     let manager_ptr = dxgi_manager.as_raw();
     unsafe {
-        transform.ProcessMessage(
-            MFT_MESSAGE_SET_D3D_MANAGER,
-            manager_ptr as usize,
-        )?;
+        transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr as usize)?;
     }
     println!("    D3D11 Device Manager успешно передан в аппаратный энкодер MFT!");
 
@@ -145,7 +145,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    SetOutputType(H.264) успешно применен!");
 
     // 7. Настраиваем входной медиа-тип (NV12)
-    println!("\n[5] Настройка входного типа (NV12, {}x{})...", width, height);
+    println!(
+        "\n[5] Настройка входного типа (NV12, {}x{})...",
+        width, height
+    );
     let in_type = unsafe { MFCreateMediaType()? };
     unsafe {
         in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -190,10 +193,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 10. Получаем сжатый кадр через ProcessOutput
     println!("\n[7] Получение сжатого кадра через ProcessOutput...");
     let stream_info = unsafe { transform.GetOutputStreamInfo(0)? };
-    println!("    OutputStreamInfo: размер буфера = {} байт, dwFlags = {:#x}", stream_info.cbSize, stream_info.dwFlags);
+    println!(
+        "    OutputStreamInfo: размер буфера = {} байт, dwFlags = {:#x}",
+        stream_info.cbSize, stream_info.dwFlags
+    );
 
     let provides_samples = (stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
-    println!("    MFT сам выделяет сэмплы (PROVIDES_SAMPLES): {}", provides_samples);
+    println!(
+        "    MFT сам выделяет сэмплы (PROVIDES_SAMPLES): {}",
+        provides_samples
+    );
 
     let p_sample_input = if provides_samples || stream_info.cbSize == 0 {
         None

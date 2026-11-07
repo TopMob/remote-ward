@@ -7,10 +7,10 @@
 //!   аппаратные характеристики (RTX 2060 SUPER, WGC, WASAPI), управление трансляцией.
 //! - Внутриигровой HUD оверлей (Ctrl+Shift+O): статистика в реальном времени, кнопка отключения.
 
-use std::net::SocketAddr;
-use egui::{Color32, RichText, Rounding, Stroke};
 use crate::config::AppConfig;
 use crate::discovery::{DiscoveredHost, LanDiscovery};
+use egui::{Color32, RichText, Rounding, Stroke};
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherTab {
@@ -49,7 +49,11 @@ pub struct LauncherUI {
 impl LauncherUI {
     pub fn new(config: &AppConfig) -> Self {
         Self {
-            active_tab: if config.is_host_mode { LauncherTab::Host } else { LauncherTab::Client },
+            active_tab: if config.is_host_mode {
+                LauncherTab::Host
+            } else {
+                LauncherTab::Client
+            },
             manual_ip_input: config.last_host_ip.clone(),
             discovery: LanDiscovery::new(),
             calibration_status: None,
@@ -93,11 +97,7 @@ impl LauncherUI {
     }
 
     /// Отрисовка основного окна лаунчера
-    pub fn draw_launcher(
-        &mut self,
-        ctx: &egui::Context,
-        config: &mut AppConfig,
-    ) -> LauncherAction {
+    pub fn draw_launcher(&mut self, ctx: &egui::Context, config: &mut AppConfig) -> LauncherAction {
         let mut action = LauncherAction::None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -433,10 +433,7 @@ impl LauncherUI {
                     // Иконка и имя хоста
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("🖥️")
-                                    .size(18.0),
-                            );
+                            ui.label(RichText::new("🖥️").size(18.0));
                             ui.label(
                                 RichText::new(&host.beacon.server_name)
                                     .size(14.0)
@@ -482,7 +479,8 @@ impl LauncherUI {
                             .fill(Color32::from_rgb(124, 58, 237)),
                         );
                         if btn.clicked() {
-                            let target = format!("{}:{}", host.beacon.host_ip, host.beacon.control_port);
+                            let target =
+                                format!("{}:{}", host.beacon.host_ip, host.beacon.control_port);
                             if let Ok(addr) = target.parse::<SocketAddr>() {
                                 clicked_addr = Some(addr);
                             }
@@ -510,18 +508,43 @@ impl LauncherUI {
                     ui.set_width(580.0);
 
                     // 1. Статус службы
-                    let is_running = self.host_server_info.as_ref().map_or(false, |i| i.is_running);
+                    let is_running = self.host_server_info.as_ref().is_some_and(|i| i.is_running);
                     let client_opt = self.host_server_info.as_ref().and_then(|i| i.client_addr);
-                    let frames = self.host_server_info.as_ref().map_or(0, |i| i.frames_streamed);
+                    let frames = self
+                        .host_server_info
+                        .as_ref()
+                        .map_or(0, |i| i.frames_streamed);
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Статус службы:").size(14.0).color(Color32::from_rgb(148, 163, 184)));
+                        ui.label(
+                            RichText::new("Статус службы:")
+                                .size(14.0)
+                                .color(Color32::from_rgb(148, 163, 184)),
+                        );
                         if !is_running {
-                            ui.label(RichText::new("⚪ ОСТАНОВЛЕН").size(14.0).strong().color(Color32::from_rgb(148, 163, 184)));
+                            ui.label(
+                                RichText::new("⚪ ОСТАНОВЛЕН")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(148, 163, 184)),
+                            );
                         } else if let Some(client_ip) = client_opt {
-                            ui.label(RichText::new(format!("🟢 СТРИМИНГ АКТИВЕН (клиент {})", client_ip)).size(14.0).strong().color(Color32::from_rgb(52, 211, 153)));
+                            ui.label(
+                                RichText::new(format!(
+                                    "🟢 СТРИМИНГ АКТИВЕН (клиент {})",
+                                    client_ip
+                                ))
+                                .size(14.0)
+                                .strong()
+                                .color(Color32::from_rgb(52, 211, 153)),
+                            );
                         } else {
-                            ui.label(RichText::new("🟢 АКТИВЕН (ОЖИДАНИЕ КЛИЕНТА В LAN)").size(14.0).strong().color(Color32::from_rgb(52, 211, 153)));
+                            ui.label(
+                                RichText::new("🟢 АКТИВЕН (ОЖИДАНИЕ КЛИЕНТА В LAN)")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(52, 211, 153)),
+                            );
                         }
                     });
 
@@ -565,7 +588,11 @@ impl LauncherUI {
                     // 3. Сетевой адрес хоста для ручного подключения
                     let local_ip = get_local_ip_string();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Локальный IP для подключения:").size(13.0).color(Color32::from_rgb(148, 163, 184)));
+                        ui.label(
+                            RichText::new("Локальный IP для подключения:")
+                                .size(13.0)
+                                .color(Color32::from_rgb(148, 163, 184)),
+                        );
                         ui.label(
                             RichText::new(format!("{}:48001", local_ip))
                                 .size(14.0)
@@ -573,7 +600,10 @@ impl LauncherUI {
                                 .color(Color32::from_rgb(248, 250, 252)),
                         );
 
-                        if ui.button(RichText::new("📋 Скопировать IP").size(12.0)).clicked() {
+                        if ui
+                            .button(RichText::new("📋 Скопировать IP").size(12.0))
+                            .clicked()
+                        {
                             ui.output_mut(|o| o.copied_text = format!("{}:48001", local_ip));
                         }
                     });
@@ -581,9 +611,17 @@ impl LauncherUI {
                     if is_running {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("Передано кадров: {}", frames)).size(12.0).color(Color32::from_rgb(192, 132, 252)));
+                            ui.label(
+                                RichText::new(format!("Передано кадров: {}", frames))
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(192, 132, 252)),
+                            );
                             ui.add_space(12.0);
-                            ui.label(RichText::new("LAN Discovery: маяк активен (порт 48002)").size(12.0).color(Color32::from_rgb(52, 211, 153)));
+                            ui.label(
+                                RichText::new("LAN Discovery: маяк активен (порт 48002)")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(52, 211, 153)),
+                            );
                         });
                     }
 
@@ -591,11 +629,27 @@ impl LauncherUI {
 
                     // 4. Компактная плашка оборудования
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("GPU:").size(11.0).color(Color32::from_rgb(100, 116, 139)));
-                        ui.label(RichText::new("NVIDIA RTX 2060 SUPER (NVENC 2-Pass)").size(11.0).color(Color32::from_rgb(203, 213, 225)));
+                        ui.label(
+                            RichText::new("GPU:")
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 116, 139)),
+                        );
+                        ui.label(
+                            RichText::new("NVIDIA RTX 2060 SUPER (NVENC 2-Pass)")
+                                .size(11.0)
+                                .color(Color32::from_rgb(203, 213, 225)),
+                        );
                         ui.add_space(16.0);
-                        ui.label(RichText::new("Захват:").size(11.0).color(Color32::from_rgb(100, 116, 139)));
-                        ui.label(RichText::new("WGC D3D11 Zero-Copy").size(11.0).color(Color32::from_rgb(203, 213, 225)));
+                        ui.label(
+                            RichText::new("Захват:")
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 116, 139)),
+                        );
+                        ui.label(
+                            RichText::new("WGC D3D11 Zero-Copy")
+                                .size(11.0)
+                                .color(Color32::from_rgb(203, 213, 225)),
+                        );
                     });
                 });
         });
@@ -655,11 +709,17 @@ impl LauncherUI {
 
                             ui.add_space(12.0);
 
-                            if ui.button(RichText::new("Монитор (F8)").size(11.0)).clicked() {
+                            if ui
+                                .button(RichText::new("Монитор (F8)").size(11.0))
+                                .clicked()
+                            {
                                 action = LauncherAction::SwitchMonitor;
                             }
 
-                            if ui.button(RichText::new("Скрыть (Esc)").size(11.0)).clicked() {
+                            if ui
+                                .button(RichText::new("Скрыть (Esc)").size(11.0))
+                                .clicked()
+                            {
                                 self.show_overlay = false;
                             }
 
@@ -717,12 +777,7 @@ impl LauncherUI {
 }
 
 fn get_local_ip_string() -> String {
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return addr.ip().to_string();
-            }
-        }
-    }
-    "127.0.0.1".to_string()
+    core_transport::get_local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
 }

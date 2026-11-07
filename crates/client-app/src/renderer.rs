@@ -9,31 +9,26 @@
 
 use windows::core::{s, Interface};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
 };
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
-    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_WRITE,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_WRITE_DISCARD, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT,
-    DXGI_PRESENT_ALLOW_TEARING, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    CreateDXGIFactory2, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
+    DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 const VS_HLSL: &str = r#"
@@ -168,7 +163,8 @@ impl D3D11Renderer {
         let context = context.unwrap();
 
         // 2. Создаем DXGI Factory2 и проверяем поддержку FastSync / Tearing
-        let dxgi_factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
+        let dxgi_factory: IDXGIFactory2 =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
 
         let mut allow_tearing = false;
         let swap_chain_flags = match dxgi_factory.cast::<IDXGIFactory5>() {
@@ -197,7 +193,10 @@ impl D3D11Renderer {
             Height: initial_h,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2, // Double buffering для Flip Model
             Scaling: DXGI_SCALING_STRETCH,
@@ -245,7 +244,8 @@ impl D3D11Renderer {
 
         tracing::info!(
             "Аппаратный D3D11 SwapChain (FLIP_DISCARD) успешно инициализирован: {}x{}",
-            initial_w, initial_h
+            initial_w,
+            initial_h
         );
 
         Ok(Self {
@@ -286,14 +286,20 @@ impl D3D11Renderer {
                 width,
                 height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
-                if self.tearing_supported { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0) },
+                if self.tearing_supported {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+                } else {
+                    windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0)
+                },
             );
             if let Err(ref e) = res {
                 tracing::error!("ResizeBuffers ({}x{}) ошибка: {:?}", width, height, e);
             }
             if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
                 let mut rtv = None;
-                let _ = self.device.CreateRenderTargetView(&back_buffer, None, Some(&mut rtv));
+                let _ = self
+                    .device
+                    .CreateRenderTargetView(&back_buffer, None, Some(&mut rtv));
                 self.render_target = rtv;
             }
         }
@@ -309,7 +315,10 @@ impl D3D11Renderer {
     }
 
     /// Обновить шрифтовой атлас и текстуры egui
-    pub fn update_egui_textures(&mut self, textures_delta: &egui::TexturesDelta) -> Result<(), windows::core::Error> {
+    pub fn update_egui_textures(
+        &mut self,
+        textures_delta: &egui::TexturesDelta,
+    ) -> Result<(), windows::core::Error> {
         self.egui_painter.update_textures(textures_delta)
     }
 
@@ -333,6 +342,12 @@ impl D3D11Renderer {
         Ok(())
     }
 
+    /// Проверка, было ли устройство GPU сброшено ОС (TDR / DXGI_ERROR_DEVICE_REMOVED)
+    pub fn is_device_lost(&self) -> bool {
+        // SAFETY: GetDeviceRemovedReason — безопасный запрос HRESULT статуса устройства Direct3D 11
+        unsafe { self.device.GetDeviceRemovedReason().is_err() }
+    }
+
     /// Аппаратный вывод содержимого буфера на экран (Flip Model, FastSync / VSync)
     pub fn present(&self) -> Result<(), windows::core::Error> {
         let present_flags = if self.tearing_supported {
@@ -340,6 +355,7 @@ impl D3D11Renderer {
         } else {
             DXGI_PRESENT(0)
         };
+        // SAFETY: self.swap_chain — валидный COM-указатель IDXGISwapChain1, созданный для окна HWND
         unsafe {
             self.swap_chain.Present(0, present_flags).ok()?;
         }
@@ -347,7 +363,12 @@ impl D3D11Renderer {
     }
 
     /// Подготовка и отрисовка видеокадра NV12 (без вызова Present)
-    pub fn draw_nv12(&mut self, nv12_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    pub fn draw_nv12(
+        &mut self,
+        nv12_data: &[u8],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<(), windows::core::Error> {
         let y_size = (frame_w * frame_h) as usize;
         let uv_size = y_size / 2;
         if nv12_data.len() < y_size + uv_size {
@@ -363,17 +384,30 @@ impl D3D11Renderer {
 
         // Загружаем Y-плоскость (R8_UNORM)
         if let Some(ref tex_y) = self.tex_y {
+            // SAFETY: tex_y создан с флагом D3D11_CPU_ACCESS_WRITE и D3D11_USAGE_DYNAMIC.
+            // Map с D3D11_MAP_WRITE_DISCARD возвращает валидный pData размером dst_pitch * frame_h.
             unsafe {
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context.Map(tex_y, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                self.context
+                    .Map(tex_y, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
                 let dst_pitch = mapped.RowPitch as usize;
                 let src_pitch = frame_w as usize;
-                let dst_slice = std::slice::from_raw_parts_mut(mapped.pData as *mut u8, dst_pitch * frame_h as usize);
+                let dst_slice = std::slice::from_raw_parts_mut(
+                    mapped.pData as *mut u8,
+                    dst_pitch * frame_h as usize,
+                );
 
-                for row in 0..frame_h as usize {
-                    let src_start = row * src_pitch;
-                    let dst_start = row * dst_pitch;
-                    dst_slice[dst_start..dst_start + src_pitch].copy_from_slice(&y_plane[src_start..src_start + src_pitch]);
+                if dst_pitch == src_pitch {
+                    // Аппаратно-векторизованное (AVX2/rep movsb) непрерывное копирование всей плоскости
+                    let total_bytes = src_pitch * frame_h as usize;
+                    dst_slice[..total_bytes].copy_from_slice(&y_plane[..total_bytes]);
+                } else {
+                    for row in 0..frame_h as usize {
+                        let src_start = row * src_pitch;
+                        let dst_start = row * dst_pitch;
+                        dst_slice[dst_start..dst_start + src_pitch]
+                            .copy_from_slice(&y_plane[src_start..src_start + src_pitch]);
+                    }
                 }
                 self.context.Unmap(tex_y, 0);
             }
@@ -382,17 +416,30 @@ impl D3D11Renderer {
         // Загружаем UV-плоскость (R8G8_UNORM, полувысота)
         if let Some(ref tex_uv) = self.tex_uv {
             let uv_h = frame_h / 2;
+            // SAFETY: tex_uv создан с D3D11_USAGE_DYNAMIC и D3D11_CPU_ACCESS_WRITE.
+            // Map возвращает валидный pData размером dst_pitch * uv_h.
             unsafe {
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context.Map(tex_uv, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                self.context
+                    .Map(tex_uv, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
                 let dst_pitch = mapped.RowPitch as usize;
                 let src_pitch = frame_w as usize;
-                let dst_slice = std::slice::from_raw_parts_mut(mapped.pData as *mut u8, dst_pitch * uv_h as usize);
+                let dst_slice = std::slice::from_raw_parts_mut(
+                    mapped.pData as *mut u8,
+                    dst_pitch * uv_h as usize,
+                );
 
-                for row in 0..uv_h as usize {
-                    let src_start = row * src_pitch;
-                    let dst_start = row * dst_pitch;
-                    dst_slice[dst_start..dst_start + src_pitch].copy_from_slice(&uv_plane[src_start..src_start + src_pitch]);
+                if dst_pitch == src_pitch {
+                    // Непрерывное копирование UV-плоскости в один проход
+                    let total_bytes = src_pitch * uv_h as usize;
+                    dst_slice[..total_bytes].copy_from_slice(&uv_plane[..total_bytes]);
+                } else {
+                    for row in 0..uv_h as usize {
+                        let src_start = row * src_pitch;
+                        let dst_start = row * dst_pitch;
+                        dst_slice[dst_start..dst_start + src_pitch]
+                            .copy_from_slice(&uv_plane[src_start..src_start + src_pitch]);
+                    }
                 }
                 self.context.Unmap(tex_uv, 0);
             }
@@ -404,13 +451,23 @@ impl D3D11Renderer {
     }
 
     /// Аппаратный рендер видеокадра в формате NV12 (YUV 4:2:0) напрямую через HLSL шейдер с выводом
-    pub fn render_nv12(&mut self, nv12_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    pub fn render_nv12(
+        &mut self,
+        nv12_data: &[u8],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<(), windows::core::Error> {
         self.draw_nv12(nv12_data, frame_w, frame_h)?;
         self.present()
     }
 
     /// Подготовка и отрисовка готового BGRA буфера (без вызова Present)
-    pub fn draw_bgra(&mut self, bgra_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    pub fn draw_bgra(
+        &mut self,
+        bgra_data: &[u8],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<(), windows::core::Error> {
         let expected_size = (frame_w * frame_h * 4) as usize;
         if bgra_data.len() < expected_size {
             return Ok(());
@@ -423,15 +480,20 @@ impl D3D11Renderer {
         if let Some(ref tex_bgra) = self.tex_bgra {
             unsafe {
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context.Map(tex_bgra, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                self.context
+                    .Map(tex_bgra, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
                 let dst_pitch = mapped.RowPitch as usize;
                 let src_pitch = (frame_w * 4) as usize;
-                let dst_slice = std::slice::from_raw_parts_mut(mapped.pData as *mut u8, dst_pitch * frame_h as usize);
+                let dst_slice = std::slice::from_raw_parts_mut(
+                    mapped.pData as *mut u8,
+                    dst_pitch * frame_h as usize,
+                );
 
                 for row in 0..frame_h as usize {
                     let src_start = row * src_pitch;
                     let dst_start = row * dst_pitch;
-                    dst_slice[dst_start..dst_start + src_pitch].copy_from_slice(&bgra_data[src_start..src_start + src_pitch]);
+                    dst_slice[dst_start..dst_start + src_pitch]
+                        .copy_from_slice(&bgra_data[src_start..src_start + src_pitch]);
                 }
                 self.context.Unmap(tex_bgra, 0);
             }
@@ -442,7 +504,12 @@ impl D3D11Renderer {
     }
 
     /// Рендер готового BGRA буфера через D3D11 с выводом
-    pub fn render_bgra(&mut self, bgra_data: &[u8], frame_w: u32, frame_h: u32) -> Result<(), windows::core::Error> {
+    pub fn render_bgra(
+        &mut self,
+        bgra_data: &[u8],
+        frame_w: u32,
+        frame_h: u32,
+    ) -> Result<(), windows::core::Error> {
         self.draw_bgra(bgra_data, frame_w, frame_h)?;
         self.present()
     }
@@ -455,19 +522,22 @@ impl D3D11Renderer {
 
         unsafe {
             // Расчет пропорционального Viewport с сохранением соотношения сторон (Letterbox)
-            let (vp_x, vp_y, vp_w, vp_h) = if self.tex_w > 0 && self.tex_h > 0 && self.width > 0 && self.height > 0 {
-                let scale = (self.width as f32 / self.tex_w as f32).min(self.height as f32 / self.tex_h as f32);
-                let tw = (self.tex_w as f32 * scale).round();
-                let th = (self.tex_h as f32 * scale).round();
-                let ox = ((self.width as f32 - tw) / 2.0).round();
-                let oy = ((self.height as f32 - th) / 2.0).round();
-                (ox, oy, tw, th)
-            } else {
-                (0.0, 0.0, self.width as f32, self.height as f32)
-            };
+            let (vp_x, vp_y, vp_w, vp_h) =
+                if self.tex_w > 0 && self.tex_h > 0 && self.width > 0 && self.height > 0 {
+                    let scale = (self.width as f32 / self.tex_w as f32)
+                        .min(self.height as f32 / self.tex_h as f32);
+                    let tw = (self.tex_w as f32 * scale).round();
+                    let th = (self.tex_h as f32 * scale).round();
+                    let ox = ((self.width as f32 - tw) / 2.0).round();
+                    let oy = ((self.height as f32 - th) / 2.0).round();
+                    (ox, oy, tw, th)
+                } else {
+                    (0.0, 0.0, self.width as f32, self.height as f32)
+                };
 
             // Очищаем буфер черным для полос letterbox при несовпадении аспектов
-            self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            self.context
+                .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
 
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: vp_x,
@@ -478,11 +548,14 @@ impl D3D11Renderer {
                 MaxDepth: 1.0,
             };
             self.context.RSSetViewports(Some(&[viewport]));
-            self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
 
-            self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             self.context.VSSetShader(&self.vs, None);
-            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
 
             if is_nv12 {
                 self.context.PSSetShader(&self.ps_nv12, None);
@@ -514,18 +587,23 @@ impl D3D11Renderer {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
                 ..Default::default()
             };
             let mut tex_y = None;
-            self.device.CreateTexture2D(&desc_y, None, Some(&mut tex_y))?;
+            self.device
+                .CreateTexture2D(&desc_y, None, Some(&mut tex_y))?;
             let tex_y = tex_y.unwrap();
 
             let mut srv_y = None;
-            self.device.CreateShaderResourceView(&tex_y, None, Some(&mut srv_y))?;
+            self.device
+                .CreateShaderResourceView(&tex_y, None, Some(&mut srv_y))?;
 
             // 2. UV plane: W/2 x H/2, R8G8_UNORM
             let desc_uv = D3D11_TEXTURE2D_DESC {
@@ -534,18 +612,23 @@ impl D3D11Renderer {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8G8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
                 ..Default::default()
             };
             let mut tex_uv = None;
-            self.device.CreateTexture2D(&desc_uv, None, Some(&mut tex_uv))?;
+            self.device
+                .CreateTexture2D(&desc_uv, None, Some(&mut tex_uv))?;
             let tex_uv = tex_uv.unwrap();
 
             let mut srv_uv = None;
-            self.device.CreateShaderResourceView(&tex_uv, None, Some(&mut srv_uv))?;
+            self.device
+                .CreateShaderResourceView(&tex_uv, None, Some(&mut srv_uv))?;
 
             self.tex_y = Some(tex_y);
             self.srv_y = srv_y;
@@ -565,7 +648,10 @@ impl D3D11Renderer {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -576,7 +662,8 @@ impl D3D11Renderer {
             let tex = tex.unwrap();
 
             let mut srv = None;
-            self.device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+            self.device
+                .CreateShaderResourceView(&tex, None, Some(&mut srv))?;
 
             self.tex_bgra = Some(tex);
             self.srv_bgra = srv;
@@ -587,11 +674,14 @@ impl D3D11Renderer {
     }
 }
 
-fn compile_vertex_shader(device: &ID3D11Device, source: &str) -> Result<ID3D11VertexShader, windows::core::Error> {
+fn compile_vertex_shader(
+    device: &ID3D11Device,
+    source: &str,
+) -> Result<ID3D11VertexShader, windows::core::Error> {
     let mut code = None;
     let mut error = None;
     unsafe {
-        let _ = D3DCompile(
+        let hr = D3DCompile(
             source.as_ptr() as *const _,
             source.len(),
             None,
@@ -604,22 +694,38 @@ fn compile_vertex_shader(device: &ID3D11Device, source: &str) -> Result<ID3D11Ve
             &mut code,
             Some(&mut error),
         );
-        let code = code.expect("Failed to compile vertex shader");
+        if let Err(e) = hr {
+            if let Some(ref err_blob) = error {
+                let msg = std::slice::from_raw_parts(
+                    err_blob.GetBufferPointer() as *const u8,
+                    err_blob.GetBufferSize(),
+                );
+                tracing::error!(
+                    "Vertex shader compile error: {}",
+                    String::from_utf8_lossy(msg)
+                );
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::from_win32)?;
         let mut vs = None;
         device.CreateVertexShader(
             std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()),
             None,
             Some(&mut vs),
         )?;
-        Ok(vs.unwrap())
+        vs.ok_or_else(windows::core::Error::from_win32)
     }
 }
 
-fn compile_pixel_shader(device: &ID3D11Device, source: &str) -> Result<ID3D11PixelShader, windows::core::Error> {
+fn compile_pixel_shader(
+    device: &ID3D11Device,
+    source: &str,
+) -> Result<ID3D11PixelShader, windows::core::Error> {
     let mut code = None;
     let mut error = None;
     unsafe {
-        let _ = D3DCompile(
+        let hr = D3DCompile(
             source.as_ptr() as *const _,
             source.len(),
             None,
@@ -632,13 +738,26 @@ fn compile_pixel_shader(device: &ID3D11Device, source: &str) -> Result<ID3D11Pix
             &mut code,
             Some(&mut error),
         );
-        let code = code.expect("Failed to compile pixel shader");
+        if let Err(e) = hr {
+            if let Some(ref err_blob) = error {
+                let msg = std::slice::from_raw_parts(
+                    err_blob.GetBufferPointer() as *const u8,
+                    err_blob.GetBufferSize(),
+                );
+                tracing::error!(
+                    "Pixel shader compile error: {}",
+                    String::from_utf8_lossy(msg)
+                );
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::from_win32)?;
         let mut ps = None;
         device.CreatePixelShader(
             std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()),
             None,
             Some(&mut ps),
         )?;
-        Ok(ps.unwrap())
+        ps.ok_or_else(windows::core::Error::from_win32)
     }
 }

@@ -13,7 +13,12 @@ use windows_capture::{
 use crate::error::CaptureError;
 
 pub type OnFrameCallback = Arc<
-    dyn Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    dyn Fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            u32,
+            u32,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + Sync,
 >;
@@ -45,8 +50,7 @@ impl GraphicsCaptureApiHandler for WgcCaptureHandler {
         let height = frame.height();
         let texture_raw: *mut std::ffi::c_void =
             unsafe { std::mem::transmute_copy(frame.as_raw_texture()) };
-        let device_raw: *mut std::ffi::c_void =
-            unsafe { std::mem::transmute_copy(frame.device()) };
+        let device_raw: *mut std::ffi::c_void = unsafe { std::mem::transmute_copy(frame.device()) };
 
         if let Err(e) = (self.callback)(texture_raw, device_raw, width, height) {
             tracing::warn!("Ошибка в колбэке кадра WGC: {:?}", e);
@@ -62,7 +66,8 @@ impl GraphicsCaptureApiHandler for WgcCaptureHandler {
 
 /// Управляемая сессия аппаратного захвата экрана через Windows Graphics Capture (WGC)
 pub struct WgcCaptureSession {
-    capture_control: Option<CaptureControl<WgcCaptureHandler, Box<dyn std::error::Error + Send + Sync>>>,
+    capture_control:
+        Option<CaptureControl<WgcCaptureHandler, Box<dyn std::error::Error + Send + Sync>>>,
     pub width: u32,
     pub height: u32,
 }
@@ -70,8 +75,9 @@ pub struct WgcCaptureSession {
 impl WgcCaptureSession {
     /// Получить список всех доступных мониторов системы (индекс, ширина, высота)
     pub fn enumerate_monitors() -> Result<Vec<(usize, u32, u32)>, CaptureError> {
-        let monitors = Monitor::enumerate()
-            .map_err(|e| CaptureError::InitializationFailed(format!("Ошибка перечисления мониторов: {:?}", e)))?;
+        let monitors = Monitor::enumerate().map_err(|e| {
+            CaptureError::InitializationFailed(format!("Ошибка перечисления мониторов: {:?}", e))
+        })?;
         let mut result = Vec::new();
         for (i, m) in monitors.into_iter().enumerate() {
             let w = m.width().unwrap_or(1920);
@@ -84,7 +90,12 @@ impl WgcCaptureSession {
     /// Запуск сессии захвата основного дисплея с передачей каждого готового GPU кадра в колбэк
     pub fn start<F>(callback: F) -> Result<Self, CaptureError>
     where
-        F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        F: Fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                u32,
+                u32,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
             + Send
             + Sync
             + 'static,
@@ -93,9 +104,18 @@ impl WgcCaptureSession {
     }
 
     /// Запуск сессии захвата конкретного монитора с выбором захвата курсора
-    pub fn start_monitor<F>(monitor_index: usize, with_cursor: bool, callback: F) -> Result<Self, CaptureError>
+    pub fn start_monitor<F>(
+        monitor_index: usize,
+        with_cursor: bool,
+        callback: F,
+    ) -> Result<Self, CaptureError>
     where
-        F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        F: Fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                u32,
+                u32,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
             + Send
             + Sync
             + 'static,
@@ -103,14 +123,16 @@ impl WgcCaptureSession {
         let all_monitors = Monitor::enumerate().ok();
         let monitor = if let Some(ref list) = all_monitors {
             if monitor_index < list.len() {
-                list[monitor_index].clone()
+                list[monitor_index]
             } else {
-                Monitor::primary()
-                    .map_err(|e| CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e)))?
+                Monitor::primary().map_err(|e| {
+                    CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e))
+                })?
             }
         } else {
-            Monitor::primary()
-                .map_err(|e| CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e)))?
+            Monitor::primary().map_err(|e| {
+                CaptureError::InitializationFailed(format!("Монитор не найден: {:?}", e))
+            })?
         };
 
         let width = monitor
@@ -136,13 +158,12 @@ impl WgcCaptureSession {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            WgcFlags {
-                callback: cb_arc,
-            },
+            WgcFlags { callback: cb_arc },
         );
 
-        let capture_control = WgcCaptureHandler::start_free_threaded(settings)
-            .map_err(|e| CaptureError::InitializationFailed(format!("Ошибка старта WGC: {:?}", e)))?;
+        let capture_control = WgcCaptureHandler::start_free_threaded(settings).map_err(|e| {
+            CaptureError::InitializationFailed(format!("Ошибка старта WGC: {:?}", e))
+        })?;
 
         Ok(Self {
             capture_control: Some(capture_control),

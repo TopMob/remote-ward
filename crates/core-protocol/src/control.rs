@@ -1,5 +1,9 @@
 use crate::frame::VideoCodec;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
+
+/// Максимально допустимый размер полезной нагрузки управляющего пакета для защиты от OOM
+pub const MAX_CONTROL_PACKET_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyframeReason {
@@ -40,20 +44,15 @@ impl From<String> for KeyframeReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StreamingStrategy {
     /// Локальная сеть Ethernet / сверхбыстрый Wi-Fi 5-6GHz (RTT < 3 мс, 90-120 FPS, битрейт до 45 Мбит/с, FastSync)
     UltraLan,
     /// Стандартный домашний Wi-Fi (RTT 3-15 мс, 60 FPS, WMM QoS, сбалансированный FEC и NACK)
+    #[default]
     StandardWifi,
     /// Удаленное подключение через интернет / WAN (RTT > 15 мс, усиленный FEC 10:3, консервативный битрейт)
     WanRemote,
-}
-
-impl Default for StreamingStrategy {
-    fn default() -> Self {
-        Self::StandardWifi
-    }
 }
 
 fn default_refresh_rate() -> u32 {
@@ -261,9 +260,13 @@ impl ControlMessage {
         bincode::serialize(self)
     }
 
-    /// Десериализация сообщения управления
+    /// Десериализация сообщения управления с жестким лимитом памяти
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_CONTROL_PACKET_SIZE)
+            .deserialize(bytes)
     }
 
     /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_CONTROL
@@ -274,10 +277,14 @@ impl ControlMessage {
         Ok(buf)
     }
 
-    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_CONTROL
+    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_CONTROL и лимитом памяти
     pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
         if packet.first() == Some(&crate::packet::MSG_TYPE_CONTROL) {
-            bincode::deserialize(&packet[1..])
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_CONTROL_PACKET_SIZE)
+                .deserialize(&packet[1..])
         } else {
             Err(bincode::ErrorKind::Custom(
                 "Пакет не содержит префикс MSG_TYPE_CONTROL".to_string(),
@@ -289,7 +296,8 @@ impl ControlMessage {
     /// Извлечь session_id из любого варианта ControlMessage (кроме Hello)
     pub fn session_id(&self) -> Option<u64> {
         match self {
-            Self::ClientHello(_) | Self::ServerHello(_) => None,
+            Self::ClientHello(_) => None,
+            Self::ServerHello(h) => Some(h.session_id),
             Self::RequestKeyframe { session_id, .. } => Some(*session_id),
             Self::Nack { session_id, .. } => Some(*session_id),
             Self::ChangeStreamSettings { session_id, .. } => Some(*session_id),
@@ -306,4 +314,3 @@ impl ControlMessage {
         }
     }
 }
-

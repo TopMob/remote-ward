@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
+    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -22,9 +22,12 @@ struct ActiveAudioEndpoint {
     render_client: IAudioRenderClient,
     buffer_frame_count: u32,
     device_id: String,
+    is_float: bool,
 }
 
-unsafe fn init_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<ActiveAudioEndpoint, windows::core::Error> {
+unsafe fn init_endpoint(
+    enumerator: &IMMDeviceEnumerator,
+) -> Result<ActiveAudioEndpoint, windows::core::Error> {
     let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
     let id_pwstr = device.GetId()?;
     let device_id = id_pwstr.to_string().unwrap_or_default();
@@ -42,26 +45,30 @@ unsafe fn init_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<ActiveAudioE
     };
     let buffer_duration = 300_000i64; // 30 мс
 
-    let init_res = audio_client.Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        0,
-        buffer_duration,
-        0,
-        &wfx,
-        None,
-    );
+    let init_res =
+        audio_client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, buffer_duration, 0, &wfx, None);
 
-    if let Err(_) = init_res {
+    let mut is_float = false;
+
+    if init_res.is_err() {
         let mix_ptr = audio_client.GetMixFormat()?;
-        audio_client.Initialize(
+        // SAFETY: mix_ptr валиден до вызова CoTaskMemFree
+        let mix_fmt = unsafe { *mix_ptr };
+        is_float = mix_fmt.wBitsPerSample == 32;
+
+        let init_retry = audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             0,
             buffer_duration,
             0,
             mix_ptr,
             None,
-        )?;
-        windows::Win32::System::Com::CoTaskMemFree(Some(mix_ptr as *const _ as *const _));
+        );
+        // SAFETY: Гарантированное освобождение буфера формата mix_ptr в куче COM даже при ошибке
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(mix_ptr as *const _ as *const _));
+        }
+        init_retry?;
     }
 
     let buffer_frame_count = audio_client.GetBufferSize()?;
@@ -73,6 +80,7 @@ unsafe fn init_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<ActiveAudioE
         render_client,
         buffer_frame_count,
         device_id,
+        is_float,
     })
 }
 
@@ -140,7 +148,8 @@ impl WasapiAudioPlayer {
                 Ok(ep) => {
                     tracing::info!(
                         "WASAPI Audio Player успешно запущен (устройство: {}, буфер: {} фреймов)",
-                        ep.device_id, ep.buffer_frame_count
+                        ep.device_id,
+                        ep.buffer_frame_count
                     );
                     ep
                 }
@@ -164,7 +173,9 @@ impl WasapiAudioPlayer {
                     if let Ok(cur_dev) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
                         if let Ok(id_pwstr) = cur_dev.GetId() {
                             let cur_id = id_pwstr.to_string().unwrap_or_default();
-                            windows::Win32::System::Com::CoTaskMemFree(Some(id_pwstr.as_ptr() as *const _));
+                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                id_pwstr.as_ptr() as *const _
+                            ));
                             if cur_id != active.device_id {
                                 tracing::info!(
                                     "[WASAPI] Обнаружена смена аудиоустройства Windows: {} -> {}. Переключение звука на наушники/гарнитуру...",
@@ -182,25 +193,48 @@ impl WasapiAudioPlayer {
                         Ok(padding) => {
                             let frames_needed = active.buffer_frame_count.saturating_sub(padding);
                             if frames_needed > 0 {
-                                let bytes_needed = (frames_needed * 4) as usize; // 2 канала * 2 байта = 4 байта на фрейм
                                 if let Ok(p_data) = active.render_client.GetBuffer(frames_needed) {
-                                    let dst_slice = std::slice::from_raw_parts_mut(p_data, bytes_needed);
-
                                     let mut queue = match audio_queue.lock() {
                                         Ok(g) => g,
                                         Err(_) => break,
                                     };
-                                    let available = queue.len().min(bytes_needed);
 
-                                    if available > 0 {
-                                        for (i, byte) in queue.drain(..available).enumerate() {
-                                            dst_slice[i] = byte;
+                                    if active.is_float {
+                                        // Приемник ожидает IEEE Float32 (4 байта на сэмпл, 8 байт на стерео фрейм)
+                                        // SAFETY: GetBuffer вернул p_data валидный для frames_needed стерео-фреймов Float32
+                                        let dst_slice = std::slice::from_raw_parts_mut(
+                                            p_data as *mut f32,
+                                            (frames_needed * 2) as usize,
+                                        );
+                                        let mut sample_idx = 0;
+                                        while sample_idx < dst_slice.len() && queue.len() >= 2 {
+                                            let b0 = queue.pop_front().unwrap_or(0);
+                                            let b1 = queue.pop_front().unwrap_or(0);
+                                            let sample_i16 = i16::from_le_bytes([b0, b1]);
+                                            dst_slice[sample_idx] = sample_i16 as f32 / 32768.0;
+                                            sample_idx += 1;
                                         }
-                                    }
+                                        if sample_idx < dst_slice.len() {
+                                            dst_slice[sample_idx..].fill(0.0);
+                                        }
+                                    } else {
+                                        // 16-bit PCM (4 байта на стерео фрейм)
+                                        let bytes_needed = (frames_needed * 4) as usize;
+                                        // SAFETY: GetBuffer вернул p_data валидный для bytes_needed байт
+                                        let dst_slice =
+                                            std::slice::from_raw_parts_mut(p_data, bytes_needed);
+                                        let available = queue.len().min(bytes_needed);
 
-                                    // Если данных не хватило (underflow), заполняем тишиной (нули)
-                                    if available < bytes_needed {
-                                        dst_slice[available..bytes_needed].fill(0);
+                                        if available > 0 {
+                                            for (i, byte) in queue.drain(..available).enumerate() {
+                                                dst_slice[i] = byte;
+                                            }
+                                        }
+
+                                        // Если данных не хватило (underflow), заполняем тишиной (нули)
+                                        if available < bytes_needed {
+                                            dst_slice[available..bytes_needed].fill(0);
+                                        }
                                     }
 
                                     let _ = active.render_client.ReleaseBuffer(frames_needed, 0);
@@ -208,7 +242,10 @@ impl WasapiAudioPlayer {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("[WASAPI] Устройство вывода сброшено ОС ({:?}), переподключение...", e);
+                            tracing::warn!(
+                                "[WASAPI] Устройство вывода сброшено ОС ({:?}), переподключение...",
+                                e
+                            );
                             need_reinit = true;
                         }
                     }

@@ -20,6 +20,12 @@ mod tests {
         let bytes = event.to_bytes().expect("serialize");
         let decoded = InputEvent::from_bytes(&bytes).expect("deserialize");
         assert_eq!(event, decoded);
+
+        // Проверка сериализации в срез памяти без аллокаций (Zero-Allocation)
+        let mut buf = [0u8; 64];
+        let len = event.write_to_slice(&mut buf).expect("write_to_slice");
+        let decoded_from_slice = InputEvent::from_packet(&buf[..len]).expect("deserialize slice");
+        assert_eq!(event, decoded_from_slice);
     }
 
     #[test]
@@ -57,7 +63,10 @@ mod tests {
         let pkt = switch_req.to_packet().expect("serialize");
         let decoded = ControlMessage::from_packet(&pkt).expect("deserialize");
         match decoded {
-            ControlMessage::SwitchMonitor { session_id, monitor_index } => {
+            ControlMessage::SwitchMonitor {
+                session_id,
+                monitor_index,
+            } => {
                 assert_eq!(session_id, 42);
                 assert_eq!(monitor_index, 1);
             }
@@ -73,7 +82,12 @@ mod tests {
         let ack_pkt = switch_ack.to_packet().expect("serialize ack");
         let decoded_ack = ControlMessage::from_packet(&ack_pkt).expect("deserialize ack");
         match decoded_ack {
-            ControlMessage::SwitchMonitorAck { session_id, monitor_index, width, height } => {
+            ControlMessage::SwitchMonitorAck {
+                session_id,
+                monitor_index,
+                width,
+                height,
+            } => {
                 assert_eq!(session_id, 42);
                 assert_eq!(monitor_index, 1);
                 assert_eq!(width, 2560);
@@ -126,7 +140,11 @@ mod tests {
         let cal_pkt = cal.to_packet().expect("serialize cal");
         let dec_cal = ControlMessage::from_packet(&cal_pkt).expect("deserialize cal");
         match dec_cal {
-            ControlMessage::CalibrationReport { min_rtt_us, selected_bitrate_kbps, .. } => {
+            ControlMessage::CalibrationReport {
+                min_rtt_us,
+                selected_bitrate_kbps,
+                ..
+            } => {
                 assert_eq!(min_rtt_us, 1500);
                 assert_eq!(selected_bitrate_kbps, 30000);
             }
@@ -145,5 +163,16 @@ mod tests {
             }
             _ => panic!("Expected SetLocalCursor"),
         }
+    }
+
+    #[test]
+    fn test_malicious_bincode_oom_protection() {
+        // Пакет с префиксом MSG_TYPE_CONTROL и огромной длиной вектора (0xFFFF_FFFF_FFFF_FFFF)
+        let mut evil = vec![crate::packet::MSG_TYPE_CONTROL];
+        evil.extend_from_slice(&[3, 0, 0, 0]); // дискриминант enum (Nack = 3)
+        evil.extend_from_slice(&[0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0]); // session_id
+        evil.extend_from_slice(&[1, 0, 0, 0]); // frame_id
+        evil.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // длина вектора 18 эксабайт
+        assert!(ControlMessage::from_packet(&evil).is_err());
     }
 }

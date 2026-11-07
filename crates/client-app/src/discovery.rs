@@ -2,11 +2,11 @@
 //!
 //! Фоновый прием маяков (UDP Beacons) от хост-серверов в локальной сети.
 
+use core_protocol::{HostBeacon, DISCOVERY_PORT};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use core_protocol::{HostBeacon, DISCOVERY_PORT};
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredHost {
@@ -35,9 +35,13 @@ impl LanDiscovery {
                     let _ = s.set_reuse_address(true);
                     let _ = s.set_broadcast(true);
                     let _ = s.set_nonblocking(true);
-                    let bind_addr: SocketAddr = format!("0.0.0.0:{}", DISCOVERY_PORT).parse().unwrap();
+                    let bind_addr = SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT));
                     if let Err(e) = s.bind(&bind_addr.into()) {
-                        tracing::warn!("Не удалось забиндить сокет LAN Discovery на 0.0.0.0:{}: {:?}", DISCOVERY_PORT, e);
+                        tracing::warn!(
+                            "Не удалось забиндить сокет LAN Discovery на 0.0.0.0:{}: {:?}",
+                            DISCOVERY_PORT,
+                            e
+                        );
                         return;
                     }
                     match tokio::net::UdpSocket::from_std(s.into()) {
@@ -61,11 +65,14 @@ impl LanDiscovery {
                         if let Ok(beacon) = HostBeacon::from_bytes(&buf[..len]) {
                             let key = format!("{}:{}", beacon.host_ip, beacon.control_port);
                             let mut map = hosts_clone.lock().unwrap();
-                            map.insert(key, DiscoveredHost {
-                                beacon,
-                                sender_addr: src,
-                                last_seen: Instant::now(),
-                            });
+                            map.insert(
+                                key,
+                                DiscoveredHost {
+                                    beacon,
+                                    sender_addr: src,
+                                    last_seen: Instant::now(),
+                                },
+                            );
                         }
                     }
                     Err(_) => {
@@ -89,3 +96,8 @@ impl LanDiscovery {
     }
 }
 
+impl Default for LanDiscovery {
+    fn default() -> Self {
+        Self::new()
+    }
+}

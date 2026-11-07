@@ -14,7 +14,11 @@ mod tests {
     fn test_enumerate_adapters() {
         let adapters = DxgiCapturer::enumerate_adapters().expect("enumerate adapters failed");
         for a in &adapters {
-            println!("Adapter: {} (VRAM: {} MB)", a.description, a.dedicated_video_memory / 1024 / 1024);
+            println!(
+                "Adapter: {} (VRAM: {} MB)",
+                a.description,
+                a.dedicated_video_memory / 1024 / 1024
+            );
         }
         assert!(!adapters.is_empty());
     }
@@ -23,7 +27,10 @@ mod tests {
     fn test_dxgi_capturer() {
         match DxgiCapturer::new(0, 0) {
             Ok(capturer) => {
-                println!("DXGI Capturer created: {}x{}", capturer.width, capturer.height);
+                println!(
+                    "DXGI Capturer created: {}x{}",
+                    capturer.width, capturer.height
+                );
                 match capturer.acquire_frame(1000) {
                     Ok(frame) => {
                         println!("DXGI Acquired frame: {:?}", frame.info.AccumulatedFrames);
@@ -44,7 +51,11 @@ mod tests {
         use windows_capture::monitor::Monitor;
         match Monitor::primary() {
             Ok(m) => {
-                println!("Primary monitor: w={}, h={}", m.width().unwrap_or(0), m.height().unwrap_or(0));
+                println!(
+                    "Primary monitor: w={}, h={}",
+                    m.width().unwrap_or(0),
+                    m.height().unwrap_or(0)
+                );
             }
             Err(e) => {
                 println!("Monitor::primary error: {:?}", e);
@@ -55,7 +66,12 @@ mod tests {
             Ok(list) => {
                 println!("Total monitors: {}", list.len());
                 for (i, m) in list.iter().enumerate() {
-                    println!("Monitor #{}: w={}, h={}", i, m.width().unwrap_or(0), m.height().unwrap_or(0));
+                    println!(
+                        "Monitor #{}: w={}, h={}",
+                        i,
+                        m.width().unwrap_or(0),
+                        m.height().unwrap_or(0)
+                    );
                 }
             }
             Err(e) => {
@@ -75,7 +91,10 @@ mod tests {
 
         println!("Starting WgcCaptureSession...");
         let session = WgcCaptureSession::start(move |tex, dev, w, h| {
-            println!("WGC Frame arrived! tex={:?}, dev={:?}, w={}, h={}", tex, dev, w, h);
+            println!(
+                "WGC Frame arrived! tex={:?}, dev={:?}, w={}, h={}",
+                tex, dev, w, h
+            );
             fc.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });

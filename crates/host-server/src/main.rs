@@ -2,7 +2,7 @@ use host_server::{HostConfig, RemoteWardHost};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
     let _timer = core_transport::ScopedTimerPeriod::set(1);
 
     tracing_subscriber::registry()
@@ -15,6 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = HostConfig::default();
     let host = RemoteWardHost::new(config);
 
-    host.run().await?;
+    host.run().await.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }

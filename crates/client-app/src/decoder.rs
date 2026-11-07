@@ -1,17 +1,17 @@
+use core_protocol::VideoCodec;
 use std::time::Instant;
+use thiserror::Error;
 use windows::core::{Interface, GUID, VARIANT};
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup,
-    IMFMediaType, IMFSample, IMFTransform, MFT_OUTPUT_DATA_BUFFER,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFMediaType_Video, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFT_MESSAGE_COMMAND_FLUSH,
+    ICodecAPI, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_H264,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_MESSAGE_COMMAND_FLUSH, MFT_OUTPUT_DATA_BUFFER,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_SIZE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
-use core_protocol::VideoCodec;
-use thiserror::Error;
 
 const CLSID_CMSH264DECODER_MFT: GUID = GUID::from_u128(0x62ce7e72_4c71_4d20_b15d_452831a87d9d);
 const CLSID_MSH265DECODER_MFT: GUID = GUID::from_u128(0x420a51a3_d601_46cf_ac41_371b7b122956);
@@ -37,7 +37,7 @@ pub struct DecodedFrame {
 
 /// Аппаратный декодер видеокадров на базе Windows Media Foundation MFT (Intel QuickSync / Direct3D)
 pub struct MftVideoDecoder {
-    decoder: IMFTransform,
+    decoder: Option<IMFTransform>,
     width: u32,
     height: u32,
     codec: VideoCodec,
@@ -46,6 +46,12 @@ pub struct MftVideoDecoder {
 }
 
 impl MftVideoDecoder {
+    #[inline]
+    fn decoder(&self) -> &IMFTransform {
+        self.decoder
+            .as_ref()
+            .expect("MftVideoDecoder: decoder is None")
+    }
     /// Проверка доступности системного декодера MFT для данного кодека
     pub fn is_codec_supported(codec: VideoCodec) -> bool {
         let clsid = match codec {
@@ -93,9 +99,8 @@ impl MftVideoDecoder {
             VideoCodec::AV1 => return Err(DecodeError::UnsupportedCodec(codec)),
         };
 
-        let decoder: IMFTransform = unsafe {
-            CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?
-        };
+        let decoder: IMFTransform =
+            unsafe { CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)? };
 
         // Включаем режим минимальной задержки (Low-Latency Mode)
         const CODECAPI_AV_LOW_LATENCY_MODE: GUID =
@@ -103,8 +108,13 @@ impl MftVideoDecoder {
         if let Ok(codec_api) = decoder.cast::<ICodecAPI>() {
             let var = VARIANT::from(1u32);
             match unsafe { codec_api.SetValue(&CODECAPI_AV_LOW_LATENCY_MODE, &var) } {
-                Ok(_) => tracing::info!("Режим CODECAPI_AV_LOW_LATENCY_MODE успешно активирован в MFT декодере"),
-                Err(e) => tracing::warn!("Не удалось включить CODECAPI_AV_LOW_LATENCY_MODE в MFT: {:?}", e),
+                Ok(_) => tracing::info!(
+                    "Режим CODECAPI_AV_LOW_LATENCY_MODE успешно активирован в MFT декодере"
+                ),
+                Err(e) => tracing::warn!(
+                    "Не удалось включить CODECAPI_AV_LOW_LATENCY_MODE в MFT: {:?}",
+                    e
+                ),
             }
         }
 
@@ -135,11 +145,13 @@ impl MftVideoDecoder {
 
         tracing::info!(
             "Аппаратный декодер Media Foundation MFT ({:?}) успешно настроен: {}x{}",
-            codec, width, height
+            codec,
+            width,
+            height
         );
 
         Ok(Self {
-            decoder,
+            decoder: Some(decoder),
             width,
             height,
             codec,
@@ -156,26 +168,35 @@ impl MftVideoDecoder {
     /// Очистка внутренних очередей MFT декодера (например, при смене монитора или энкодера)
     pub fn flush(&mut self) {
         unsafe {
-            let _ = self.decoder.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = self.decoder().ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         }
     }
 
-    /// Извлечение декодированного кадра из MFT
-    fn pull_output(&mut self, t0: Instant) -> Result<Option<DecodedFrame>, DecodeError> {
-        self.pull_output_attempts(t0, 0)
+    fn pull_output_into(
+        &mut self,
+        t0: Instant,
+        out_buf: &mut Vec<u8>,
+    ) -> Result<Option<(u32, u32, u64)>, DecodeError> {
+        self.pull_output_attempts_into(t0, out_buf, 0)
     }
 
-    fn pull_output_attempts(&mut self, t0: Instant, attempts: usize) -> Result<Option<DecodedFrame>, DecodeError> {
+    fn pull_output_attempts_into(
+        &mut self,
+        t0: Instant,
+        out_buf: &mut Vec<u8>,
+        attempts: usize,
+    ) -> Result<Option<(u32, u32, u64)>, DecodeError> {
         if attempts >= 3 {
             return Ok(None);
         }
 
-        let stream_info = unsafe {
-            self.decoder.GetOutputStreamInfo(self.output_stream_id)?
-        };
+        let stream_info = unsafe { self.decoder().GetOutputStreamInfo(self.output_stream_id)? };
 
-        let min_nv12_size = self.width * self.height * 3 / 2;
-        let buffer_size = stream_info.cbSize.max(min_nv12_size);
+        let min_nv12_size = (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(3)
+            / 2;
+        let buffer_size = (stream_info.cbSize as usize).max(min_nv12_size) as u32;
 
         let output_sample: IMFSample = unsafe { MFCreateSample()? };
         let output_buffer = unsafe { MFCreateMemoryBuffer(buffer_size)? };
@@ -192,7 +213,8 @@ impl MftVideoDecoder {
 
         let mut status = 0u32;
         let output_res = unsafe {
-            self.decoder.ProcessOutput(0, std::slice::from_mut(&mut output_data), &mut status)
+            self.decoder()
+                .ProcessOutput(0, std::slice::from_mut(&mut output_data), &mut status)
         };
 
         let output_sample = std::mem::ManuallyDrop::into_inner(output_data.pSample);
@@ -201,7 +223,10 @@ impl MftVideoDecoder {
         if let Err(e) = output_res {
             if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
                 // Декодер определил формат потока (SPS/PPS). Обновляем разрешение и тип вывода на NV12
-                if let Ok(avail_type) = unsafe { self.decoder.GetOutputAvailableType(self.output_stream_id, 0) } {
+                if let Ok(avail_type) = unsafe {
+                    self.decoder()
+                        .GetOutputAvailableType(self.output_stream_id, 0)
+                } {
                     if let Ok(new_size) = unsafe { avail_type.GetUINT64(&MF_MT_FRAME_SIZE) } {
                         let w = (new_size >> 32) as u32;
                         let h = (new_size & 0xFFFFFFFF) as u32;
@@ -217,9 +242,10 @@ impl MftVideoDecoder {
                     output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
                     output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
                     output_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
-                    self.decoder.SetOutputType(self.output_stream_id, &output_type, 0)?;
+                    self.decoder()
+                        .SetOutputType(self.output_stream_id, &output_type, 0)?;
                 }
-                return self.pull_output_attempts(t0, attempts + 1);
+                return self.pull_output_attempts_into(t0, out_buf, attempts + 1);
             }
             if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                 return Ok(None);
@@ -239,9 +265,10 @@ impl MftVideoDecoder {
             media_buffer.Lock(&mut buf_ptr, None, Some(&mut cur_len))?;
         }
 
-        let frame_bytes = unsafe {
-            std::slice::from_raw_parts(buf_ptr as *const u8, cur_len as usize).to_vec()
-        };
+        // Копируем напрямую в переиспользуемый буфер без аллокаций
+        let slice = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, cur_len as usize) };
+        out_buf.clear();
+        out_buf.extend_from_slice(slice);
 
         unsafe {
             let _ = media_buffer.Unlock();
@@ -249,16 +276,15 @@ impl MftVideoDecoder {
 
         let latency_us = t0.elapsed().as_micros() as u64;
 
-        Ok(Some(DecodedFrame {
-            width: self.width,
-            height: self.height,
-            data: frame_bytes,
-            latency_us,
-        }))
+        Ok(Some((self.width, self.height, latency_us)))
     }
 
-    /// Подача сжатых данных NAL и извлечение декодированного кадра (NV12)
-    pub fn decode(&mut self, compressed_nal: &[u8]) -> Result<Option<DecodedFrame>, DecodeError> {
+    /// Подача сжатых данных NAL и декодирование в предоставленный буфер (Zero-Allocation)
+    pub fn decode_into(
+        &mut self,
+        compressed_nal: &[u8],
+        out_buf: &mut Vec<u8>,
+    ) -> Result<Option<(u32, u32, u64)>, DecodeError> {
         let t0 = Instant::now();
 
         // 1. Создаем IMFSample с полезной нагрузкой NAL
@@ -283,14 +309,13 @@ impl MftVideoDecoder {
         self.frame_count += 1;
 
         // 2. Отправляем входной образец в MFT декодер
-        let input_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
+        let input_res = unsafe { self.decoder().ProcessInput(0, &sample, 0) };
         if let Err(e) = input_res {
-            // Если декодер вернул ошибку (например, MF_E_NOTACCEPTING), откачиваем ожидающие кадры и пробуем снова
-            let _ = self.pull_output(t0);
-            let retry_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
+            let _ = self.pull_output_into(t0, out_buf);
+            let retry_res = unsafe { self.decoder().ProcessInput(0, &sample, 0) };
             if let Err(retry_err) = retry_res {
                 self.flush();
-                let last_res = unsafe { self.decoder.ProcessInput(0, &sample, 0) };
+                let last_res = unsafe { self.decoder().ProcessInput(0, &sample, 0) };
                 if let Err(last_err) = last_res {
                     return Err(DecodeError::ProcessInputFailed(format!(
                         "{:?} (after retry: {:?}, initial: {:?})",
@@ -300,13 +325,30 @@ impl MftVideoDecoder {
             }
         }
 
-        // 3. Получаем выходной декодированный кадр
-        self.pull_output(t0)
+        // 3. Получаем выходной декодированный кадр в out_buf
+        self.pull_output_into(t0, out_buf)
+    }
+
+    /// Подача сжатых данных NAL и извлечение декодированного кадра (NV12)
+    pub fn decode(&mut self, compressed_nal: &[u8]) -> Result<Option<DecodedFrame>, DecodeError> {
+        let mut data = Vec::with_capacity((self.width * self.height * 3 / 2) as usize);
+        if let Some((w, h, lat)) = self.decode_into(compressed_nal, &mut data)? {
+            Ok(Some(DecodedFrame {
+                width: w,
+                height: h,
+                data,
+                latency_us: lat,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 }
 
 impl Drop for MftVideoDecoder {
     fn drop(&mut self) {
+        // SAFETY: Все COM-интерфейсы Media Foundation обязаны быть освобождены ДО вызова MFShutdown()
+        drop(self.decoder.take());
         unsafe {
             let _ = MFShutdown();
         }

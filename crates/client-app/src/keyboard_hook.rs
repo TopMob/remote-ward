@@ -9,7 +9,8 @@
 //! 2. Локальная обработка блокируется (возврат 1 из хука), чтобы клиентский ПК (ноутбук)
 //!    не открывал меню Пуск, не сворачивал окна и не переключал локальные задачи.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -18,10 +19,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow,
-    GetMessageW, GetWindowThreadProcessId, PostMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, PostMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_CLOSE,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use core_protocol::{ButtonState, InputEvent};
@@ -51,14 +52,14 @@ static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Глобальное состояние для обратного вызова хука Windows
 struct HookContext {
-    target_hwnd: HWND,
+    target_hwnd: isize,
     is_active: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
     input_tx: mpsc::UnboundedSender<InputEvent>,
 }
 
-static mut HOOK_HANDLE: HHOOK = HHOOK(std::ptr::null_mut());
-static mut HOOK_CTX: Option<HookContext> = None;
+static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static HOOK_CTX: RwLock<Option<HookContext>> = RwLock::new(None);
 
 #[inline]
 fn resolve_scancode(kbd: &KBDLLHOOKSTRUCT) -> u16 {
@@ -77,7 +78,8 @@ unsafe extern "system" fn low_level_keyboard_proc(
     l_param: LPARAM,
 ) -> LRESULT {
     if n_code >= 0 {
-        if let Some(ref ctx) = HOOK_CTX {
+        let hook_guard = HOOK_CTX.read();
+        if let Some(ref ctx) = *hook_guard {
             // Проверяем: включен ли захват и активно ли наше окно
             if ctx.is_active.load(Ordering::Relaxed) {
                 let fg = GetForegroundWindow();
@@ -85,11 +87,11 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 GetWindowThreadProcessId(fg, Some(&mut fg_pid));
                 let current_pid = windows::Win32::System::Threading::GetCurrentProcessId();
 
-                let is_target_focused = (fg_pid != 0 && fg_pid == current_pid)
-                    || fg == ctx.target_hwnd
-                    || {
+                let target_hwnd = HWND(ctx.target_hwnd as *mut _);
+                let is_target_focused =
+                    (fg_pid != 0 && fg_pid == current_pid) || fg == target_hwnd || {
                         let fg_root = GetAncestor(fg, GA_ROOT);
-                        let target_root = GetAncestor(ctx.target_hwnd, GA_ROOT);
+                        let target_root = GetAncestor(target_hwnd, GA_ROOT);
                         fg_root == target_root && fg_root != HWND(std::ptr::null_mut())
                     };
 
@@ -120,27 +122,39 @@ unsafe extern "system" fn low_level_keyboard_proc(
                         }
 
                         // 0. ХОСТ-КЛАВИША: Right Control
-                        let rctrl_down = vk == VK_RCONTROL || (GetAsyncKeyState(VK_RCONTROL as i32) as u16 & 0x8000) != 0;
+                        let rctrl_down = vk == VK_RCONTROL
+                            || (GetAsyncKeyState(VK_RCONTROL as i32) as u16 & 0x8000) != 0;
                         if rctrl_down {
                             // Right Control + Esc: экстренное чистое закрытие клиента
                             if vk == VK_ESCAPE {
                                 if is_down {
                                     tracing::info!("[KEY_HOOK] Нажат Right Ctrl + Esc -> экстренное завершение клиента");
                                     ctx.is_running.store(false, Ordering::Relaxed);
-                                    let _ = PostMessageW(ctx.target_hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                                    let _ = PostMessageW(
+                                        HWND(ctx.target_hwnd as *mut _),
+                                        WM_CLOSE,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
                                 }
                                 return LRESULT(1);
                             }
 
                             // Right Control + H: освобождение мыши и выход из полноэкранного режима
-                            if vk == 0x48 /* Key 'H' */ {
-                                return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
+                            if vk == 0x48
+                            /* Key 'H' */
+                            {
+                                let hhook = HHOOK(HOOK_HANDLE.load(Ordering::Relaxed) as *mut _);
+                                return CallNextHookEx(hhook, n_code, w_param, l_param);
                             }
                         }
 
                         // 1. Комбинация Ctrl + Alt + End -> отправка Ctrl+Alt+Del на хост
-                        let alt_pressed = alt_flag || ALT_DOWN.load(Ordering::Relaxed) || (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
-                        let ctrl_pressed = CTRL_DOWN.load(Ordering::Relaxed) || (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
+                        let alt_pressed = alt_flag
+                            || ALT_DOWN.load(Ordering::Relaxed)
+                            || (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0;
+                        let ctrl_pressed = CTRL_DOWN.load(Ordering::Relaxed)
+                            || (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
 
                         if vk == VK_END && alt_pressed && ctrl_pressed {
                             tracing::info!("[KEY_HOOK] Перехвачен Ctrl+Alt+End -> отправка Ctrl+Alt+Del на хост");
@@ -238,13 +252,16 @@ unsafe extern "system" fn low_level_keyboard_proc(
         }
     }
 
-    CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param)
+    // SAFETY: Вызов следующего хука в цепочке Win32
+    let hhook = HHOOK(HOOK_HANDLE.load(Ordering::Relaxed) as *mut _);
+    CallNextHookEx(hhook, n_code, w_param, l_param)
 }
 
 /// Управляемый сторож хука клавиатуры
 pub struct SystemKeyboardHook {
     thread_id: Arc<AtomicU32>,
     is_active: Arc<AtomicBool>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SystemKeyboardHook {
@@ -262,50 +279,57 @@ impl SystemKeyboardHook {
 
         let target_raw = target_hwnd.0 as isize;
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("keyboard-hook".into())
-            .spawn(move || unsafe {
-                let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+            .spawn(move || {
+                // SAFETY: Получение системного TID для цикла сообщений хука
+                let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 thread_id_clone.store(tid, Ordering::SeqCst);
 
-                HOOK_CTX = Some(HookContext {
-                    target_hwnd: HWND(target_raw as *mut _),
+                *HOOK_CTX.write() = Some(HookContext {
+                    target_hwnd: target_raw,
                     is_active: is_active_clone,
                     is_running,
                     input_tx,
                 });
 
-                let hmod = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
-                let hook = SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(low_level_keyboard_proc),
-                    hmod,
-                    0,
-                );
+                let hmod = unsafe {
+                    windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                        .unwrap_or_default()
+                };
+                // SAFETY: Установка хука WH_KEYBOARD_LL в текущем процессе
+                let hook = unsafe {
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), hmod, 0)
+                };
 
                 match hook {
                     Ok(h) => {
-                        HOOK_HANDLE = h;
+                        HOOK_HANDLE.store(h.0 as isize, Ordering::SeqCst);
                         tracing::info!("Глобальный хук WH_KEYBOARD_LL успешно установлен");
                     }
                     Err(e) => {
                         tracing::error!("Не удалось установить WH_KEYBOARD_LL: {:?}", e);
+                        *HOOK_CTX.write() = None;
                         return;
                     }
                 }
 
                 // Цикл сообщений Windows (обязателен для функционирования LL хуков)
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+                // SAFETY: GetMessageW для очереди сообщений выделенного потока хука
+                while unsafe { GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() } {
                     if msg.message == WM_QUIT {
                         break;
                     }
-                    DispatchMessageW(&msg);
+                    unsafe { DispatchMessageW(&msg) };
                 }
 
-                let _ = UnhookWindowsHookEx(HOOK_HANDLE);
-                HOOK_HANDLE = HHOOK(std::ptr::null_mut());
-                HOOK_CTX = None;
+                let hhook = HHOOK(HOOK_HANDLE.swap(0, Ordering::SeqCst) as *mut _);
+                if !hhook.0.is_null() {
+                    // SAFETY: Корректное снятие хука Windows при выходе из цикла
+                    let _ = unsafe { UnhookWindowsHookEx(hhook) };
+                }
+                *HOOK_CTX.write() = None;
                 WIN_DOWN.store(false, Ordering::Relaxed);
                 ALT_DOWN.store(false, Ordering::Relaxed);
                 CTRL_DOWN.store(false, Ordering::Relaxed);
@@ -316,15 +340,15 @@ impl SystemKeyboardHook {
         Self {
             thread_id,
             is_active,
+            thread_handle: Some(handle),
         }
     }
 
-    /// Обновить канал передачи событий ввода на активную сессию стрима
+    /// Обновить канал передачи событий ввода на активную сессию стрима без Data Race
     pub fn update_sender(&self, input_tx: mpsc::UnboundedSender<InputEvent>) {
-        unsafe {
-            if let Some(ref mut ctx) = HOOK_CTX {
-                ctx.input_tx = input_tx;
-            }
+        let mut hook_guard = HOOK_CTX.write();
+        if let Some(ref mut ctx) = *hook_guard {
+            ctx.input_tx = input_tx;
         }
     }
 
@@ -343,9 +367,13 @@ impl Drop for SystemKeyboardHook {
     fn drop(&mut self) {
         let tid = self.thread_id.load(Ordering::SeqCst);
         if tid != 0 {
+            // SAFETY: Отправка WM_QUIT в поток хука для корректного выхода из цикла сообщений
             unsafe {
                 let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
             }
+        }
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
         }
     }
 }

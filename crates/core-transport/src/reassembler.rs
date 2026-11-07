@@ -15,6 +15,7 @@ struct PartialFrame {
     session_id: u64,
     total_packets: u16,
     received_packets: u16,
+    max_packet_idx_seen: u16,
     timestamp_us: u64,
     is_keyframe: bool,
     created_at: Instant,
@@ -109,24 +110,36 @@ impl FrameReassembler {
         {
             self.cleanup_stale_frames();
             if self.pending_frames.len() >= self.max_pending_frames {
-                // Из BTreeMap гарантированно удаляем самый старый по frame_id кадр
-                if let Some(&oldest_id) = self.pending_frames.keys().next() {
+                // Находим самый старый кадр с учетом циклического переполнения u32 (Sequence Rollover)
+                if let Some(&oldest_id) = self.pending_frames.keys().min_by(|&&a, &&b| {
+                    if a == b {
+                        std::cmp::Ordering::Equal
+                    } else if is_newer_frame(b, a) {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }) {
                     self.pending_frames.remove(&oldest_id);
                 }
             }
         }
 
-        let partial = self.pending_frames.entry(frame_id).or_insert_with(|| {
-            PartialFrame {
+        let partial = self
+            .pending_frames
+            .entry(frame_id)
+            .or_insert_with(|| PartialFrame {
                 session_id: header.get_session_id(),
                 total_packets,
                 received_packets: 0,
+                max_packet_idx_seen: 0,
                 timestamp_us: header.get_timestamp_us(),
                 is_keyframe: header.is_keyframe(),
                 created_at: Instant::now(),
                 chunks: vec![None; total_packets as usize],
-            }
-        });
+            });
+
+        partial.max_packet_idx_seen = partial.max_packet_idx_seen.max(packet_idx as u16);
 
         // Проверяем, не был ли этот фрагмент уже получен (дедупликация)
         if packet_idx < partial.chunks.len() && partial.chunks[packet_idx].is_none() {
@@ -157,14 +170,17 @@ impl FrameReassembler {
                 let is_keyframe = partial.is_keyframe;
                 self.pending_frames.remove(&frame_id);
 
-                if !self.has_completed_any || is_newer_frame(frame_id, self.latest_completed_frame_id) {
+                if !self.has_completed_any
+                    || is_newer_frame(frame_id, self.latest_completed_frame_id)
+                {
                     self.latest_completed_frame_id = frame_id;
                     self.has_completed_any = true;
                 }
 
                 // При получении ключевого кадра сбрасываем более старые неполные P-кадры
                 if is_keyframe {
-                    self.pending_frames.retain(|&id, _| is_newer_frame(id, frame_id));
+                    self.pending_frames
+                        .retain(|&id, _| is_newer_frame(id, frame_id));
                 }
 
                 return Ok(Some(completed));
@@ -174,14 +190,46 @@ impl FrameReassembler {
         Ok(None)
     }
 
-    /// Получить список номеров недостающих пакетов для указанного кадра
+    /// Получить список номеров недостающих пакетов для указанного кадра среди всех фрагментов (0..total_packets).
+    /// Используется когда передача кадра завершена (пришел последний пакет) или при анализе отставшего кадра.
     pub fn get_missing_packets(&self, frame_id: u32) -> Option<Vec<u16>> {
         let partial = self.pending_frames.get(&frame_id)?;
         let missing: Vec<u16> = partial
             .chunks
             .iter()
             .enumerate()
-            .filter_map(|(idx, chunk)| if chunk.is_none() { Some(idx as u16) } else { None })
+            .filter_map(|(idx, chunk)| {
+                if chunk.is_none() {
+                    Some(idx as u16)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(missing)
+        }
+    }
+
+    /// Получить список пропущенных пакетов только среди уже принятого диапазона (до max_packet_idx_seen).
+    /// Используется на лету во время активного приема кадра (in-flight), чтобы выявлять промежуточные дыры
+    /// без генерации ложного NACK-шторма по пакетам, которые еще просто летят по сети.
+    pub fn get_missing_packets_in_flight(&self, frame_id: u32) -> Option<Vec<u16>> {
+        let partial = self.pending_frames.get(&frame_id)?;
+        let limit =
+            (partial.max_packet_idx_seen as usize).min(partial.chunks.len().saturating_sub(1));
+        let missing: Vec<u16> = partial.chunks[..=limit]
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, chunk)| {
+                if chunk.is_none() {
+                    Some(idx as u16)
+                } else {
+                    None
+                }
+            })
             .collect();
         if missing.is_empty() {
             None
@@ -245,7 +293,8 @@ mod tests {
             }
         }
 
-        let frame = completed.expect("Кадр должен быть собран несмотря на переупорядочивание фрагментов");
+        let frame =
+            completed.expect("Кадр должен быть собран несмотря на переупорядочивание фрагментов");
         assert_eq!(frame.frame_id, 100);
         assert!(!frame.is_keyframe);
         assert_eq!(frame.data, fake_payload);

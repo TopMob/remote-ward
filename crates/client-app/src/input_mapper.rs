@@ -88,15 +88,15 @@ pub fn keycode_to_scancode(key: KeyCode) -> Option<(u16, bool)> {
         // Знаки препинания и русские буквы (б, ю, ., э, ж, х, ъ, ё, -, =)
         KeyCode::Minus => Some((0x0C, false)),
         KeyCode::Equal => Some((0x0D, false)),
-        KeyCode::BracketLeft => Some((0x1A, false)),  // х
+        KeyCode::BracketLeft => Some((0x1A, false)), // х
         KeyCode::BracketRight => Some((0x1B, false)), // ъ
-        KeyCode::Semicolon => Some((0x27, false)),    // ж
-        KeyCode::Quote => Some((0x28, false)),        // э
-        KeyCode::Backquote => Some((0x29, false)),    // ё
+        KeyCode::Semicolon => Some((0x27, false)),   // ж
+        KeyCode::Quote => Some((0x28, false)),       // э
+        KeyCode::Backquote => Some((0x29, false)),   // ё
         KeyCode::Backslash => Some((0x2B, false)),
-        KeyCode::Comma => Some((0x33, false)),        // б
-        KeyCode::Period => Some((0x34, false)),       // ю
-        KeyCode::Slash => Some((0x35, false)),        // . / ?
+        KeyCode::Comma => Some((0x33, false)),  // б
+        KeyCode::Period => Some((0x34, false)), // ю
+        KeyCode::Slash => Some((0x35, false)),  // . / ?
 
         // Windows клавиши и системные
         KeyCode::SuperLeft => Some((0x5B, true)),
@@ -140,7 +140,10 @@ mod tests {
         assert_eq!(keycode_to_scancode(KeyCode::KeyD), Some((0x20, false)));
         assert_eq!(keycode_to_scancode(KeyCode::Space), Some((0x39, false)));
         assert_eq!(keycode_to_scancode(KeyCode::ShiftLeft), Some((0x2A, false)));
-        assert_eq!(keycode_to_scancode(KeyCode::ControlLeft), Some((0x1D, false)));
+        assert_eq!(
+            keycode_to_scancode(KeyCode::ControlLeft),
+            Some((0x1D, false))
+        );
     }
 
     #[test]

@@ -9,9 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEXTENSIBLE,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -84,25 +83,22 @@ impl WasapiAudioCapture {
 
             tracing::info!(
                 "WASAPI Loopback: устройство аудио подключено ({} Гц, {} каналов, {} бит)",
-                sample_rate, channels, bits_per_sample
+                sample_rate,
+                channels,
+                bits_per_sample
             );
 
             // Буфер на 20 мс (200 000 сотен наносекунд = 20 мс)
             let buffer_duration = 200_000i64;
 
-            audio_client.Initialize(
+            let init_res = audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK,
                 buffer_duration,
                 0,
                 pwfx_ptr,
                 None,
-            )?;
-
-            let capture_client: IAudioCaptureClient = audio_client.GetService()?;
-            audio_client.Start()?;
-
-            tracing::info!("WASAPI Loopback захват звука успешно запущен!");
+            );
 
             let is_float = if pwfx.wFormatTag == 1 {
                 false // WAVE_FORMAT_PCM
@@ -116,10 +112,16 @@ impl WasapiAudioCapture {
                 false
             };
 
+            // SAFETY: Освобождаем память WAVEFORMATEX в куче COM до проверки возможных ошибок
             CoTaskMemFree(Some(pwfx_ptr as *const _ as *const _));
+            init_res?;
+
+            let capture_client: IAudioCaptureClient = audio_client.GetService()?;
+            audio_client.Start()?;
+
+            tracing::info!("WASAPI Loopback захват звука успешно запущен!");
 
             let mut pcm_i16_buf: Vec<i16> = Vec::with_capacity(4096);
-            let mut byte_out_buf: Vec<u8> = Vec::with_capacity(8192);
 
             while is_running.load(Ordering::Relaxed) {
                 // Опрашиваем аудио каждые 5 мс для минимальной задержки
@@ -152,29 +154,31 @@ impl WasapiAudioCapture {
                             pcm_i16_buf.resize(total_samples, 0);
                         } else if is_float {
                             // Конвертация IEEE Float32 -> Int16
-                            let float_slice = std::slice::from_raw_parts(data_ptr as *const f32, total_samples);
+                            let float_slice =
+                                std::slice::from_raw_parts(data_ptr as *const f32, total_samples);
                             for &s in float_slice {
                                 let clamped = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                                 pcm_i16_buf.push(clamped);
                             }
                         } else if bits_per_sample == 16 {
                             // Исходный Int16
-                            let i16_slice = std::slice::from_raw_parts(data_ptr as *const i16, total_samples);
+                            let i16_slice =
+                                std::slice::from_raw_parts(data_ptr as *const i16, total_samples);
                             pcm_i16_buf.extend_from_slice(i16_slice);
                         }
 
                         if !pcm_i16_buf.is_empty() {
-                            byte_out_buf.clear();
-                            for &s in &pcm_i16_buf {
-                                byte_out_buf.extend_from_slice(&s.to_le_bytes());
-                            }
-
                             let timestamp_us = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_micros() as u64;
 
-                            callback(&byte_out_buf, timestamp_us);
+                            // SAFETY: pcm_i16_buf — непрерывный вектор i16. Приведение к &[u8] валидно на x86_64 Little-Endian
+                            let byte_slice = std::slice::from_raw_parts(
+                                pcm_i16_buf.as_ptr() as *const u8,
+                                pcm_i16_buf.len() * std::mem::size_of::<i16>(),
+                            );
+                            callback(byte_slice, timestamp_us);
                         }
                     }
 

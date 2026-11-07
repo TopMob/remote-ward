@@ -2,10 +2,19 @@
 //!
 //! Передача UDP-маяков (Beacons) для автоматического обнаружения хост-серверов Remote-Ward в локальной сети.
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 pub const DISCOVERY_PORT: u16 = 48002;
 pub const BEACON_MAGIC: &[u8; 4] = b"RWD1";
+
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    #[error("Маяк обнаружения слишком короткий или имеет неверную сигнатуру")]
+    InvalidMagic,
+    #[error("Ошибка десериализации маяка обнаружения: {0}")]
+    Deserialize(#[from] bincode::Error),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostBeacon {
@@ -28,12 +37,15 @@ impl HostBeacon {
         Ok(bytes)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DiscoveryError> {
         if bytes.len() < 4 || &bytes[..4] != BEACON_MAGIC {
-            return Err("Неверный заголовок маяка обнаружения".into());
+            return Err(DiscoveryError::InvalidMagic);
         }
-        let beacon: Self = bincode::deserialize(&bytes[4..])?;
+        let beacon: Self = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(2048)
+            .deserialize(&bytes[4..])?;
         Ok(beacon)
     }
 }
-

@@ -23,7 +23,11 @@ impl ScopedTimerPeriod {
             if res == 0 {
                 tracing::debug!("Windows Multimedia Timer установлен на {} мс", period_ms);
             } else {
-                tracing::warn!("Не удалось вызвать timeBeginPeriod({}): код {}", period_ms, res);
+                tracing::warn!(
+                    "Не удалось вызвать timeBeginPeriod({}): код {}",
+                    period_ms,
+                    res
+                );
             }
         }
         Self { period_ms }
@@ -40,7 +44,10 @@ impl Drop for ScopedTimerPeriod {
         unsafe {
             let res = timeEndPeriod(self.period_ms);
             if res == 0 {
-                tracing::debug!("Windows Multimedia Timer успешно сброшен ({})", self.period_ms);
+                tracing::debug!(
+                    "Windows Multimedia Timer успешно сброшен ({})",
+                    self.period_ms
+                );
             }
         }
     }
@@ -66,4 +73,3 @@ mod tests {
         // Timer автоматически вернется в исходное состояние при drop
     }
 }
-

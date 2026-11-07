@@ -7,31 +7,23 @@
 use std::collections::HashMap;
 use windows::core::s;
 use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
-    ID3D11InputLayout, ID3D11PixelShader, ID3D11RasterizerState,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
-    ID3D11Texture2D, ID3D11VertexShader,
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_INDEX_BUFFER,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VERTEX_BUFFER,
-    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
-    D3D11_BLEND_OP_ADD, D3D11_BOX, D3D11_BUFFER_DESC,
-    D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
-    D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
-    D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
-    D3D11_VIEWPORT,
+    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState,
+    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER,
+    D3D11_BIND_INDEX_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VERTEX_BUFFER,
+    D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BOX,
+    D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CPU_ACCESS_WRITE, D3D11_CULL_NONE,
+    D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_INPUT_ELEMENT_DESC,
+    D3D11_INPUT_PER_VERTEX_DATA, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
+    D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_UINT,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 
 const EGUI_VS_HLSL: &str = r#"
@@ -99,7 +91,10 @@ pub struct D3D11EguiPainter {
 }
 
 impl D3D11EguiPainter {
-    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Self, windows::core::Error> {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+    ) -> Result<Self, windows::core::Error> {
         let (vs, vs_code) = compile_vertex_shader_with_code(device, EGUI_VS_HLSL)?;
         let ps = compile_pixel_shader(device, EGUI_PS_HLSL)?;
 
@@ -138,7 +133,10 @@ impl D3D11EguiPainter {
         unsafe {
             device.CreateInputLayout(
                 &input_elements,
-                std::slice::from_raw_parts(vs_code.GetBufferPointer() as *const u8, vs_code.GetBufferSize()),
+                std::slice::from_raw_parts(
+                    vs_code.GetBufferPointer() as *const u8,
+                    vs_code.GetBufferSize(),
+                ),
                 Some(&mut input_layout),
             )?;
         }
@@ -248,12 +246,16 @@ impl D3D11EguiPainter {
     /// Очистить буфер кадра заданным цветом
     pub fn clear(&self, render_target: &ID3D11RenderTargetView, color_rgba: [f32; 4]) {
         unsafe {
-            self.context.ClearRenderTargetView(render_target, &color_rgba);
+            self.context
+                .ClearRenderTargetView(render_target, &color_rgba);
         }
     }
 
     /// Обновить текстуры egui (шрифтовой атлас и пользовательские изображения)
-    pub fn update_textures(&mut self, textures_delta: &egui::TexturesDelta) -> Result<(), windows::core::Error> {
+    pub fn update_textures(
+        &mut self,
+        textures_delta: &egui::TexturesDelta,
+    ) -> Result<(), windows::core::Error> {
         for (id, delta) in &textures_delta.set {
             self.set_texture(*id, delta)?;
         }
@@ -268,10 +270,15 @@ impl D3D11EguiPainter {
         id: egui::TextureId,
         delta: &egui::epaint::ImageDelta,
     ) -> Result<(), windows::core::Error> {
-        let (width, height, rgba_data): (usize, usize, std::borrow::Cow<[u8]>) = match &delta.image {
+        let (width, height, rgba_data): (usize, usize, std::borrow::Cow<[u8]>) = match &delta.image
+        {
             egui::ImageData::Color(image) => {
                 let bytes: &[u8] = bytemuck::cast_slice(&image.pixels);
-                (image.size[0], image.size[1], std::borrow::Cow::Borrowed(bytes))
+                (
+                    image.size[0],
+                    image.size[1],
+                    std::borrow::Cow::Borrowed(bytes),
+                )
             }
             egui::ImageData::Font(font) => {
                 let pixels: Vec<u8> = font.srgba_pixels(None).flat_map(|c| c.to_array()).collect();
@@ -309,7 +316,10 @@ impl D3D11EguiPainter {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 ..Default::default()
@@ -323,13 +333,15 @@ impl D3D11EguiPainter {
 
             let mut tex = None;
             unsafe {
-                self.device.CreateTexture2D(&desc, Some(&init_data), Some(&mut tex))?;
+                self.device
+                    .CreateTexture2D(&desc, Some(&init_data), Some(&mut tex))?;
             }
             let tex = tex.unwrap();
 
             let mut srv = None;
             unsafe {
-                self.device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+                self.device
+                    .CreateShaderResourceView(&tex, None, Some(&mut srv))?;
             }
             let srv = srv.unwrap();
 
@@ -388,11 +400,21 @@ impl D3D11EguiPainter {
         // 1. Копирование вершин в динамический GPU буфер
         unsafe {
             let mut mapped_vb = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.vertex_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped_vb))?;
+            self.context.Map(
+                &self.vertex_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped_vb),
+            )?;
             let mut vb_dst = mapped_vb.pData as *mut egui::epaint::Vertex;
             for clipped in clipped_primitives {
                 if let egui::epaint::Primitive::Mesh(ref mesh) = clipped.primitive {
-                    std::ptr::copy_nonoverlapping(mesh.vertices.as_ptr(), vb_dst, mesh.vertices.len());
+                    std::ptr::copy_nonoverlapping(
+                        mesh.vertices.as_ptr(),
+                        vb_dst,
+                        mesh.vertices.len(),
+                    );
                     vb_dst = vb_dst.add(mesh.vertices.len());
                 }
             }
@@ -400,11 +422,21 @@ impl D3D11EguiPainter {
 
             // 2. Копирование индексов в динамический GPU буфер
             let mut mapped_ib = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.index_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped_ib))?;
+            self.context.Map(
+                &self.index_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped_ib),
+            )?;
             let mut ib_dst = mapped_ib.pData as *mut u32;
             for clipped in clipped_primitives {
                 if let egui::epaint::Primitive::Mesh(ref mesh) = clipped.primitive {
-                    std::ptr::copy_nonoverlapping(mesh.indices.as_ptr(), ib_dst, mesh.indices.len());
+                    std::ptr::copy_nonoverlapping(
+                        mesh.indices.as_ptr(),
+                        ib_dst,
+                        mesh.indices.len(),
+                    );
                     ib_dst = ib_dst.add(mesh.indices.len());
                 }
             }
@@ -412,14 +444,24 @@ impl D3D11EguiPainter {
 
             // 3. Обновление Constant Buffer (размер экрана)
             let mut mapped_cb = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&self.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped_cb))?;
+            self.context.Map(
+                &self.constant_buffer,
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                Some(&mut mapped_cb),
+            )?;
             let screen_size_data = [
                 screen_width as f32 / pixels_per_point,
                 screen_height as f32 / pixels_per_point,
                 0.0f32,
                 0.0f32,
             ];
-            std::ptr::copy_nonoverlapping(screen_size_data.as_ptr(), mapped_cb.pData as *mut f32, 4);
+            std::ptr::copy_nonoverlapping(
+                screen_size_data.as_ptr(),
+                mapped_cb.pData as *mut f32,
+                4,
+            );
             self.context.Unmap(&self.constant_buffer, 0);
 
             // 4. Настройка конвейера отрисовки Direct3D 11
@@ -432,25 +474,37 @@ impl D3D11EguiPainter {
                 MaxDepth: 1.0,
             };
             self.context.RSSetViewports(Some(&[viewport]));
-            self.context.OMSetRenderTargets(Some(&[Some(render_target.clone())]), None);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(render_target.clone())]), None);
 
             let blend_factors = [0.0f32, 0.0, 0.0, 0.0];
-            self.context.OMSetBlendState(Some(&self.blend_state), Some(&blend_factors), 0xFFFFFFFF);
+            self.context
+                .OMSetBlendState(Some(&self.blend_state), Some(&blend_factors), 0xFFFFFFFF);
             self.context.RSSetState(Some(&self.rasterizer_state));
 
             self.context.IASetInputLayout(Some(&self.input_layout));
-            self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
             let stride = std::mem::size_of::<egui::epaint::Vertex>() as u32;
             let offset = 0u32;
-            self.context.IASetVertexBuffers(0, 1, Some(&Some(self.vertex_buffer.clone())), Some(&stride), Some(&offset));
-            self.context.IASetIndexBuffer(Some(&self.index_buffer), DXGI_FORMAT_R32_UINT, 0);
+            self.context.IASetVertexBuffers(
+                0,
+                1,
+                Some(&Some(self.vertex_buffer.clone())),
+                Some(&stride),
+                Some(&offset),
+            );
+            self.context
+                .IASetIndexBuffer(Some(&self.index_buffer), DXGI_FORMAT_R32_UINT, 0);
 
             self.context.VSSetShader(Some(&self.vs), None);
-            self.context.VSSetConstantBuffers(0, Some(&[Some(self.constant_buffer.clone())]));
+            self.context
+                .VSSetConstantBuffers(0, Some(&[Some(self.constant_buffer.clone())]));
 
             self.context.PSSetShader(Some(&self.ps), None);
-            self.context.PSSetSamplers(0, Some(&[Some(self.sampler_state.clone())]));
+            self.context
+                .PSSetSamplers(0, Some(&[Some(self.sampler_state.clone())]));
 
             // 5. Поэлементная отрисовка сеток с учетом Scissor Rects
             let mut vertex_offset = 0i32;
@@ -463,10 +517,18 @@ impl D3D11EguiPainter {
                     }
 
                     // Переводим логические координаты egui в физические пиксели D3D11
-                    let min_x = (clipped.clip_rect.min.x * pixels_per_point).round().max(0.0) as i32;
-                    let min_y = (clipped.clip_rect.min.y * pixels_per_point).round().max(0.0) as i32;
-                    let max_x = (clipped.clip_rect.max.x * pixels_per_point).round().min(screen_width as f32) as i32;
-                    let max_y = (clipped.clip_rect.max.y * pixels_per_point).round().min(screen_height as f32) as i32;
+                    let min_x = (clipped.clip_rect.min.x * pixels_per_point)
+                        .round()
+                        .max(0.0) as i32;
+                    let min_y = (clipped.clip_rect.min.y * pixels_per_point)
+                        .round()
+                        .max(0.0) as i32;
+                    let max_x = (clipped.clip_rect.max.x * pixels_per_point)
+                        .round()
+                        .min(screen_width as f32) as i32;
+                    let max_y = (clipped.clip_rect.max.y * pixels_per_point)
+                        .round()
+                        .min(screen_height as f32) as i32;
 
                     if max_x > min_x && max_y > min_y {
                         let scissor = RECT {
@@ -478,10 +540,15 @@ impl D3D11EguiPainter {
                         self.context.RSSetScissorRects(Some(&[scissor]));
 
                         if let Some((_, srv)) = self.textures.get(&mesh.texture_id) {
-                            self.context.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                            self.context
+                                .PSSetShaderResources(0, Some(&[Some(srv.clone())]));
                         }
 
-                        self.context.DrawIndexed(mesh.indices.len() as u32, index_offset, vertex_offset);
+                        self.context.DrawIndexed(
+                            mesh.indices.len() as u32,
+                            index_offset,
+                            vertex_offset,
+                        );
                     }
 
                     vertex_offset += mesh.vertices.len() as i32;
@@ -520,11 +587,17 @@ fn create_dynamic_buffer(
 fn compile_vertex_shader_with_code(
     device: &ID3D11Device,
     source: &str,
-) -> Result<(ID3D11VertexShader, windows::Win32::Graphics::Direct3D::ID3DBlob), windows::core::Error> {
+) -> Result<
+    (
+        ID3D11VertexShader,
+        windows::Win32::Graphics::Direct3D::ID3DBlob,
+    ),
+    windows::core::Error,
+> {
     let mut code = None;
     let mut error = None;
     unsafe {
-        let _ = D3DCompile(
+        let hr = D3DCompile(
             source.as_ptr() as *const _,
             source.len(),
             None,
@@ -537,14 +610,28 @@ fn compile_vertex_shader_with_code(
             &mut code,
             Some(&mut error),
         );
-        let code = code.expect("Failed to compile vertex shader");
+        if let Err(e) = hr {
+            if let Some(ref err_blob) = error {
+                let msg = std::slice::from_raw_parts(
+                    err_blob.GetBufferPointer() as *const u8,
+                    err_blob.GetBufferSize(),
+                );
+                tracing::error!(
+                    "Egui vertex shader compile error: {}",
+                    String::from_utf8_lossy(msg)
+                );
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::from_win32)?;
         let mut vs = None;
         device.CreateVertexShader(
             std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()),
             None,
             Some(&mut vs),
         )?;
-        Ok((vs.unwrap(), code))
+        let vs = vs.ok_or_else(windows::core::Error::from_win32)?;
+        Ok((vs, code))
     }
 }
 
@@ -555,7 +642,7 @@ fn compile_pixel_shader(
     let mut code = None;
     let mut error = None;
     unsafe {
-        let _ = D3DCompile(
+        let hr = D3DCompile(
             source.as_ptr() as *const _,
             source.len(),
             None,
@@ -568,13 +655,26 @@ fn compile_pixel_shader(
             &mut code,
             Some(&mut error),
         );
-        let code = code.expect("Failed to compile pixel shader");
+        if let Err(e) = hr {
+            if let Some(ref err_blob) = error {
+                let msg = std::slice::from_raw_parts(
+                    err_blob.GetBufferPointer() as *const u8,
+                    err_blob.GetBufferSize(),
+                );
+                tracing::error!(
+                    "Egui pixel shader compile error: {}",
+                    String::from_utf8_lossy(msg)
+                );
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::from_win32)?;
         let mut ps = None;
         device.CreatePixelShader(
             std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()),
             None,
             Some(&mut ps),
         )?;
-        Ok(ps.unwrap())
+        ps.ok_or_else(windows::core::Error::from_win32)
     }
 }

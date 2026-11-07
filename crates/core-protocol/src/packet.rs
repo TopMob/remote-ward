@@ -61,7 +61,7 @@ pub mod flags {
     pub const RETRANSMIT: u8 = 1 << 4;
 }
 
-/// Фиксированный бинарный заголовок для высокоскоростных датаграмм (Zero-Copy, 48 байт)
+/// Фиксированный бинарный заголовок для высокоскоростных датаграмм (Zero-Copy, 40 байт)
 ///
 /// Структура спроектирована так, что каждое поле выровнено по границе своего размера.
 /// Добавление нового поля: нужно только изменить `reserved2` и добавить getter/setter.
@@ -101,6 +101,7 @@ pub struct DatagramHeader {
 impl DatagramHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: u64,
         channel: ChannelId,

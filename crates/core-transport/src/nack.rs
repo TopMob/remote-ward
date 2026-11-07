@@ -206,7 +206,12 @@ impl NackBuffer {
     /// Добавить отправленный пакет в буфер текущего кадра
     pub fn buffer_packet(&mut self, frame_id: u32, packet_index: u16, datagram: Vec<u8>) {
         // Находим запись для этого frame_id
-        if let Some((_, packets)) = self.frames.iter_mut().rev().find(|(fid, _)| *fid == frame_id) {
+        if let Some((_, packets)) = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|(fid, _)| *fid == frame_id)
+        {
             if packets.len() < MAX_PACKETS_PER_FRAME {
                 packets.push(BufferedPacket {
                     frame_id,
@@ -221,11 +226,7 @@ impl NackBuffer {
     /// Найти пакеты по NACK-запросу.
     ///
     /// Возвращает список датаграмм готовых к повторной отправке.
-    pub fn get_packets_for_nack(
-        &self,
-        frame_id: u32,
-        missing_indices: &[u16],
-    ) -> Vec<Vec<u8>> {
+    pub fn get_packets_for_nack(&self, frame_id: u32, missing_indices: &[u16]) -> Vec<Vec<u8>> {
         let mut result = Vec::with_capacity(missing_indices.len());
 
         if let Some((_, packets)) = self.frames.iter().rev().find(|(fid, _)| *fid == frame_id) {
@@ -242,7 +243,9 @@ impl NackBuffer {
     /// Удалить кадры старше указанного порога
     pub fn cleanup_old(&mut self, max_age: Duration) {
         self.frames.retain(|(_, packets)| {
-            packets.first().map_or(true, |p| p.sent_at.elapsed() < max_age)
+            packets
+                .first()
+                .is_none_or(|p| p.sent_at.elapsed() < max_age)
         });
     }
 
@@ -313,4 +316,3 @@ mod tests {
         assert!(!buffer.get_packets_for_nack(4, &[0]).is_empty());
     }
 }
-

@@ -34,14 +34,14 @@ pub struct FramePacketizer;
 
 impl FramePacketizer {
     /// Потоковый итератор по датаграммам без промежуточных выделений памяти
-    pub fn packetize<'a>(
+    pub fn packetize(
         session_id: u64,
         frame_id: u32,
         timestamp_us: u64,
         is_keyframe: bool,
-        frame_data: &'a [u8],
+        frame_data: &[u8],
         max_payload_size: usize,
-    ) -> impl Iterator<Item = (super::packet::DatagramHeader, &'a [u8])> {
+    ) -> impl Iterator<Item = (super::packet::DatagramHeader, &'_ [u8])> {
         let total_packets = if frame_data.is_empty() {
             1
         } else {
@@ -87,7 +87,9 @@ impl FramePacketizer {
     ) -> usize {
         let header_bytes = bytemuck::bytes_of(header);
         let total_len = header_bytes.len() + payload.len();
-        debug_assert!(out_buf.len() >= total_len, "Предоставленный буфер меньше размера датаграммы");
+        if out_buf.len() < total_len {
+            return 0;
+        }
         out_buf[..header_bytes.len()].copy_from_slice(header_bytes);
         out_buf[header_bytes.len()..total_len].copy_from_slice(payload);
         total_len
@@ -102,14 +104,21 @@ impl FramePacketizer {
         frame_data: &[u8],
         max_payload_size: usize,
     ) -> Vec<Vec<u8>> {
-        Self::packetize(session_id, frame_id, timestamp_us, is_keyframe, frame_data, max_payload_size)
-            .map(|(header, chunk)| {
-                let mut buf = Vec::with_capacity(super::packet::DatagramHeader::SIZE + chunk.len());
-                buf.extend_from_slice(bytemuck::bytes_of(&header));
-                buf.extend_from_slice(chunk);
-                buf
-            })
-            .collect()
+        Self::packetize(
+            session_id,
+            frame_id,
+            timestamp_us,
+            is_keyframe,
+            frame_data,
+            max_payload_size,
+        )
+        .map(|(header, chunk)| {
+            let mut buf = Vec::with_capacity(super::packet::DatagramHeader::SIZE + chunk.len());
+            buf.extend_from_slice(bytemuck::bytes_of(&header));
+            buf.extend_from_slice(chunk);
+            buf
+        })
+        .collect()
     }
 }
 
@@ -122,7 +131,8 @@ mod tests {
         let fake_frame = vec![42u8; 3000]; // 3000 bytes
         let max_payload = 1000;
         let packets: Vec<_> =
-            FramePacketizer::packetize(123456, 100, 1_000_000, true, &fake_frame, max_payload).collect();
+            FramePacketizer::packetize(123456, 100, 1_000_000, true, &fake_frame, max_payload)
+                .collect();
 
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].0.get_session_id(), 123456);
@@ -137,7 +147,11 @@ mod tests {
         assert_eq!(packets[2].1.len(), 1000);
 
         let mut scratch = [0u8; 1500];
-        let bytes_written = FramePacketizer::write_datagram(&packets[0].0, packets[0].1, &mut scratch);
-        assert_eq!(bytes_written, super::super::packet::DatagramHeader::SIZE + 1000);
+        let bytes_written =
+            FramePacketizer::write_datagram(&packets[0].0, packets[0].1, &mut scratch);
+        assert_eq!(
+            bytes_written,
+            super::super::packet::DatagramHeader::SIZE + 1000
+        );
     }
 }

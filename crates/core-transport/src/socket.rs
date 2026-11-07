@@ -1,3 +1,10 @@
+/// Определение локального IPv4-адреса текущего узла через UDP-сопряжение
+pub fn get_local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
+
 /// Низкоуровневая оптимизация UDP-сокетов Windows для стриминга сверхнизкой задержки
 pub fn optimize_udp_socket(socket: &tokio::net::UdpSocket) {
     #[cfg(windows)]
@@ -23,7 +30,10 @@ pub fn optimize_udp_socket(socket: &tokio::net::UdpSocket) {
         // 3. Устанавливаем QoS / DSCP 46 (Expedited Forwarding, 0x2E << 2 = 0xB8)
         // Для Wi-Fi роутеров с поддержкой WMM (802.11e) это помещает видеопакеты в аппаратную очередь AC_VI/AC_VO
         if let Err(e) = sock_ref.set_tos(0xB8) {
-            tracing::debug!("QoS/TOS не поддерживается или ограничен групповой политикой Windows: {:?}", e);
+            tracing::debug!(
+                "QoS/TOS не поддерживается или ограничен групповой политикой Windows: {:?}",
+                e
+            );
         } else {
             tracing::trace!("Установлен QoS DSCP 46 (Expedited Forwarding) для WMM");
         }

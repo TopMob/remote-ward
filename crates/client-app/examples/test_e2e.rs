@@ -3,11 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
-use core_protocol::{
-    ButtonState, ClientHello, ControlMessage, InputEvent, VideoCodec,
-};
-use core_transport::FrameReassembler;
 use client_app::decoder::MftVideoDecoder;
+use core_protocol::{ButtonState, ClientHello, ControlMessage, InputEvent, VideoCodec};
+use core_transport::FrameReassembler;
 use host_server::{HostConfig, RemoteWardHost};
 
 #[tokio::main]
@@ -45,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_ctrl_socket = UdpSocket::bind("127.0.0.1:0").await?;
     let client_video_port = 48002;
     let client_video_socket = UdpSocket::bind(format!("127.0.0.1:{}", client_video_port)).await?;
-    println!("[2] Клиентские сокеты открыты: видео-приемник на порту {}", client_video_port);
+    println!(
+        "[2] Клиентские сокеты открыты: видео-приемник на порту {}",
+        client_video_port
+    );
 
     // 3. Отправляем ClientHello на хост
     let host_ctrl_addr: SocketAddr = "127.0.0.1:48001".parse()?;
@@ -62,7 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let hello_bytes = hello.to_packet()?;
-    client_ctrl_socket.send_to(&hello_bytes, host_ctrl_addr).await?;
+    client_ctrl_socket
+        .send_to(&hello_bytes, host_ctrl_addr)
+        .await?;
     println!("[3] Отправлен ClientHello на хост (запрос видеопотока 2560x1440 @ 60 FPS)");
 
     // 4. Ожидаем ответ ServerHello
@@ -74,7 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await??;
 
     let selected_codec;
-    if let Ok(ControlMessage::ServerHello(server_hello)) = ControlMessage::from_packet(&ctrl_buf[..ctrl_len]) {
+    if let Ok(ControlMessage::ServerHello(server_hello)) =
+        ControlMessage::from_packet(&ctrl_buf[..ctrl_len])
+    {
         println!(
             "    ✅ Получен ServerHello: сервер {}, выбран кодек: {:?}",
             server_hello.server_name, server_hello.selected_codec
@@ -89,7 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for i in 0..10 {
         // Мышь: относительное перемещение
         let mouse_event = InputEvent::MouseMoveRelative { dx: i * 2, dy: -i };
-        client_ctrl_socket.send_to(&mouse_event.to_packet()?, host_ctrl_addr).await?;
+        client_ctrl_socket
+            .send_to(&mouse_event.to_packet()?, host_ctrl_addr)
+            .await?;
 
         // Клавиатура: W нажата и отпущена (scan code 0x11)
         let key_down = InputEvent::Keyboard {
@@ -97,14 +104,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             is_extended: false,
             state: ButtonState::Pressed,
         };
-        client_ctrl_socket.send_to(&key_down.to_packet()?, host_ctrl_addr).await?;
+        client_ctrl_socket
+            .send_to(&key_down.to_packet()?, host_ctrl_addr)
+            .await?;
 
         let key_up = InputEvent::Keyboard {
             scan_code: 0x11,
             is_extended: false,
             state: ButtonState::Released,
         };
-        client_ctrl_socket.send_to(&key_up.to_packet()?, host_ctrl_addr).await?;
+        client_ctrl_socket
+            .send_to(&key_up.to_packet()?, host_ctrl_addr)
+            .await?;
     }
     println!("    ✅ 30 пакетов ввода (мышь + клавиатура) успешно доставлены на хост!");
 
@@ -126,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Движение мыши заставляет Windows DWM непрерывно отрисовывать кадры на рабочем столе
         mouse_tick += 1;
         let delta = if mouse_tick % 2 == 0 { 15 } else { -15 };
-        let mouse_event = InputEvent::MouseMoveRelative { dx: delta, dy: delta };
+        let mouse_event = InputEvent::MouseMoveRelative {
+            dx: delta,
+            dy: delta,
+        };
         if let Ok(bytes) = mouse_event.to_packet() {
             let _ = client_ctrl_socket.send_to(&bytes, host_ctrl_addr).await;
         }
@@ -154,7 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     // Декодируем через MFT
                     let decode_res = decoder.decode(&assembled.data);
                     let decode_status = match decode_res {
-                        Ok(Some(frame)) => format!("NV12 {}x{}, задержка MFT: {:.2} мс", frame.width, frame.height, frame.latency_us as f64 / 1000.0),
+                        Ok(Some(frame)) => format!(
+                            "NV12 {}x{}, задержка MFT: {:.2} мс",
+                            frame.width,
+                            frame.height,
+                            frame.latency_us as f64 / 1000.0
+                        ),
                         Ok(None) => "Кадр буферизован MFT".into(),
                         Err(e) => format!("Ошибка MFT: {:?}", e),
                     };
@@ -195,15 +214,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         println!("  Средний размер кадра в сети: {:.1} КБ", avg_size_kb);
         println!("  Сквозная задержка (захват экрана + NVENC + сеть UDP + сборка пакетов):");
-        println!("    Средняя: {:.2} мс ({} мкс)", avg_e2e_us as f64 / 1000.0, avg_e2e_us);
-        println!("    Медиана (p50): {:.2} мс ({} мкс)", p50_us as f64 / 1000.0, p50_us);
-        println!("    Минимум: {:.2} мс ({} мкс)", min_us as f64 / 1000.0, min_us);
-        println!("    Максимум: {:.2} мс ({} мкс)", max_us as f64 / 1000.0, max_us);
+        println!(
+            "    Средняя: {:.2} мс ({} мкс)",
+            avg_e2e_us as f64 / 1000.0,
+            avg_e2e_us
+        );
+        println!(
+            "    Медиана (p50): {:.2} мс ({} мкс)",
+            p50_us as f64 / 1000.0,
+            p50_us
+        );
+        println!(
+            "    Минимум: {:.2} мс ({} мкс)",
+            min_us as f64 / 1000.0,
+            min_us
+        );
+        println!(
+            "    Максимум: {:.2} мс ({} мкс)",
+            max_us as f64 / 1000.0,
+            max_us
+        );
 
         let target_ok = (avg_e2e_us as f64 / 1000.0) <= 16.6; // Укладываемся ли в 60 FPS бюджет (16.6 мс)
         println!(
             "\n  Соответствие бюджету кадра 60 FPS (< 16.6 мс): {}",
-            if target_ok { "✅ В РАМКАХ БЮДЖЕТА" } else { "⚠️ ПРЕВЫШАЕТ" }
+            if target_ok {
+                "✅ В РАМКАХ БЮДЖЕТА"
+            } else {
+                "⚠️ ПРЕВЫШАЕТ"
+            }
         );
     }
 

@@ -2,13 +2,14 @@ use client_app::{run_client, AppConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
     let _timer = core_transport::ScopedTimerPeriod::set(1);
 
+    // SAFETY: Инициализация COM в многопоточном режиме (MTA) согласно п. 3.3 AGENTS.md
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
-            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            windows::Win32::System::Com::COINIT_MULTITHREADED,
         );
     }
 
@@ -29,6 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    run_client(app_config).await?;
+    let res = run_client(app_config).await;
+    // SAFETY: Парный вызов CoUninitialize для очистки COM-апартамента потока
+    unsafe {
+        windows::Win32::System::Com::CoUninitialize();
+    }
+    res.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }

@@ -1,11 +1,19 @@
+use core_protocol::VideoCodec;
+use libloading::Library;
+use moq_nvenc::sys::nvEncodeAPI::*;
 use std::ffi::c_void;
 use std::ptr;
 use std::time::Instant;
-use libloading::Library;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
-use moq_nvenc::sys::nvEncodeAPI::*;
-use core_protocol::VideoCodec;
+
+/// GUID для пресета P1 (ultra-low latency) кодировщика NVIDIA NVENC
+pub const NV_ENC_PRESET_P1_GUID: GUID = GUID {
+    Data1: 0xfc0a_3770,
+    Data2: 0x01a4,
+    Data3: 0x480e,
+    Data4: [0xa7, 0x76, 0x4f, 0x6e, 0x24, 0x01, 0x67, 0x22],
+};
 
 /// GUID для пресета P4 (balanced) кодировщика NVIDIA NVENC
 pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
@@ -65,7 +73,6 @@ impl Drop for NvencEncoder {
 
 unsafe impl Sync for NvencEncoder {}
 
-
 impl NvencEncoder {
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -97,17 +104,14 @@ impl NvencEncoder {
     ) -> Result<Self, EncodeError> {
         // 1. Загрузка DLL
         let lib = unsafe {
-            Library::new("nvEncodeAPI64.dll").map_err(|_e| {
-                EncodeError::EncoderNotFound(codec)
-            })?
+            Library::new("nvEncodeAPI64.dll").map_err(|_e| EncodeError::EncoderNotFound(codec))?
         };
 
         let create_instance: libloading::Symbol<
             unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS,
         > = unsafe {
-            lib.get(b"NvEncodeAPICreateInstance\0").map_err(|_e| {
-                EncodeError::EncoderNotFound(codec)
-            })?
+            lib.get(b"NvEncodeAPICreateInstance\0")
+                .map_err(|_e| EncodeError::EncoderNotFound(codec))?
         };
 
         let mut fn_list = NV_ENCODE_API_FUNCTION_LIST {
@@ -147,7 +151,7 @@ impl NvencEncoder {
             VideoCodec::AV1 => NV_ENC_CODEC_AV1_GUID,
         };
 
-        let preset_guid = NV_ENC_PRESET_P4_GUID; // P4 = оптимальный пресет высокой четкости динамики и низкого инпут-лага (<0.2 мс)
+        let preset_guid = NV_ENC_PRESET_P1_GUID; // P1 = Ultra-Low Latency (<0.1 мс инпут-лаг согласно AGENTS.md)
 
         // 3. Получение конфигурации пресета
         let mut preset_config = NV_ENC_PRESET_CONFIG {
@@ -174,7 +178,10 @@ impl NvencEncoder {
         };
 
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
-            tracing::warn!("GetEncodePresetConfigEx вернул {:?}, используем базовую конфигурацию", status);
+            tracing::warn!(
+                "GetEncodePresetConfigEx вернул {:?}, используем базовую конфигурацию",
+                status
+            );
         }
 
         // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, двухпроходное распределение битрейта, IDR по запросу
@@ -228,7 +235,8 @@ impl NvencEncoder {
         match codec {
             VideoCodec::H264 => {
                 let h264 = unsafe { &mut encode_config.encodeCodecConfig.h264Config };
-                h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+                h264.entropyCodingMode =
+                    NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
                 h264.set_repeatSPSPPS(1);
                 h264.idrPeriod = 0xFFFFFFFF;
                 h264.maxNumRefFrames = 1;
@@ -239,9 +247,12 @@ impl NvencEncoder {
 
                 h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
                 h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
-                h264.h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-                h264.h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-                h264.h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                h264.h264VUIParameters.colourPrimaries =
+                    NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                h264.h264VUIParameters.transferCharacteristics =
+                    NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                h264.h264VUIParameters.colourMatrix =
+                    NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 h264.h264VUIParameters.videoFullRangeFlag = 0; // Limited range
             }
             VideoCodec::HEVC => {
@@ -256,9 +267,12 @@ impl NvencEncoder {
 
                 hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
                 hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
-                hevc.hevcVUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-                hevc.hevcVUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-                hevc.hevcVUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                hevc.hevcVUIParameters.colourPrimaries =
+                    NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                hevc.hevcVUIParameters.transferCharacteristics =
+                    NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                hevc.hevcVUIParameters.colourMatrix =
+                    NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 hevc.hevcVUIParameters.videoFullRangeFlag = 0; // Limited range
             }
             _ => {}
@@ -377,7 +391,10 @@ impl NvencEncoder {
             )));
         }
 
-        tracing::info!("NVENC битрейт успешно перенастроен: {} кбит/с", new_bitrate_kbps);
+        tracing::info!(
+            "NVENC битрейт успешно перенастроен: {} кбит/с",
+            new_bitrate_kbps
+        );
         Ok(())
     }
 
@@ -506,6 +523,7 @@ impl NvencEncoder {
 
         let status = unsafe { encode_fn(self.encoder_ptr, &mut pic_params) };
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
+            // SAFETY: Очистка замапленного ресурса и разрегистрация дескриптора при ошибке
             unsafe {
                 if let Some(unmap_fn) = self.fn_list.nvEncUnmapInputResource {
                     let _ = unmap_fn(self.encoder_ptr, input_buffer);
@@ -514,6 +532,8 @@ impl NvencEncoder {
                     let _ = unreg_fn(self.encoder_ptr, registered_handle);
                 }
             }
+            // Удаляем недействительный дескриптор из кэша, предотвращая Use-After-Free
+            self.registered_resources.remove(&ptr_key);
             return Err(EncodeError::ProcessOutputFailed(format!(
                 "Ошибка encode_picture: {:?}",
                 status
@@ -534,6 +554,12 @@ impl NvencEncoder {
 
         let status = unsafe { lock_fn(self.encoder_ptr, &mut lock_bitstream) };
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
+            // SAFETY: Обязательно размапливаем input_buffer при сбое LockBitstream
+            unsafe {
+                if let Some(unmap_fn) = self.fn_list.nvEncUnmapInputResource {
+                    let _ = unmap_fn(self.encoder_ptr, input_buffer);
+                }
+            }
             return Err(EncodeError::ProcessOutputFailed(format!(
                 "Ошибка lock_bitstream: {:?}",
                 status

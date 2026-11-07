@@ -1,7 +1,7 @@
+use core_protocol::ControlMessage;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use core_protocol::ControlMessage;
 
 #[derive(Debug, Clone)]
 pub struct CalibrationResult {
@@ -46,8 +46,11 @@ pub async fn run_network_calibration(
                     loop {
                         match socket.recv_from(&mut buf).await {
                             Ok((len, _src)) => {
-                                if let Ok(ControlMessage::Pong { sequence, session_id: pong_sid, .. }) =
-                                    ControlMessage::from_packet(&buf[..len])
+                                if let Ok(ControlMessage::Pong {
+                                    sequence,
+                                    session_id: pong_sid,
+                                    ..
+                                }) = ControlMessage::from_packet(&buf[..len])
                                 {
                                     if sequence == seq as u32 && pong_sid == session_id {
                                         return Ok(t0.elapsed());
@@ -89,8 +92,11 @@ pub async fn run_network_calibration(
                 loop {
                     match socket.recv_from(&mut buf).await {
                         Ok((len, _src)) => {
-                            if let Ok(ControlMessage::SpeedProbeAck { sequence, session_id: ack_sid, .. }) =
-                                ControlMessage::from_packet(&buf[..len])
+                            if let Ok(ControlMessage::SpeedProbeAck {
+                                sequence,
+                                session_id: ack_sid,
+                                ..
+                            }) = ControlMessage::from_packet(&buf[..len])
                             {
                                 if sequence == seq as u32 && ack_sid == session_id {
                                     return Ok(());
@@ -163,7 +169,10 @@ pub async fn run_network_calibration(
     tracing::info!("  Джиттер (Jitter):    {:.2} мс", jitter_ms);
     tracing::info!("  Потери пакетов:      {:.1} %", packet_loss_rate * 100.0);
     tracing::info!("  Класс соединения:    {}", connection_class);
-    tracing::info!("  Оптимальный битрейт: {} Мбит/с", target_bitrate_kbps / 1000);
+    tracing::info!(
+        "  Оптимальный битрейт: {} Мбит/с",
+        target_bitrate_kbps / 1000
+    );
     tracing::info!("============================================================");
 
     CalibrationResult {

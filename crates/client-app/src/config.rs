@@ -2,10 +2,10 @@
 //!
 //! Сохранение и загрузка настроек лаунчера (история IP, пресеты, кодеки) в `remote_ward_config.json`.
 
+use core_protocol::VideoCodec;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use core_protocol::VideoCodec;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
@@ -70,4 +70,3 @@ impl AppConfig {
         self.save();
     }
 }
-

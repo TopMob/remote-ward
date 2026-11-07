@@ -1,16 +1,28 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
 use core_protocol::{
-    ControlMessage, FramePacketizer, InputEvent, ServerHello, VideoCodec, PROTOCOL_VERSION,
+    ControlMessage, FramePacketizer, InputEvent, InputPacket, ServerHello, VideoCodec,
+    PROTOCOL_VERSION,
 };
 use core_transport::{CongestionConfig, CongestionController, PacedSender};
 use host_capture::WgcCaptureSession;
 use host_encode::NvencEncoder;
 use host_input::WindowsInputInjector;
+
+type FrameCallback = Arc<
+    dyn Fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            u32,
+            u32,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+        + Send
+        + Sync,
+>;
 
 pub struct HostConfig {
     pub video_port: u16,
@@ -34,6 +46,8 @@ impl Default for HostConfig {
 
 pub struct ServerState {
     pub client_endpoint: Arc<RwLock<Option<SocketAddr>>>,
+    pub client_control_endpoint: Arc<RwLock<Option<SocketAddr>>>,
+    pub last_client_activity: Arc<parking_lot::Mutex<Instant>>,
     pub session_id: Arc<AtomicU64>,
     pub force_keyframe: Arc<AtomicBool>,
     pub selected_codec: Arc<RwLock<VideoCodec>>,
@@ -56,12 +70,16 @@ pub struct RemoteWardHost {
 impl RemoteWardHost {
     pub fn new(config: HostConfig) -> Self {
         let initial_bitrate = config.bitrate_kbps;
-        let mut cc_config = CongestionConfig::default();
-        cc_config.initial_bitrate_kbps = initial_bitrate;
+        let cc_config = CongestionConfig {
+            initial_bitrate_kbps: initial_bitrate,
+            ..Default::default()
+        };
         let congestion = Arc::new(RwLock::new(CongestionController::new(cc_config)));
 
         let state = Arc::new(ServerState {
             client_endpoint: Arc::new(RwLock::new(None)),
+            client_control_endpoint: Arc::new(RwLock::new(None)),
+            last_client_activity: Arc::new(parking_lot::Mutex::new(Instant::now())),
             session_id: Arc::new(AtomicU64::new(0)),
             force_keyframe: Arc::new(AtomicBool::new(true)),
             selected_codec: Arc::new(RwLock::new(config.preferred_codec)),
@@ -89,6 +107,16 @@ impl RemoteWardHost {
         Arc::clone(&self.state)
     }
 
+    /// Получить инжектор ввода
+    pub fn input_injector(&self) -> Arc<WindowsInputInjector> {
+        Arc::clone(&self.input_injector)
+    }
+
+    /// Получить конфигурацию сервера
+    pub fn config(&self) -> &HostConfig {
+        &self.config
+    }
+
     /// Остановка сервера
     pub fn stop(&self) {
         self.state.is_running.store(false, Ordering::Relaxed);
@@ -101,9 +129,8 @@ impl RemoteWardHost {
         tracing::info!("============================================================");
 
         // 1. Создаем сокет для управления и ввода с оптимизацией буферов и QoS DSCP
-        let control_socket = Arc::new(
-            UdpSocket::bind(format!("0.0.0.0:{}", self.config.control_port)).await?,
-        );
+        let control_socket =
+            Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", self.config.control_port)).await?);
         core_transport::optimize_udp_socket(&control_socket);
         tracing::info!(
             "Управляющий сокет (Control & Input) слушает на порту {} с QoS DSCP 46",
@@ -116,8 +143,14 @@ impl RemoteWardHost {
             tokio::spawn(async move {
                 if let Some(res) = core_transport::discover_public_endpoint(&stun_socket).await {
                     tracing::info!("============================================================");
-                    tracing::info!("   ПУБЛИЧНЫЙ АДРЕС ХОСТА ДЛЯ ПОДКЛЮЧЕНИЯ ИЗ ИНТЕРНЕТА (WAN):  ");
-                    tracing::info!("   -> {} (RTT: {} мс)                           ", res.public_addr, res.rtt_ms);
+                    tracing::info!(
+                        "   ПУБЛИЧНЫЙ АДРЕС ХОСТА ДЛЯ ПОДКЛЮЧЕНИЯ ИЗ ИНТЕРНЕТА (WAN):  "
+                    );
+                    tracing::info!(
+                        "   -> {} (RTT: {} мс)                           ",
+                        res.public_addr,
+                        res.rtt_ms
+                    );
                     tracing::info!("============================================================");
                 }
             });
@@ -144,11 +177,19 @@ impl RemoteWardHost {
                     }
                 };
 
-                let computer_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "RemoteWard-Host".to_string());
-                let local_ip = get_local_ip_str().unwrap_or_else(|| "127.0.0.1".to_string());
+                let computer_name =
+                    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "RemoteWard-Host".to_string());
+                let local_ip = core_transport::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
                 let broadcast_targets = get_broadcast_targets(&local_ip);
 
-                tracing::info!("LAN Discovery маяк активен: имя '{}', IP {}, порт {}", computer_name, local_ip, core_protocol::DISCOVERY_PORT);
+                tracing::info!(
+                    "LAN Discovery маяк активен: имя '{}', IP {}, порт {}",
+                    computer_name,
+                    local_ip,
+                    core_protocol::DISCOVERY_PORT
+                );
 
                 while is_running_discovery.load(Ordering::Relaxed) {
                     let w = display_w_atomic.load(Ordering::Relaxed);
@@ -177,7 +218,8 @@ impl RemoteWardHost {
         }
 
         // 2. Создаем сокет для видеопотока с буфером 4 МБ для защиты от сброса пакетов ОС и QoS
-        let video_socket_raw = std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?;
+        let video_socket_raw =
+            std::net::UdpSocket::bind(format!("0.0.0.0:{}", self.config.video_port))?;
         let sock_ref = socket2::SockRef::from(&video_socket_raw);
         let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
         let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
@@ -196,15 +238,32 @@ impl RemoteWardHost {
                 let mut punch_buf = [0u8; 128];
                 while state_punch.is_running.load(Ordering::Relaxed) {
                     if let Ok((len, src)) = video_socket_punch.recv_from(&mut punch_buf) {
-                        if len > 0 {
-                            let mut endpoint = state_punch.client_endpoint.write().unwrap();
-                            if endpoint.as_ref() != Some(&src) {
-                                tracing::info!(
-                                    "Видеосокет хоста успешно сопряжен с клиентом: {} (получен пакет пробивки)!",
-                                    src
-                                );
-                                *endpoint = Some(src);
-                                state_punch.force_keyframe.store(true, Ordering::SeqCst);
+                        if len >= core_protocol::DatagramHeader::SIZE {
+                            if let Ok((hdr, _)) =
+                                core_protocol::DatagramHeader::parse(&punch_buf[..len])
+                            {
+                                if hdr.flags & core_protocol::flags::HOLE_PUNCH != 0 {
+                                    let is_matching_ip = {
+                                        let ctrl =
+                                            state_punch.client_control_endpoint.read().unwrap();
+                                        ctrl.as_ref().is_none_or(|c| c.ip() == src.ip())
+                                    };
+                                    if is_matching_ip {
+                                        let mut endpoint =
+                                            state_punch.client_endpoint.write().unwrap();
+                                        if endpoint.as_ref() != Some(&src) {
+                                            tracing::info!(
+                                                "Видеосокет хоста успешно сопряжен с клиентом: {} (получен HOLE_PUNCH session: {})!",
+                                                src,
+                                                hdr.get_session_id()
+                                            );
+                                            *endpoint = Some(src);
+                                            state_punch
+                                                .force_keyframe
+                                                .store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -233,9 +292,27 @@ impl RemoteWardHost {
 
                             // 1. Проверяем пакеты ввода (MSG_TYPE_INPUT)
                             if data[0] == core_protocol::MSG_TYPE_INPUT {
-                                if let Ok(input_event) = InputEvent::from_packet(data) {
-                                    if let Err(e) = injector.inject(&input_event) {
-                                        tracing::trace!("Ошибка инжекции ввода: {:?}", e);
+                                let is_authorized = {
+                                    let ctrl = state.client_control_endpoint.read().unwrap();
+                                    let video = state.client_endpoint.read().unwrap();
+                                    ctrl.as_ref().is_some_and(|c| c.ip() == src.ip())
+                                        || video.as_ref().is_some_and(|v| v.ip() == src.ip())
+                                };
+
+                                if is_authorized {
+                                    *state.last_client_activity.lock() = Instant::now();
+                                    if let Ok(input_pkt) = InputPacket::from_packet(data) {
+                                        if input_pkt.session_id
+                                            == state.session_id.load(Ordering::Relaxed)
+                                        {
+                                            if let Err(e) = injector.inject(&input_pkt.event) {
+                                                tracing::trace!("Ошибка инжекции ввода: {:?}", e);
+                                            }
+                                        }
+                                    } else if let Ok(input_event) = InputEvent::from_packet(data) {
+                                        if let Err(e) = injector.inject(&input_event) {
+                                            tracing::trace!("Ошибка инжекции ввода: {:?}", e);
+                                        }
                                     }
                                 }
                                 continue;
@@ -243,8 +320,10 @@ impl RemoteWardHost {
 
                             // 2. Проверяем управляющие сообщения (MSG_TYPE_CONTROL)
                             if let Ok(ctrl_msg) = ControlMessage::from_packet(data) {
+                                *state.last_client_activity.lock() = Instant::now();
                                 match ctrl_msg {
                                     ControlMessage::ClientHello(hello) => {
+                                        *state.client_control_endpoint.write().unwrap() = Some(src);
                                         tracing::info!(
                                             "Клиент подключился: {} (v{}) с адреса {}",
                                             hello.client_name,
@@ -253,20 +332,23 @@ impl RemoteWardHost {
                                         );
 
                                         // Выбираем лучший кодек из поддерживаемых клиентом
-                                        let selected = if hello.supported_codecs.contains(&VideoCodec::HEVC) {
-                                            VideoCodec::HEVC
-                                        } else {
-                                            VideoCodec::H264
-                                        };
+                                        let selected =
+                                            if hello.supported_codecs.contains(&VideoCodec::HEVC) {
+                                                VideoCodec::HEVC
+                                            } else {
+                                                VideoCodec::H264
+                                            };
 
                                         {
-                                            let mut current_codec = state.selected_codec.write().unwrap();
+                                            let mut current_codec =
+                                                state.selected_codec.write().unwrap();
                                             *current_codec = selected;
                                         }
 
                                         // Сохраняем адрес видеопотока клиента
                                         {
-                                            let mut endpoint = state.client_endpoint.write().unwrap();
+                                            let mut endpoint =
+                                                state.client_endpoint.write().unwrap();
                                             let client_video_addr = if hello.video_port > 0 {
                                                 SocketAddr::new(src.ip(), hello.video_port)
                                             } else {
@@ -286,19 +368,21 @@ impl RemoteWardHost {
                                         }
 
                                         // Авто-согласование стратегии трансляции (UltraLAN, StandardWiFi, WanRemote)
-                                        let is_local_lan = src.ip().is_loopback() || match src.ip() {
-                                            std::net::IpAddr::V4(ipv4) => ipv4.is_private(),
-                                            std::net::IpAddr::V6(_) => false,
-                                        };
+                                        let is_local_lan = src.ip().is_loopback()
+                                            || match src.ip() {
+                                                std::net::IpAddr::V4(ipv4) => ipv4.is_private(),
+                                                std::net::IpAddr::V6(_) => false,
+                                            };
 
                                         let client_refresh_rate = hello.display_refresh_rate;
-                                        let negotiated_fps = if is_local_lan && client_refresh_rate >= 120 {
-                                            120
-                                        } else if is_local_lan && client_refresh_rate >= 90 {
-                                            90
-                                        } else {
-                                            config_fps
-                                        };
+                                        let negotiated_fps =
+                                            if is_local_lan && client_refresh_rate >= 120 {
+                                                120
+                                            } else if is_local_lan && client_refresh_rate >= 90 {
+                                                90
+                                            } else {
+                                                config_fps
+                                            };
 
                                         let strategy = if is_local_lan {
                                             if client_refresh_rate >= 90 {
@@ -312,7 +396,9 @@ impl RemoteWardHost {
 
                                         let (fec_data, fec_parity) = match strategy {
                                             core_protocol::StreamingStrategy::UltraLan => (10, 1),
-                                            core_protocol::StreamingStrategy::StandardWifi => (10, 2),
+                                            core_protocol::StreamingStrategy::StandardWifi => {
+                                                (10, 2)
+                                            }
                                             core_protocol::StreamingStrategy::WanRemote => (10, 3),
                                         };
 
@@ -328,8 +414,16 @@ impl RemoteWardHost {
                                             session_id: 1,
                                             selected_codec: selected,
                                             strategy,
-                                            width: if real_w > 0 { real_w } else { hello.screen_width },
-                                            height: if real_h > 0 { real_h } else { hello.screen_height },
+                                            width: if real_w > 0 {
+                                                real_w
+                                            } else {
+                                                hello.screen_width
+                                            },
+                                            height: if real_h > 0 {
+                                                real_h
+                                            } else {
+                                                hello.screen_height
+                                            },
                                             target_fps: negotiated_fps,
                                             nack_enabled: hello.supports_nack,
                                             fec_enabled: hello.supports_fec,
@@ -347,16 +441,28 @@ impl RemoteWardHost {
                                     }
 
                                     ControlMessage::RequestKeyframe { reason, .. } => {
-                                        tracing::debug!("Клиент запросил ключевой кадр: {}", reason);
+                                        tracing::debug!(
+                                            "Клиент запросил ключевой кадр: {}",
+                                            reason
+                                        );
                                         state.force_keyframe.store(true, Ordering::SeqCst);
                                     }
 
-                                    ControlMessage::Nack { frame_id, missing_packet_indices, .. } => {
-                                        if let Some(target) = *state.client_endpoint.read().unwrap() {
+                                    ControlMessage::Nack {
+                                        frame_id,
+                                        missing_packet_indices,
+                                        ..
+                                    } => {
+                                        if let Some(target) = *state.client_endpoint.read().unwrap()
+                                        {
+                                            let mut sanitized = missing_packet_indices;
+                                            sanitized.sort_unstable();
+                                            sanitized.dedup();
+                                            if sanitized.len() > 32 {
+                                                sanitized.truncate(32);
+                                            }
                                             let count = paced_sender_ctrl.handle_nack_retransmit(
-                                                frame_id,
-                                                &missing_packet_indices,
-                                                target,
+                                                frame_id, &sanitized, target,
                                             );
                                             tracing::trace!(
                                                 "[NACK] Повторно отправлено {} пакетов для кадра #{}",
@@ -365,7 +471,11 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::Ping { sequence, send_timestamp_us, .. } => {
+                                    ControlMessage::Ping {
+                                        sequence,
+                                        send_timestamp_us,
+                                        ..
+                                    } => {
                                         let pong = ControlMessage::Pong {
                                             session_id: 1,
                                             sequence,
@@ -376,7 +486,11 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::SpeedProbe { sequence, payload_size, .. } => {
+                                    ControlMessage::SpeedProbe {
+                                        sequence,
+                                        payload_size,
+                                        ..
+                                    } => {
                                         let ack = ControlMessage::SpeedProbeAck {
                                             session_id: 1,
                                             sequence,
@@ -387,16 +501,28 @@ impl RemoteWardHost {
                                         }
                                     }
 
-                                    ControlMessage::ChangeStreamSettings { target_bitrate_kbps, .. } => {
+                                    ControlMessage::ChangeStreamSettings {
+                                        target_bitrate_kbps,
+                                        ..
+                                    } => {
                                         let clamped = target_bitrate_kbps.clamp(4_000, 60_000);
-                                        let old = state.target_bitrate_kbps.swap(clamped, Ordering::SeqCst);
+                                        let old = state
+                                            .target_bitrate_kbps
+                                            .swap(clamped, Ordering::SeqCst);
                                         tracing::info!(
                                             "[СЕТЬ] Клиент запросил изменение битрейта: {} -> {} кбит/с",
                                             old, clamped
                                         );
                                     }
 
-                                    ControlMessage::CalibrationReport { min_rtt_us, avg_rtt_us, jitter_us, loss_rate, selected_bitrate_kbps, .. } => {
+                                    ControlMessage::CalibrationReport {
+                                        min_rtt_us,
+                                        avg_rtt_us,
+                                        jitter_us,
+                                        loss_rate,
+                                        selected_bitrate_kbps,
+                                        ..
+                                    } => {
                                         let clamped = selected_bitrate_kbps.clamp(4_000, 60_000);
                                         state.target_bitrate_kbps.store(clamped, Ordering::SeqCst);
                                         tracing::info!(
@@ -414,72 +540,36 @@ impl RemoteWardHost {
                                         packet_loss_rate,
                                         ..
                                     } => {
-                                        let current_bitrate = state.target_bitrate_kbps.load(Ordering::Relaxed);
-                                        const OPTIMAL_TARGET_BITRATE: u32 = 45_000;
-                                        const MAX_BITRATE: u32 = 60_000;
-                                        const MIN_BITRATE: u32 = 14_000;
+                                        // Полноценная динамическая ABR-адаптация через CongestionController (EWMA RTT + AIMD)
+                                        if let Ok(mut cc) = state.congestion.write() {
+                                            let new_bitrate =
+                                                cc.update_feedback(rtt_us, packet_loss_rate);
+                                            state
+                                                .target_bitrate_kbps
+                                                .store(new_bitrate, Ordering::SeqCst);
+                                        }
 
-                                        if packet_loss_rate > 0.02 {
-                                            // Снижаем битрейт на 10% при реальных потерях пакетов
-                                            let new_bitrate = ((current_bitrate as f32 * 0.90) as u32).max(MIN_BITRATE);
-                                            if new_bitrate < current_bitrate {
-                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
-                                                tracing::warn!(
-                                                    "[ABR Адаптация] Потери пакетов {:.2}% (RTT {:.1} мс)! Снижаем битрейт: {} -> {} кбит/с",
-                                                    packet_loss_rate * 100.0,
-                                                    rtt_us as f32 / 1000.0,
-                                                    current_bitrate,
-                                                    new_bitrate
-                                                );
-                                            }
-                                            if packet_loss_rate > 0.08 {
-                                                state.force_keyframe.store(true, Ordering::SeqCst);
-                                            }
-                                        } else if rtt_us > 35_000 && current_bitrate > 25_000 {
-                                            // Защита от bufferbloat в роутере
-                                            let new_bitrate = (current_bitrate.saturating_sub(2_000)).max(MIN_BITRATE);
-                                            if new_bitrate < current_bitrate {
-                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
-                                                tracing::info!(
-                                                    "[ABR Адаптация] Зафиксирован рост задержки (RTT {:.1} мс, bufferbloat). Снижаем битрейт: {} -> {} кбит/с",
-                                                    rtt_us as f32 / 1000.0,
-                                                    current_bitrate,
-                                                    new_bitrate
-                                                );
-                                            }
-                                        } else if packet_loss_rate < 0.005 && (rtt_us as f32 / 1000.0) < 20.0 && rtt_us > 0 {
-                                            if current_bitrate < OPTIMAL_TARGET_BITRATE {
-                                                // Плавный подъем к целевому оптимуму 45 Мбит/с
-                                                let new_bitrate = (current_bitrate + 1_500).min(OPTIMAL_TARGET_BITRATE);
-                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
-                                                tracing::info!(
-                                                    "[ABR Адаптация] Сеть стабильна (loss 0.0%, RTT {:.1} мс). Подъем к целевому: {} -> {} кбит/с",
-                                                    rtt_us as f32 / 1000.0,
-                                                    current_bitrate,
-                                                    new_bitrate
-                                                );
-                                            } else if current_bitrate < MAX_BITRATE {
-                                                // Выше 45 Мбит/с — режим осторожного зондирования до 60 Мбит/с
-                                                let new_bitrate = (current_bitrate + 500).min(MAX_BITRATE);
-                                                state.target_bitrate_kbps.store(new_bitrate, Ordering::SeqCst);
-                                                tracing::debug!(
-                                                    "[ABR Адаптация] Режим удержания/зондирования: {} -> {} кбит/с",
-                                                    current_bitrate,
-                                                    new_bitrate
-                                                );
-                                            }
+                                        if packet_loss_rate > 0.08 {
+                                            state.force_keyframe.store(true, Ordering::SeqCst);
                                         }
                                     }
 
                                     ControlMessage::SwitchMonitor { monitor_index, .. } => {
-                                        let monitors = WgcCaptureSession::enumerate_monitors().unwrap_or_default();
-                                        let count = if monitors.is_empty() { 1 } else { monitors.len() as u32 };
+                                        let monitors = WgcCaptureSession::enumerate_monitors()
+                                            .unwrap_or_default();
+                                        let count = if monitors.is_empty() {
+                                            1
+                                        } else {
+                                            monitors.len() as u32
+                                        };
                                         let actual_index = monitor_index % count;
                                         tracing::info!(
                                             "Клиент запросил переключение монитора: индекс {} (всего мониторов: {}) -> выбор: #{}",
                                             monitor_index, count, actual_index
                                         );
-                                        state.target_monitor_index.store(actual_index, Ordering::SeqCst);
+                                        state
+                                            .target_monitor_index
+                                            .store(actual_index, Ordering::SeqCst);
                                         state.force_keyframe.store(true, Ordering::SeqCst);
                                     }
 
@@ -490,8 +580,8 @@ impl RemoteWardHost {
 
                                     ControlMessage::Disconnect { reason, .. } => {
                                         tracing::info!("Клиент отключился: {}", reason);
-                                        let mut endpoint = state.client_endpoint.write().unwrap();
-                                        *endpoint = None;
+                                        *state.client_endpoint.write().unwrap() = None;
+                                        *state.client_control_endpoint.write().unwrap() = None;
                                         injector.release_all();
                                     }
 
@@ -501,6 +591,32 @@ impl RemoteWardHost {
                         }
                         Err(e) => {
                             tracing::error!("Ошибка чтения control сокета: {:?}", e);
+                        }
+                    }
+                }
+            })
+        };
+
+        // Фоновый Watchdog активности клиента (Heartbeat / Stuck Keys protection)
+        let _watchdog_task = {
+            let state_wd = Arc::clone(&self.state);
+            let injector_wd = Arc::clone(&self.input_injector);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(250));
+                while state_wd.is_running.load(Ordering::Relaxed) {
+                    interval.tick().await;
+                    let has_client = {
+                        let ctrl = state_wd.client_control_endpoint.read().unwrap();
+                        let video = state_wd.client_endpoint.read().unwrap();
+                        ctrl.is_some() || video.is_some()
+                    };
+                    if has_client {
+                        let last_active = *state_wd.last_client_activity.lock();
+                        if last_active.elapsed() > Duration::from_millis(2000) {
+                            tracing::warn!("Таймаут сессии клиента (>2000 мс без активности). Сброс состояния клавиш.");
+                            injector_wd.release_all();
+                            *state_wd.client_endpoint.write().unwrap() = None;
+                            *state_wd.client_control_endpoint.write().unwrap() = None;
                         }
                     }
                 }
@@ -547,7 +663,8 @@ impl RemoteWardHost {
             })
             .unwrap();
 
-        let encoder_lock: Arc<std::sync::Mutex<Option<NvencEncoder>>> = Arc::new(std::sync::Mutex::new(None));
+        let encoder_lock: Arc<std::sync::Mutex<Option<NvencEncoder>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::H264));
         let last_bitrate_lock = Arc::new(std::sync::Mutex::new(bitrate_kbps));
 
@@ -562,39 +679,42 @@ impl RemoteWardHost {
         let video_socket_audio = Arc::clone(&video_socket);
         let mut audio_seq = 0u32;
 
-        let _audio_capture = crate::audio_capture::WasapiAudioCapture::start(move |pcm_data, timestamp_us| {
-            if let Some(target_addr) = *state_audio.client_endpoint.read().unwrap() {
-                if pcm_data.is_empty() {
-                    return;
+        let _audio_capture =
+            crate::audio_capture::WasapiAudioCapture::start(move |pcm_data, timestamp_us| {
+                if let Some(target_addr) = *state_audio.client_endpoint.read().unwrap() {
+                    if pcm_data.is_empty() {
+                        return;
+                    }
+                    audio_seq = audio_seq.wrapping_add(1);
+
+                    let mut packet_buf = [0u8; 4096];
+                    let hdr_len = core_protocol::DatagramHeader::SIZE;
+                    let total_len = hdr_len + pcm_data.len();
+                    if total_len > packet_buf.len() {
+                        return;
+                    }
+
+                    let header = core_protocol::DatagramHeader::new(
+                        1,
+                        core_protocol::ChannelId::AudioHostToClient,
+                        0,
+                        audio_seq,
+                        0,
+                        1,
+                        timestamp_us,
+                        pcm_data.len() as u16,
+                    );
+                    packet_buf[..hdr_len].copy_from_slice(header.as_bytes());
+                    packet_buf[hdr_len..total_len].copy_from_slice(pcm_data);
+
+                    let _ = video_socket_audio.send_to(&packet_buf[..total_len], target_addr);
                 }
-                audio_seq = audio_seq.wrapping_add(1);
-
-                let mut packet = Vec::with_capacity(core_protocol::DatagramHeader::SIZE + pcm_data.len());
-                let header = core_protocol::DatagramHeader::new(
-                    1,
-                    core_protocol::ChannelId::AudioHostToClient,
-                    0,
-                    audio_seq,
-                    0,
-                    1,
-                    timestamp_us,
-                    pcm_data.len() as u16,
-                );
-                packet.extend_from_slice(header.as_bytes());
-                packet.extend_from_slice(pcm_data);
-
-                let _ = video_socket_audio.send_to(&packet, target_addr);
-            }
-        });
+            });
 
         // 4. Пайплайн захвата экрана (WGC) и кодирования (NVENC)
         let state_capture = Arc::clone(&self.state);
         let injector_frame = Arc::clone(&self.input_injector);
-        let on_frame: Arc<
-            dyn Fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > = Arc::new(move |texture_raw, device_raw, width, height| {
+        let on_frame: FrameCallback = Arc::new(move |texture_raw, device_raw, width, height| {
             let mut enc_guard = encoder_clone.lock().unwrap();
             let mut last_codec_guard = last_codec_clone.lock().unwrap();
             let mut last_bitrate_guard = last_bitrate_clone.lock().unwrap();
@@ -607,16 +727,29 @@ impl RemoteWardHost {
             };
 
             if need_reinit {
-                tracing::info!("(Пере)инициализация энкодера GPU для разрешения {}x{}...", width, height);
+                tracing::info!(
+                    "(Пере)инициализация энкодера GPU для разрешения {}x{}...",
+                    width,
+                    height
+                );
                 injector_frame.update_dimensions(width, height);
                 let codec = *state_capture.selected_codec.read().unwrap();
                 *last_codec_guard = codec;
-                match NvencEncoder::new_from_raw_device(device_raw, width, height, fps, current_target_bitrate, codec) {
+                match NvencEncoder::new_from_raw_device(
+                    device_raw,
+                    width,
+                    height,
+                    fps,
+                    current_target_bitrate,
+                    codec,
+                ) {
                     Ok(enc) => {
                         *enc_guard = Some(enc);
                         *last_bitrate_guard = current_target_bitrate;
                         state_capture.display_width.store(width, Ordering::Relaxed);
-                        state_capture.display_height.store(height, Ordering::Relaxed);
+                        state_capture
+                            .display_height
+                            .store(height, Ordering::Relaxed);
                         let _ = init_tx.try_send((width, height));
                         tracing::info!(
                             "Аппаратный энкодер NVENC успешно привязан к текстурам WGC: {}x{} @ {} FPS (битрейт: {} кбит/с)",
@@ -625,9 +758,10 @@ impl RemoteWardHost {
                     }
                     Err(e) => {
                         tracing::error!("Ошибка инициализации NvencEncoder: {:?}", e);
-                        return Err(Box::new(std::io::Error::other(
-                            format!("Encoder init failed: {:?}", e),
-                        )));
+                        return Err(Box::new(std::io::Error::other(format!(
+                            "Encoder init failed: {:?}",
+                            e
+                        ))));
                     }
                 }
             }
@@ -647,8 +781,19 @@ impl RemoteWardHost {
             // Проверяем смену кодека на лету
             let current_codec = *state_capture.selected_codec.read().unwrap();
             if current_codec != *last_codec_guard {
-                tracing::info!("Смена кодека на лету: {:?} -> {:?}", *last_codec_guard, current_codec);
-                if let Ok(new_enc) = NvencEncoder::new_from_raw_device(device_raw, width, height, fps, current_target_bitrate, current_codec) {
+                tracing::info!(
+                    "Смена кодека на лету: {:?} -> {:?}",
+                    *last_codec_guard,
+                    current_codec
+                );
+                if let Ok(new_enc) = NvencEncoder::new_from_raw_device(
+                    device_raw,
+                    width,
+                    height,
+                    fps,
+                    current_target_bitrate,
+                    current_codec,
+                ) {
                     *encoder = new_enc;
                     *last_codec_guard = current_codec;
                     *last_bitrate_guard = current_target_bitrate;
@@ -656,7 +801,10 @@ impl RemoteWardHost {
             } else if current_target_bitrate != *last_bitrate_guard {
                 // Динамическое изменение битрейта (ABR адаптация)
                 if let Err(e) = encoder.reconfigure_bitrate(current_target_bitrate) {
-                    tracing::warn!("Не удалось динамически перенастроить битрейт NVENC: {:?}", e);
+                    tracing::warn!(
+                        "Не удалось динамически перенастроить битрейт NVENC: {:?}",
+                        e
+                    );
                 } else {
                     *last_bitrate_guard = current_target_bitrate;
                 }
@@ -702,12 +850,19 @@ impl RemoteWardHost {
                         packets,
                         target_addr,
                     };
-                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = sender_tx_capture.try_send(outgoing) {
-                        tracing::debug!("Очередь видеопакетов заполнена, пропуск кадра #{}", frame_id);
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        sender_tx_capture.try_send(outgoing)
+                    {
+                        tracing::debug!(
+                            "Очередь видеопакетов заполнена, пропуск кадра #{}",
+                            frame_id
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Ошибка кодирования кадра #{}: {:?}", frame_id, e);
+                    // Сбрасываем энкодер для немедленной переинициализации на новом устройстве при сбросе GPU драйвера (TDR / Device Removed)
+                    *enc_guard = None;
                 }
             }
 
@@ -725,8 +880,12 @@ impl RemoteWardHost {
             move |tex, dev, w, h| on_frame_start(tex, dev, w, h),
         )?;
 
-        self.state.display_width.store(capture_session.width, Ordering::Relaxed);
-        self.state.display_height.store(capture_session.height, Ordering::Relaxed);
+        self.state
+            .display_width
+            .store(capture_session.width, Ordering::Relaxed);
+        self.state
+            .display_height
+            .store(capture_session.height, Ordering::Relaxed);
 
         tracing::info!(
             "Сессия захвата экрана запущена (монитор #{}): разрешение дисплея {}x{}",
@@ -839,25 +998,18 @@ impl RemoteWardHost {
     }
 }
 
-fn get_local_ip_str() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-    Some(local_addr.ip().to_string())
-}
-
 fn get_broadcast_targets(local_ip: &str) -> Vec<SocketAddr> {
-    let mut targets = Vec::new();
-    if let Ok(addr) = format!("255.255.255.255:{}", core_protocol::DISCOVERY_PORT).parse::<SocketAddr>() {
-        targets.push(addr);
-    }
-    if let Ok(addr) = format!("127.0.0.1:{}", core_protocol::DISCOVERY_PORT).parse::<SocketAddr>() {
-        targets.push(addr);
-    }
+    let mut targets = vec![
+        SocketAddr::from(([255, 255, 255, 255], core_protocol::DISCOVERY_PORT)),
+        SocketAddr::from(([127, 0, 0, 1], core_protocol::DISCOVERY_PORT)),
+    ];
     if let Ok(ip) = local_ip.parse::<std::net::Ipv4Addr>() {
         let o = ip.octets();
         let subnet_bcast = std::net::Ipv4Addr::new(o[0], o[1], o[2], 255);
-        targets.push(SocketAddr::new(std::net::IpAddr::V4(subnet_bcast), core_protocol::DISCOVERY_PORT));
+        targets.push(SocketAddr::from((
+            subnet_bcast,
+            core_protocol::DISCOVERY_PORT,
+        )));
     }
     targets
 }
@@ -896,7 +1048,11 @@ mod tests {
             if let Some(ref mut encoder) = *enc_guard {
                 match encoder.encode_frame_raw(tex, false) {
                     Ok(frame) => {
-                        println!("Frame encoded: len={}, keyframe={}", frame.data.len(), frame.is_keyframe);
+                        println!(
+                            "Frame encoded: len={}, keyframe={}",
+                            frame.data.len(),
+                            frame.is_keyframe
+                        );
                         ec.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(err) => {

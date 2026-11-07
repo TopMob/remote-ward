@@ -5,10 +5,10 @@
 //! буферы роутеров и сетевых карт даже в гигабитной локальной сети.
 //! Также сохраняет отправленные датаграммы в `NackBuffer` для возможности повторной отправки.
 
+use parking_lot::Mutex;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 
 use crate::nack::NackBuffer;
 use crate::pacer::PacketPacer;
@@ -20,9 +20,10 @@ pub fn accurate_sleep(duration: Duration) {
         return;
     }
     let start = Instant::now();
-    // Для задержек больше 2мс спим системным сном, экономя CPU
-    if duration >= Duration::from_millis(2) {
-        std::thread::sleep(duration - Duration::from_millis(1));
+    // При активном Windows 1ms мультимедийном таймере (timeBeginPeriod) std::thread::sleep
+    // безопасно усыпляет поток на кванты >= 1.2 мс, предотвращая 100% CPU burn в спин-лупе
+    if duration >= Duration::from_micros(1200) {
+        std::thread::sleep(duration.saturating_sub(Duration::from_micros(400)));
     }
     // Оставшееся микросекундное время докручиваем спин-лупом для идеальной точности
     while start.elapsed() < duration {
@@ -91,15 +92,20 @@ impl PacedSender {
         }
 
         // 2. Рассчитываем задержку между пакетами
-        let per_packet_delay = self.pacer.calculate_packet_delay(total_packets, self.target_fps);
+        let per_packet_delay = self
+            .pacer
+            .calculate_packet_delay(total_packets, self.target_fps);
 
-        // 3. Отправляем пакеты с микро-задержкой
+        // 3. Отправляем пакеты с микро-пакетным пейсингом (burst по 2 пакета) для разгрузки CPU
+        let burst_size = 2usize;
+        let burst_delay = per_packet_delay * burst_size as u32;
+
         for (idx, packet) in packets.iter().enumerate() {
             self.socket.send_to(packet, target_addr)?;
 
-            // После последнего пакета кадра пауза не нужна
-            if idx + 1 < total_packets && !per_packet_delay.is_zero() {
-                accurate_sleep(per_packet_delay);
+            // После завершения очередной пачки burst_size пакетов делаем точную паузу
+            if (idx + 1) % burst_size == 0 && idx + 1 < total_packets && !burst_delay.is_zero() {
+                accurate_sleep(burst_delay);
             }
         }
 
@@ -126,4 +132,3 @@ impl PacedSender {
         count
     }
 }
-

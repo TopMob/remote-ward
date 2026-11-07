@@ -21,9 +21,9 @@
 //! 3. Если пришло не менее N шардов из (N+P) — `FecDecoder::reconstruct()`.
 //! 4. Если пришло меньше N — шлёт NACK / IDR-запрос (edge case).
 
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use reed_solomon_erasure::galois_8::ReedSolomon;
 
 /// Конфигурация FEC-кодирования
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +92,10 @@ impl FecEncoder {
     ///
     /// **Важно:** все data-шарды должны иметь одинаковый размер.
     /// Последний шард при необходимости дополняется нулями до `shard_size`.
-    pub fn encode_parity(&self, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, reed_solomon_erasure::Error> {
+    pub fn encode_parity(
+        &self,
+        data_shards: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, reed_solomon_erasure::Error> {
         debug_assert_eq!(
             data_shards.len(),
             self.config.data_shards,
@@ -271,7 +274,12 @@ impl FecDecoder {
                     return Some(result);
                 }
                 Err(e) => {
-                    tracing::warn!("FEC восстановление не удалось для frame={} group={}: {:?}", frame_id, group_id, e);
+                    tracing::warn!(
+                        "FEC восстановление не удалось для frame={} group={}: {:?}",
+                        frame_id,
+                        group_id,
+                        e
+                    );
                 }
             }
         }
@@ -310,9 +318,13 @@ mod tests {
 
         // Добавляем все data-шарды — должно сработать без FEC-восстановления
         for (i, shard) in data_shards.iter().enumerate() {
-            let result = decoder.add_shard(1, 0, i as u8, config.total_shards() as u8, shard.clone());
+            let result =
+                decoder.add_shard(1, 0, i as u8, config.total_shards() as u8, shard.clone());
             if i + 1 == config.data_shards {
-                assert!(result.is_some(), "Должно восстановиться когда получены все data шарды");
+                assert!(
+                    result.is_some(),
+                    "Должно восстановиться когда получены все data шарды"
+                );
                 let recovered = result.unwrap();
                 for (j, s) in recovered.iter().enumerate() {
                     assert_eq!(&s[..data_shards[j].len()], &data_shards[j][..]);
@@ -348,17 +360,24 @@ mod tests {
                 continue;
             }
             let r = decoder.add_shard(2, 0, i as u8, total, shard.clone());
-            if r.is_some() { recovered = r; }
+            if r.is_some() {
+                recovered = r;
+            }
         }
 
         // Добавляем parity-шарды
         for (i, p) in parity.iter().enumerate() {
             let idx = config.data_shards + i;
             let r = decoder.add_shard(2, 0, idx as u8, total, p.clone());
-            if r.is_some() { recovered = r; }
+            if r.is_some() {
+                recovered = r;
+            }
         }
 
-        assert!(recovered.is_some(), "FEC должен восстановить 2 потерянных шарда из 2 parity");
+        assert!(
+            recovered.is_some(),
+            "FEC должен восстановить 2 потерянных шарда из 2 parity"
+        );
         let shards = recovered.unwrap();
         assert_eq!(shards.len(), config.data_shards);
         for (i, s) in shards.iter().enumerate() {
@@ -368,4 +387,3 @@ mod tests {
         }
     }
 }
-

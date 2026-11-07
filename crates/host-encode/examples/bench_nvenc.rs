@@ -1,3 +1,5 @@
+use core_protocol::VideoCodec;
+use host_encode::NvencEncoder;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -7,8 +9,6 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use core_protocol::VideoCodec;
-use host_encode::NvencEncoder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
@@ -46,7 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
@@ -56,18 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tex_opt: Option<ID3D11Texture2D> = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex_opt))? };
     let texture = tex_opt.expect("Texture2D");
-    println!("[2] Создана 2K-текстура: {}x{} (DXGI_FORMAT_B8G8R8A8_UNORM)", width, height);
+    println!(
+        "[2] Создана 2K-текстура: {}x{} (DXGI_FORMAT_B8G8R8A8_UNORM)",
+        width, height
+    );
 
     // 3. Инициализация NvencEncoder
     println!("[3] Инициализация NvencEncoder (H.264, 60 FPS, 15 Мбит/с)...");
-    let mut encoder = NvencEncoder::new(
-        &device,
-        width,
-        height,
-        60,
-        15_000,
-        VideoCodec::H264,
-    )?;
+    let mut encoder = NvencEncoder::new(&device, width, height, 60, 15_000, VideoCodec::H264)?;
     println!("    Инициализация завершена успешно!");
 
     // 4. Прогон 100 кадров
@@ -107,31 +106,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("             ИТОГИ БЕНЧМАРКА NVIDIA NVENC (2K 1440p)        ");
     println!("============================================================");
     println!("  Успешно закодировано: {} кадров", latencies_us.len());
-    println!("  Средний размер сжатого кадра: {:.1} КБ (вместо 14.7 МБ сырых!)", avg_size_kb);
+    println!(
+        "  Средний размер сжатого кадра: {:.1} КБ (вместо 14.7 МБ сырых!)",
+        avg_size_kb
+    );
     println!("  Степень сжатия: ~{:.0}:1", (14.7 * 1024.0) / avg_size_kb);
 
     println!("\n  Задержка кодирования кадра на GPU (RTX 2060 SUPER):");
-    println!("    Средняя: {:.2} мс ({} мкс)", avg_us as f64 / 1000.0, avg_us);
-    println!("    Медиана (p50): {:.2} мс ({} мкс)", p50_us as f64 / 1000.0, p50_us);
-    println!("    Минимум: {:.2} мс ({} мкс)", min_us as f64 / 1000.0, min_us);
-    println!("    95-й перцентиль (p95): {:.2} мс ({} мкс)", p95_us as f64 / 1000.0, p95_us);
-    println!("    99-й перцентиль (p99): {:.2} мс ({} мкс)", p99_us as f64 / 1000.0, p99_us);
-    println!("    Максимум: {:.2} мс ({} мкс)", max_us as f64 / 1000.0, max_us);
+    println!(
+        "    Средняя: {:.2} мс ({} мкс)",
+        avg_us as f64 / 1000.0,
+        avg_us
+    );
+    println!(
+        "    Медиана (p50): {:.2} мс ({} мкс)",
+        p50_us as f64 / 1000.0,
+        p50_us
+    );
+    println!(
+        "    Минимум: {:.2} мс ({} мкс)",
+        min_us as f64 / 1000.0,
+        min_us
+    );
+    println!(
+        "    95-й перцентиль (p95): {:.2} мс ({} мкс)",
+        p95_us as f64 / 1000.0,
+        p95_us
+    );
+    println!(
+        "    99-й перцентиль (p99): {:.2} мс ({} мкс)",
+        p99_us as f64 / 1000.0,
+        p99_us
+    );
+    println!(
+        "    Максимум: {:.2} мс ({} мкс)",
+        max_us as f64 / 1000.0,
+        max_us
+    );
 
     let budget_ok = (avg_us as f64 / 1000.0) <= 5.0;
     println!(
         "\n  Соответствие бюджету ТЗ (2–5 мс): {}",
-        if budget_ok { "✅ В РАМКАХ БЮДЖЕТА" } else { "⚠️ ПРЕВЫШАЕТ БЮДЖЕТ" }
+        if budget_ok {
+            "✅ В РАМКАХ БЮДЖЕТА"
+        } else {
+            "⚠️ ПРЕВЫШАЕТ БЮДЖЕТ"
+        }
     );
     println!("\n[5] Тестирование кодирования HEVC (H.265, 60 FPS, 15 Мбит/с)...");
-    let mut hevc_encoder = NvencEncoder::new(
-        &device,
-        width,
-        height,
-        60,
-        15_000,
-        VideoCodec::HEVC,
-    )?;
+    let mut hevc_encoder = NvencEncoder::new(&device, width, height, 60, 15_000, VideoCodec::HEVC)?;
     let mut hevc_latencies = Vec::with_capacity(50);
     for i in 0..50 {
         let encoded = hevc_encoder.encode_frame(&texture, i == 0)?;
@@ -140,7 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hevc_latencies.sort_unstable();
     let hevc_avg_us: u64 = hevc_latencies.iter().sum::<u64>() / hevc_latencies.len() as u64;
     let hevc_p50_us = hevc_latencies[hevc_latencies.len() / 2];
-    println!("    ✅ HEVC (H.265) успешно: средняя задержка: {:.2} мс, p50: {:.2} мс", hevc_avg_us as f64 / 1000.0, hevc_p50_us as f64 / 1000.0);
+    println!(
+        "    ✅ HEVC (H.265) успешно: средняя задержка: {:.2} мс, p50: {:.2} мс",
+        hevc_avg_us as f64 / 1000.0,
+        hevc_p50_us as f64 / 1000.0
+    );
 
     Ok(())
 }

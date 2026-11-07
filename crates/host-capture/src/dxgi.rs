@@ -121,8 +121,14 @@ impl DxgiCapturer {
             )?;
         }
 
-        let device = device_opt.expect("D3D11 device must be created");
-        let context = context_opt.expect("D3D11 immediate context must be created");
+        let device = device_opt.ok_or_else(|| {
+            CaptureError::InitializationFailed("D3D11 device creation returned null".into())
+        })?;
+        let context = context_opt.ok_or_else(|| {
+            CaptureError::InitializationFailed(
+                "D3D11 immediate context creation returned null".into(),
+            )
+        })?;
 
         let output1: IDXGIOutput1 = output.cast()?;
         let duplication = unsafe { output1.DuplicateOutput(&device)? };
@@ -189,7 +195,9 @@ impl DxgiCapturer {
             }
         }
 
-        let resource = resource_opt.expect("Desktop resource should not be null on success");
+        let resource = resource_opt.ok_or_else(|| {
+            CaptureError::AcquireFailed("Desktop resource was null on acquire".into())
+        })?;
         let texture: ID3D11Texture2D = resource.cast()?;
 
         Ok(AcquiredFrame {

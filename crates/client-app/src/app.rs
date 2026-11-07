@@ -5,33 +5,35 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetDC, ReleaseDC, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    SRCCOPY, SetStretchBltMode, COLORONCOLOR,
-    MonitorFromWindow, MONITOR_DEFAULTTONEAREST, GetMonitorInfoW, MONITORINFO,
+    GetDC, GetMonitorInfoW, MonitorFromWindow, ReleaseDC, SetStretchBltMode, StretchDIBits,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongW, SetWindowLongW, GWL_STYLE, SetWindowPos,
-    HWND_TOP, HWND_NOTOPMOST, WS_POPUP, WS_OVERLAPPED, WS_CAPTION, WS_SYSMENU,
-    WS_MINIMIZEBOX, WS_MAXIMIZEBOX, WS_THICKFRAME, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SWP_NOZORDER,
+    GetClientRect, GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, HWND_NOTOPMOST,
+    HWND_TOP, SWP_FRAMECHANGED, SWP_NOZORDER, SWP_SHOWWINDOW, WS_CAPTION, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
-use core_protocol::{
-    ButtonState, ClientHello, ControlMessage, InputEvent, MouseButton, VideoCodec,
-};
-use core_transport::FrameReassembler;
 use crate::config::AppConfig;
 use crate::decoder::{DecodedFrame, MftVideoDecoder};
 use crate::input_mapper::keycode_to_scancode;
 use crate::launcher::{LauncherAction, LauncherUI};
+use core_protocol::{
+    ButtonState, ClientHello, ControlMessage, InputEvent, MouseButton, VideoCodec,
+};
+use core_transport::FrameReassembler;
 
 pub struct ClientConfig {
     pub host_control_addr: SocketAddr,
@@ -44,7 +46,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            host_control_addr: "127.0.0.1:48001".parse().unwrap(),
+            host_control_addr: SocketAddr::from(([127, 0, 0, 1], 48001)),
             video_port: 48000,
             width: 2560,
             height: 1440,
@@ -57,6 +59,7 @@ pub struct StreamingSession {
     pub input_tx: mpsc::UnboundedSender<InputEvent>,
     pub control_tx: mpsc::UnboundedSender<ControlMessage>,
     pub frame_rx: mpsc::Receiver<DecodedFrame>,
+    pub buf_pool_tx: crossbeam_channel::Sender<Vec<u8>>,
     pub is_running: Arc<AtomicBool>,
     pub current_rtt_us: Arc<AtomicU32>,
     pub current_monitor_shared: Arc<AtomicU32>,
@@ -148,7 +151,7 @@ pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
                 let y0 = (y_line0[x] as i32 - 16).max(0);
                 let c0 = 1192 * y0;
                 let idx0 = x * 4;
-                row0_bgra[idx0]     = clamp_u8((c0 + b_uv + 512) >> 10);
+                row0_bgra[idx0] = clamp_u8((c0 + b_uv + 512) >> 10);
                 row0_bgra[idx0 + 1] = clamp_u8((c0 + g_uv + 512) >> 10);
                 row0_bgra[idx0 + 2] = clamp_u8((c0 + r_uv + 512) >> 10);
                 row0_bgra[idx0 + 3] = 255;
@@ -156,7 +159,7 @@ pub fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize, bgra: &mut [u8]) {
                 let y1 = (y_line1[x] as i32 - 16).max(0);
                 let c1 = 1192 * y1;
                 let idx1 = x * 4;
-                row1_bgra[idx1]     = clamp_u8((c1 + b_uv + 512) >> 10);
+                row1_bgra[idx1] = clamp_u8((c1 + b_uv + 512) >> 10);
                 row1_bgra[idx1 + 1] = clamp_u8((c1 + g_uv + 512) >> 10);
                 row1_bgra[idx1 + 2] = clamp_u8((c1 + r_uv + 512) >> 10);
                 row1_bgra[idx1 + 3] = 255;
@@ -307,7 +310,9 @@ impl RemoteWardClientApp {
         };
 
         if fullscreen {
-            tracing::info!("Переключение окна в честный полноэкранный режим (Borderless Fullscreen)...");
+            tracing::info!(
+                "Переключение окна в честный полноэкранный режим (Borderless Fullscreen)..."
+            );
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
 
             // Гарантируем через Win32 API, что окно занимает весь физический экран монитора
@@ -324,7 +329,13 @@ impl RemoteWardClientApp {
                         let h = rc.bottom - rc.top;
 
                         let style = GetWindowLongW(hwnd, GWL_STYLE);
-                        let clean_style = (style & !(WS_CAPTION.0 as i32 | WS_THICKFRAME.0 as i32 | WS_MINIMIZEBOX.0 as i32 | WS_MAXIMIZEBOX.0 as i32 | WS_SYSMENU.0 as i32)) | WS_POPUP.0 as i32;
+                        let clean_style = (style
+                            & !(WS_CAPTION.0 as i32
+                                | WS_THICKFRAME.0 as i32
+                                | WS_MINIMIZEBOX.0 as i32
+                                | WS_MAXIMIZEBOX.0 as i32
+                                | WS_SYSMENU.0 as i32))
+                            | WS_POPUP.0 as i32;
                         SetWindowLongW(hwnd, GWL_STYLE, clean_style);
 
                         let _ = SetWindowPos(
@@ -350,7 +361,11 @@ impl RemoteWardClientApp {
             if let Some(hwnd) = self.get_hwnd() {
                 unsafe {
                     let style = GetWindowLongW(hwnd, GWL_STYLE);
-                    let windowed_style = (style & !(WS_POPUP.0 as i32)) | (WS_OVERLAPPED.0 as i32 | WS_CAPTION.0 as i32 | WS_SYSMENU.0 as i32 | WS_MINIMIZEBOX.0 as i32);
+                    let windowed_style = (style & !(WS_POPUP.0 as i32))
+                        | (WS_OVERLAPPED.0 as i32
+                            | WS_CAPTION.0 as i32
+                            | WS_SYSMENU.0 as i32
+                            | WS_MINIMIZEBOX.0 as i32);
                     SetWindowLongW(hwnd, GWL_STYLE, windowed_style);
 
                     let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -361,7 +376,10 @@ impl RemoteWardClientApp {
                     let (x, y) = if GetMonitorInfoW(monitor, &mut mi).as_bool() {
                         let mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
                         let mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
-                        (mi.rcMonitor.left + (mon_w - 960) / 2, mi.rcMonitor.top + (mon_h - 640) / 2)
+                        (
+                            mi.rcMonitor.left + (mon_w - 960) / 2,
+                            mi.rcMonitor.top + (mon_h - 640) / 2,
+                        )
                     } else {
                         (100, 100)
                     };
@@ -413,6 +431,10 @@ impl RemoteWardClientApp {
 
     fn disconnect_to_launcher(&mut self) {
         if let Some(ref session) = self.session {
+            let _ = session.control_tx.send(ControlMessage::Disconnect {
+                session_id: 1,
+                reason: "Сеанс завершен пользователем на клиенте".into(),
+            });
             session.is_running.store(false, Ordering::Relaxed);
         }
         self.session = None;
@@ -483,8 +505,16 @@ impl ApplicationHandler for RemoteWardClientApp {
                             self.keyboard_hook = Some(hook);
 
                             let inner_size = window.inner_size();
-                            let render_w = if inner_size.width > 0 { inner_size.width } else { 960 };
-                            let render_h = if inner_size.height > 0 { inner_size.height } else { 640 };
+                            let render_w = if inner_size.width > 0 {
+                                inner_size.width
+                            } else {
+                                960
+                            };
+                            let render_h = if inner_size.height > 0 {
+                                inner_size.height
+                            } else {
+                                640
+                            };
                             match crate::renderer::D3D11Renderer::new(hwnd, render_w, render_h) {
                                 Ok(d3d11) => {
                                     tracing::info!("Аппаратный рендерер Direct3D 11 для лаунчера и стрима готов!");
@@ -540,9 +570,7 @@ impl ApplicationHandler for RemoteWardClientApp {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("Закрытие окна приложения Remote-Ward...");
-                if let Some(ref session) = self.session {
-                    session.is_running.store(false, Ordering::Relaxed);
-                }
+                self.disconnect_to_launcher();
                 if let Some(h) = self.host_handle.take() {
                     h.host.stop();
                     h.task.abort();
@@ -558,7 +586,9 @@ impl ApplicationHandler for RemoteWardClientApp {
 
             WindowEvent::Focused(is_focused) => {
                 if let Some(ref hook) = self.keyboard_hook {
-                    hook.set_active(is_focused && self.session.is_some() && !self.launcher_ui.show_overlay);
+                    hook.set_active(
+                        is_focused && self.session.is_some() && !self.launcher_ui.show_overlay,
+                    );
                 }
                 if !is_focused && is_streaming {
                     if let Some(ref session) = self.session {
@@ -574,7 +604,9 @@ impl ApplicationHandler for RemoteWardClientApp {
                 }
             }
 
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 if let PhysicalKey::Code(key_code) = key_event.physical_key {
                     let is_pressed = key_event.state == ElementState::Pressed;
 
@@ -589,11 +621,14 @@ impl ApplicationHandler for RemoteWardClientApp {
                     }
 
                     // ШОРТКАТ Ctrl + Shift + O: Внутриигровой HUD оверлей
-                    if self.ctrl_down && self.shift_down && key_code == KeyCode::KeyO && is_pressed {
-                        if self.session.is_some() {
-                            self.toggle_hud_overlay();
-                            return;
-                        }
+                    if self.ctrl_down
+                        && self.shift_down
+                        && key_code == KeyCode::KeyO
+                        && is_pressed
+                        && self.session.is_some()
+                    {
+                        self.toggle_hud_overlay();
+                        return;
                     }
 
                     // В режиме оверлея: клавиша Escape закрывает оверлей и возвращает мышь в игру
@@ -603,7 +638,10 @@ impl ApplicationHandler for RemoteWardClientApp {
                     }
 
                     // Экстренное завершение стрима: Right Ctrl + Esc
-                    if (self.rctrl_down || key_code == KeyCode::ControlRight) && key_code == KeyCode::Escape && is_pressed {
+                    if (self.rctrl_down || key_code == KeyCode::ControlRight)
+                        && key_code == KeyCode::Escape
+                        && is_pressed
+                    {
                         if self.session.is_some() {
                             self.disconnect_to_launcher();
                             return;
@@ -618,14 +656,21 @@ impl ApplicationHandler for RemoteWardClientApp {
                         if !is_overlay {
                             // F8: Переключение активного монитора хоста
                             if key_code == KeyCode::F8 && is_pressed {
-                                if self.last_monitor_switch.elapsed() >= Duration::from_millis(300) {
+                                if self.last_monitor_switch.elapsed() >= Duration::from_millis(300)
+                                {
                                     self.last_monitor_switch = Instant::now();
-                                    let next_idx = session.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
-                                    session.current_monitor_shared.store(next_idx, Ordering::Relaxed);
-                                    let _ = session.control_tx.send(ControlMessage::SwitchMonitor {
-                                        session_id: 1,
-                                        monitor_index: next_idx,
-                                    });
+                                    let next_idx = session
+                                        .current_monitor_shared
+                                        .load(Ordering::Relaxed)
+                                        .wrapping_add(1);
+                                    session
+                                        .current_monitor_shared
+                                        .store(next_idx, Ordering::Relaxed);
+                                    let _ =
+                                        session.control_tx.send(ControlMessage::SwitchMonitor {
+                                            session_id: 1,
+                                            monitor_index: next_idx,
+                                        });
                                 }
                                 return;
                             }
@@ -644,7 +689,10 @@ impl ApplicationHandler for RemoteWardClientApp {
                             }
 
                             // F11 / Right Ctrl + H: Переключение режима мыши (Рабочий стол / Игровой захват 3D камеры)
-                            if (key_code == KeyCode::F11 || (self.rctrl_down && key_code == KeyCode::KeyH)) && is_pressed {
+                            if (key_code == KeyCode::F11
+                                || (self.rctrl_down && key_code == KeyCode::KeyH))
+                                && is_pressed
+                            {
                                 self.cursor_grabbed = !self.cursor_grabbed;
                                 if let Some(ref window) = self.window {
                                     window.set_cursor_visible(!self.cursor_grabbed);
@@ -704,7 +752,11 @@ impl ApplicationHandler for RemoteWardClientApp {
                 }
             }
 
-            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => {
                 if let Some(ref session) = self.session {
                     if !is_overlay {
                         let mb = match button {
@@ -721,10 +773,9 @@ impl ApplicationHandler for RemoteWardClientApp {
                             ElementState::Released => ButtonState::Released,
                         };
 
-                        let _ = session.input_tx.send(InputEvent::MouseButton {
-                            button: mb,
-                            state,
-                        });
+                        let _ = session
+                            .input_tx
+                            .send(InputEvent::MouseButton { button: mb, state });
                     }
                 }
             }
@@ -740,7 +791,9 @@ impl ApplicationHandler for RemoteWardClientApp {
                                 (pos.x as i16, pos.y as i16)
                             }
                         };
-                        let _ = session.input_tx.send(InputEvent::MouseWheel { delta_y, delta_x });
+                        let _ = session
+                            .input_tx
+                            .send(InputEvent::MouseWheel { delta_y, delta_x });
                     }
                 }
             }
@@ -776,7 +829,9 @@ impl ApplicationHandler for RemoteWardClientApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(1),
+        ));
 
         // 1. Проверяем результат асинхронного подключения
         if let Some(ref mut rx) = self.session_rx {
@@ -785,7 +840,9 @@ impl ApplicationHandler for RemoteWardClientApp {
                 self.connecting_target = None;
                 match res {
                     Ok(session) => {
-                        tracing::info!("Подключение успешно! Разворачиваем окно в полноэкранный стрим.");
+                        tracing::info!(
+                            "Подключение успешно! Разворачиваем окно в полноэкранный стрим."
+                        );
                         self.set_fullscreen_mode(true);
 
                         if let Some(ref window) = self.window {
@@ -801,7 +858,8 @@ impl ApplicationHandler for RemoteWardClientApp {
                     }
                     Err(err) => {
                         tracing::warn!("Не удалось подключиться к хосту: {}", err);
-                        self.launcher_ui.error_message = Some(format!("Ошибка подключения: {}", err));
+                        self.launcher_ui.error_message =
+                            Some(format!("Ошибка подключения: {}", err));
                         self.disconnect_to_launcher();
                     }
                 }
@@ -818,11 +876,25 @@ impl ApplicationHandler for RemoteWardClientApp {
         let screen_w = inner_size.width;
         let screen_h = inner_size.height;
 
+        let window_hwnd = if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(win32_handle) = handle.as_raw() {
+                Some(HWND(win32_handle.hwnd.get() as *mut _))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         if let Some(ref mut session) = self.session {
             // Режим СТРИМИНГА
-            let mut latest_frame = None;
+            let mut latest_frame: Option<crate::decoder::DecodedFrame> = None;
             while let Ok(frame) = session.frame_rx.try_recv() {
-                latest_frame = Some(frame);
+                // Если в очереди было несколько кадров, возвращаем пропущенные буферы в пул
+                // предотвращая утечку слотов пула и повторный heap-churn (Zero-Allocation)
+                if let Some(prev) = latest_frame.replace(frame) {
+                    let _ = session.buf_pool_tx.try_send(prev.data);
+                }
             }
 
             let mut hud_action = LauncherAction::None;
@@ -838,10 +910,16 @@ impl ApplicationHandler for RemoteWardClientApp {
                     let bitrate = self.app_config.bitrate_mbps as f32;
 
                     let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                        hud_action = self.launcher_ui.draw_in_stream_hud(ctx, rtt, fps, decode_ms, bitrate);
+                        hud_action = self
+                            .launcher_ui
+                            .draw_in_stream_hud(ctx, rtt, fps, decode_ms, bitrate);
                     });
                     state.handle_platform_output(window, full_output.platform_output);
-                    overlay_draw_data = Some((full_output.shapes, full_output.textures_delta, full_output.pixels_per_point));
+                    overlay_draw_data = Some((
+                        full_output.shapes,
+                        full_output.textures_delta,
+                        full_output.pixels_per_point,
+                    ));
                 }
             }
 
@@ -851,8 +929,13 @@ impl ApplicationHandler for RemoteWardClientApp {
                     return;
                 }
                 LauncherAction::SwitchMonitor => {
-                    let next_idx = session.current_monitor_shared.load(Ordering::Relaxed).wrapping_add(1);
-                    session.current_monitor_shared.store(next_idx, Ordering::Relaxed);
+                    let next_idx = session
+                        .current_monitor_shared
+                        .load(Ordering::Relaxed)
+                        .wrapping_add(1);
+                    session
+                        .current_monitor_shared
+                        .store(next_idx, Ordering::Relaxed);
                     let _ = session.control_tx.send(ControlMessage::SwitchMonitor {
                         session_id: 1,
                         monitor_index: next_idx,
@@ -876,8 +959,24 @@ impl ApplicationHandler for RemoteWardClientApp {
                         let _ = d3d11.paint_egui(screen_w, screen_h, ppp, &clipped);
                     }
 
-                    let _ = d3d11.present();
+                    if let Err(e) = d3d11.present() {
+                        tracing::warn!("Ошибка Direct3D11 Present(): {:?}", e);
+                        if d3d11.is_device_lost() {
+                            tracing::warn!("Обнаружен сброс GPU драйвера (DXGI_ERROR_DEVICE_REMOVED). Переинициализация D3D11Renderer...");
+                            self.renderer = None; // Освобождаем старый Device и SwapChain
+                            if let Some(hwnd) = window_hwnd {
+                                if let Ok(new_r) =
+                                    crate::renderer::D3D11Renderer::new(hwnd, screen_w, screen_h)
+                                {
+                                    self.renderer = Some(new_r);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Возвращаем буфер в пул для следующего кадра (Zero-Allocation)
+                let _ = session.buf_pool_tx.try_send(frame.data);
             }
 
             // Статистика FPS
@@ -917,7 +1016,11 @@ impl ApplicationHandler for RemoteWardClientApp {
                     launcher_action = self.launcher_ui.draw_launcher(ctx, &mut self.app_config);
                 });
                 state.handle_platform_output(window, full_output.platform_output);
-                launcher_draw_data = Some((full_output.shapes, full_output.textures_delta, full_output.pixels_per_point));
+                launcher_draw_data = Some((
+                    full_output.shapes,
+                    full_output.textures_delta,
+                    full_output.pixels_per_point,
+                ));
             }
 
             match launcher_action {
@@ -927,7 +1030,9 @@ impl ApplicationHandler for RemoteWardClientApp {
                 LauncherAction::ToggleHostServer => {
                     if self.host_handle.is_none() {
                         tracing::info!("Запуск встроенного хост-сервера Remote-Ward...");
-                        let host = Arc::new(host_server::RemoteWardHost::new(host_server::HostConfig::default()));
+                        let host = Arc::new(host_server::RemoteWardHost::new(
+                            host_server::HostConfig::default(),
+                        ));
                         let host_clone = Arc::clone(&host);
                         let task = tokio::spawn(async move {
                             if let Err(e) = host_clone.run().await {
@@ -999,9 +1104,12 @@ async fn spawn_streaming_pipeline(
     let is_running_punch = Arc::clone(&is_running);
     let video_socket_punch = Arc::clone(&video_socket);
     tokio::spawn(async move {
-        let punch_packet = [core_protocol::MSG_TYPE_CONTROL, 0x50, 0x55, 0x4E, 0x43, 0x48]; // PUNCH
+        let punch_header = core_protocol::DatagramHeader::new_hole_punch(1);
+        let punch_bytes = punch_header.as_bytes();
         while is_running_punch.load(Ordering::Relaxed) {
-            let _ = video_socket_punch.send_to(&punch_packet, host_video_addr).await;
+            let _ = video_socket_punch
+                .send_to(punch_bytes, host_video_addr)
+                .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
@@ -1014,7 +1122,9 @@ async fn spawn_streaming_pipeline(
 
     // 4. Сетевая калибровка
     let session_id = 1u64;
-    let _calibration = crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id).await;
+    let _calibration =
+        crate::calibration::run_network_calibration(&control_socket, host_ctrl_addr, session_id)
+            .await;
 
     let target_bitrate = (config.bitrate_mbps * 1000).max(10_000);
     let target_fps = config.target_fps;
@@ -1025,7 +1135,9 @@ async fn spawn_streaming_pipeline(
         target_fps,
     };
     if let Ok(settings_bytes) = settings_msg.to_packet() {
-        let _ = control_socket.send_to(&settings_bytes, host_ctrl_addr).await;
+        let _ = control_socket
+            .send_to(&settings_bytes, host_ctrl_addr)
+            .await;
     }
 
     // 5. Отправляем ClientHello с динамическим портом local_video_port
@@ -1047,7 +1159,10 @@ async fn spawn_streaming_pipeline(
         supports_fec: true,
     });
     let hello_bytes = hello.to_packet().map_err(|e| format!("{:?}", e))?;
-    control_socket.send_to(&hello_bytes, host_ctrl_addr).await.map_err(|e| format!("{:?}", e))?;
+    control_socket
+        .send_to(&hello_bytes, host_ctrl_addr)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
 
     // 6. Фоновый прием ServerHello, Pong
     let is_running_ctrl_rx = Arc::clone(&is_running);
@@ -1061,13 +1176,25 @@ async fn spawn_streaming_pipeline(
                     if let Ok(msg) = ControlMessage::from_packet(&buf[..len]) {
                         match msg {
                             ControlMessage::ServerHello(h) => {
-                                tracing::info!("Хост подтвердил сеанс: {} [{}x{} @ {} FPS]", h.server_name, h.width, h.height, h.target_fps);
+                                tracing::info!(
+                                    "Хост подтвердил сеанс: {} [{}x{} @ {} FPS]",
+                                    h.server_name,
+                                    h.width,
+                                    h.height,
+                                    h.target_fps
+                                );
                             }
                             ControlMessage::SwitchMonitorAck { monitor_index, .. } => {
                                 current_monitor_shared_ctrl.store(monitor_index, Ordering::Relaxed);
                             }
-                            ControlMessage::Pong { send_timestamp_us, .. } => {
-                                let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+                            ControlMessage::Pong {
+                                send_timestamp_us, ..
+                            } => {
+                                let now_us = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros()
+                                    as u64;
                                 let rtt = now_us.saturating_sub(send_timestamp_us) as u32;
                                 current_rtt_rx.store(rtt, Ordering::Relaxed);
                             }
@@ -1090,24 +1217,34 @@ async fn spawn_streaming_pipeline(
         while is_running_ping.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(1500)).await;
             seq += 1;
-            let now_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
-            let ping = ControlMessage::Ping { session_id, sequence: seq, send_timestamp_us: now_us };
+            let now_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            let ping = ControlMessage::Ping {
+                session_id,
+                sequence: seq,
+                send_timestamp_us: now_us,
+            };
             if let Ok(b) = ping.to_packet() {
                 let _ = ctrl_socket_ping.send_to(&b, host_ctrl_addr).await;
             }
         }
     });
 
-    // 8. Передача пользовательского ввода
+    // 8. Передача пользовательского ввода (Zero-Allocation 1000 Hz)
     let is_running_input = Arc::clone(&is_running);
     let ctrl_socket_input = Arc::clone(&control_socket);
     tokio::spawn(async move {
+        let mut input_buf = [0u8; 64];
         while let Some(event) = input_rx.recv().await {
             if !is_running_input.load(Ordering::Relaxed) {
                 break;
             }
-            if let Ok(bytes) = event.to_packet() {
-                let _ = ctrl_socket_input.send_to(&bytes, host_ctrl_addr).await;
+            if let Ok(len) = event.write_to_slice(&mut input_buf) {
+                let _ = ctrl_socket_input
+                    .send_to(&input_buf[..len], host_ctrl_addr)
+                    .await;
             }
         }
     });
@@ -1119,48 +1256,111 @@ async fn spawn_streaming_pipeline(
     let initial_width = 2560u32;
     let initial_height = 1440u32;
 
+    // Пул буферов кадров (Zero-Allocation Buffer Pool)
+    let (buf_pool_tx, buf_pool_rx) = crossbeam_channel::bounded::<Vec<u8>>(8);
+    let buf_pool_tx_session = buf_pool_tx.clone();
+
     std::thread::Builder::new()
         .name("video-decoder".into())
         .spawn(move || {
+            // SAFETY: Инициализация COM MTA для MFT декодера в системном потоке
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                );
+            }
+
             let effective_codec = if MftVideoDecoder::is_codec_supported(preferred_codec) {
                 preferred_codec
             } else {
                 VideoCodec::H264
             };
-            let mut decoder_opt = MftVideoDecoder::new(initial_width, initial_height, effective_codec).ok();
+            let mut decoder_opt =
+                MftVideoDecoder::new(initial_width, initial_height, effective_codec).ok();
 
             while is_running_dec.load(Ordering::Relaxed) {
                 match raw_frame_rx.blocking_recv() {
                     Some(assembled_frame) => {
+                        let mut buffer = buf_pool_rx.try_recv().unwrap_or_else(|_| {
+                            Vec::with_capacity((initial_width * initial_height * 3 / 2) as usize)
+                        });
                         if let Some(ref mut decoder) = decoder_opt {
-                            match decoder.decode(&assembled_frame.data) {
-                                Ok(Some(decoded)) => {
-                                    let _ = frame_tx_decoder.try_send(decoded);
+                            match decoder.decode_into(&assembled_frame.data, &mut buffer) {
+                                Ok(Some((w, h, lat))) => {
+                                    let _ = frame_tx_decoder.try_send(DecodedFrame {
+                                        width: w,
+                                        height: h,
+                                        data: buffer,
+                                        latency_us: lat,
+                                    });
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    let _ = buf_pool_tx.try_send(buffer);
+                                }
                                 Err(e) => {
                                     tracing::warn!("Ошибка декодера: {:?}", e);
                                     if assembled_frame.is_keyframe {
-                                        if let Ok(mut new_dec) = MftVideoDecoder::new(initial_width, initial_height, effective_codec) {
-                                            if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
-                                                let _ = frame_tx_decoder.try_send(decoded);
+                                        if let Ok(mut new_dec) = MftVideoDecoder::new(
+                                            initial_width,
+                                            initial_height,
+                                            effective_codec,
+                                        ) {
+                                            if let Ok(Some((w, h, lat))) = new_dec
+                                                .decode_into(&assembled_frame.data, &mut buffer)
+                                            {
+                                                let _ = frame_tx_decoder.try_send(DecodedFrame {
+                                                    width: w,
+                                                    height: h,
+                                                    data: buffer,
+                                                    latency_us: lat,
+                                                });
+                                            } else {
+                                                let _ = buf_pool_tx.try_send(buffer);
                                             }
                                             *decoder = new_dec;
+                                        } else {
+                                            let _ = buf_pool_tx.try_send(buffer);
                                         }
+                                    } else {
+                                        let _ = buf_pool_tx.try_send(buffer);
                                     }
                                 }
                             }
                         } else if assembled_frame.is_keyframe {
-                            if let Ok(mut new_dec) = MftVideoDecoder::new(initial_width, initial_height, effective_codec) {
-                                if let Ok(Some(decoded)) = new_dec.decode(&assembled_frame.data) {
-                                    let _ = frame_tx_decoder.try_send(decoded);
+                            if let Ok(mut new_dec) =
+                                MftVideoDecoder::new(initial_width, initial_height, effective_codec)
+                            {
+                                if let Ok(Some((w, h, lat))) =
+                                    new_dec.decode_into(&assembled_frame.data, &mut buffer)
+                                {
+                                    let _ = frame_tx_decoder.try_send(DecodedFrame {
+                                        width: w,
+                                        height: h,
+                                        data: buffer,
+                                        latency_us: lat,
+                                    });
+                                } else {
+                                    let _ = buf_pool_tx.try_send(buffer);
                                 }
                                 decoder_opt = Some(new_dec);
+                            } else {
+                                let _ = buf_pool_tx.try_send(buffer);
                             }
+                        } else {
+                            let _ = buf_pool_tx.try_send(buffer);
                         }
                     }
                     None => break,
                 }
+            }
+
+            // SAFETY: Все COM-объекты декодера (IMFTransform) обязаны быть освобождены ДО вызова CoUninitialize()
+            drop(decoder_opt);
+
+            // SAFETY: Деинициализация COM-апартаментов при завершении потока декодера
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
             }
         })
         .map_err(|e| format!("Не удалось запустить поток декодера: {:?}", e))?;
@@ -1227,18 +1427,37 @@ async fn spawn_streaming_pipeline(
                                 continue;
                             }
 
-                            if len >= core_protocol::DatagramHeader::SIZE
-                                && buf[3] == core_protocol::ChannelId::AudioHostToClient as u8
-                            {
+                            if len < core_protocol::DatagramHeader::SIZE {
+                                continue;
+                            }
+
+                            let (hdr, payload) =
+                                match core_protocol::DatagramHeader::parse(&buf[..len]) {
+                                    Ok(res) => res,
+                                    Err(_) => continue,
+                                };
+
+                            if matches!(
+                                hdr.get_channel(),
+                                Ok(core_protocol::ChannelId::AudioHostToClient)
+                            ) {
                                 if let Some(ref player) = *audio_player_task {
-                                    player.queue_pcm(&buf[core_protocol::DatagramHeader::SIZE..len]);
+                                    // 16-bit stereo PCM = 4 байта на сэмпл, строго выравниваем длину
+                                    let aligned_len = payload.len() & !3;
+                                    if aligned_len > 0 {
+                                        player.queue_pcm(&payload[..aligned_len]);
+                                    }
                                 }
                                 continue;
                             }
 
                             packets_received_window += 1;
                             let datagram = &buf[..len];
-                            let parsed_header = core_protocol::DatagramHeader::parse(datagram).ok().map(|(h, _)| (h.get_frame_id(), h.get_packet_index(), h.get_total_packets()));
+                            let parsed_header = Some((
+                                hdr.get_frame_id(),
+                                hdr.get_packet_index(),
+                                hdr.get_total_packets(),
+                            ));
 
                             match reassembler.process_packet(datagram) {
                                 Ok(Some(assembled_frame)) => {
@@ -1248,22 +1467,35 @@ async fn spawn_streaming_pipeline(
                                         let _ = raw_frame_tx.try_send(assembled_frame);
                                     } else {
                                         let is_gap = match last_frame_id_opt {
-                                            Some(last_id) => assembled_frame.frame_id > last_id.wrapping_add(1),
+                                            Some(last_id) => core_transport::is_newer_frame(
+                                                assembled_frame.frame_id,
+                                                last_id.wrapping_add(1),
+                                            ),
                                             None => true,
                                         };
 
                                         if is_gap {
                                             waiting_for_clean_keyframe = true;
-                                            let gap = last_frame_id_opt.map_or(1, |lid| assembled_frame.frame_id.saturating_sub(lid + 1));
+                                            let gap = last_frame_id_opt.map_or(1, |lid| {
+                                                assembled_frame
+                                                    .frame_id
+                                                    .wrapping_sub(lid.wrapping_add(1))
+                                                    .max(1)
+                                            });
                                             packets_lost_window += gap * 20;
 
-                                            if last_idr_request.elapsed() >= Duration::from_millis(50) {
+                                            if last_idr_request.elapsed()
+                                                >= Duration::from_millis(50)
+                                            {
                                                 let req = ControlMessage::RequestKeyframe {
                                                     session_id,
-                                                    reason: "frame gap detected: dropping dirty P-frames".into(),
+                                                    reason:
+                                                        core_protocol::KeyframeReason::PacketLoss,
                                                 };
                                                 if let Ok(req_bytes) = req.to_packet() {
-                                                    let _ = ctrl_socket_task.send_to(&req_bytes, host_ctrl_addr).await;
+                                                    let _ = ctrl_socket_task
+                                                        .send_to(&req_bytes, host_ctrl_addr)
+                                                        .await;
                                                 }
                                                 last_idr_request = Instant::now();
                                             }
@@ -1279,21 +1511,35 @@ async fn spawn_streaming_pipeline(
                                 }
 
                                 Ok(None) => {
-                                    if let Some((current_fid, packet_idx, total_pkts)) = parsed_header {
-                                        if packet_idx + 1 == total_pkts || packet_idx > 5 {
-                                            if let Some(missing) = reassembler.get_missing_packets(current_fid) {
-                                                if !missing.is_empty() && last_nack_instant.elapsed() >= Duration::from_millis(8) {
-                                                    nack_sent_window += missing.len() as u32;
-                                                    let nack_msg = ControlMessage::Nack {
-                                                        session_id,
-                                                        frame_id: current_fid,
-                                                        missing_packet_indices: missing,
-                                                    };
-                                                    if let Ok(nack_bytes) = nack_msg.to_packet() {
-                                                        let _ = ctrl_socket_task.send_to(&nack_bytes, host_ctrl_addr).await;
-                                                    }
-                                                    last_nack_instant = Instant::now();
+                                    if let Some((current_fid, packet_idx, total_pkts)) =
+                                        parsed_header
+                                    {
+                                        let is_last_packet = packet_idx + 1 == total_pkts;
+                                        let missing_opt = if is_last_packet {
+                                            reassembler.get_missing_packets(current_fid)
+                                        } else if packet_idx > 5 {
+                                            reassembler.get_missing_packets_in_flight(current_fid)
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(missing) = missing_opt {
+                                            if !missing.is_empty()
+                                                && last_nack_instant.elapsed()
+                                                    >= Duration::from_millis(8)
+                                            {
+                                                nack_sent_window += missing.len() as u32;
+                                                let nack_msg = ControlMessage::Nack {
+                                                    session_id,
+                                                    frame_id: current_fid,
+                                                    missing_packet_indices: missing,
+                                                };
+                                                if let Ok(nack_bytes) = nack_msg.to_packet() {
+                                                    let _ = ctrl_socket_task
+                                                        .send_to(&nack_bytes, host_ctrl_addr)
+                                                        .await;
                                                 }
+                                                last_nack_instant = Instant::now();
                                             }
                                         }
                                     }
@@ -1325,6 +1571,7 @@ async fn spawn_streaming_pipeline(
         input_tx,
         control_tx: control_cmd_tx,
         frame_rx,
+        buf_pool_tx: buf_pool_tx_session,
         is_running,
         current_rtt_us,
         current_monitor_shared,
@@ -1343,7 +1590,9 @@ pub async fn run_client(
     tracing::info!("============================================================");
 
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1)));
+    event_loop.set_control_flow(ControlFlow::WaitUntil(
+        Instant::now() + Duration::from_millis(1),
+    ));
 
     let mut app = RemoteWardClientApp::new(app_config);
     event_loop.run_app(&mut app)?;

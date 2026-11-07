@@ -1,3 +1,4 @@
+use moq_nvenc::sys::nvEncodeAPI::*;
 use std::ffi::c_void;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::{
@@ -7,7 +8,6 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_SDK_VERSION,
 };
-use moq_nvenc::sys::nvEncodeAPI::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
@@ -60,7 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut encoder_handle: *mut c_void = std::ptr::null_mut();
     let status = unsafe {
-        let open_fn = fn_list.nvEncOpenEncodeSessionEx.expect("nvEncOpenEncodeSessionEx");
+        let open_fn = fn_list
+            .nvEncOpenEncodeSessionEx
+            .expect("nvEncOpenEncodeSessionEx");
         open_fn(&mut session_params, &mut encoder_handle)
     };
 

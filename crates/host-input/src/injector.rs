@@ -2,12 +2,11 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 
 const XBUTTON1: u32 = 0x0001;
@@ -16,8 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
 };
 
-use core_protocol::{ButtonState, InputEvent, MouseButton};
 use crate::error::InputError;
+use core_protocol::{ButtonState, InputEvent, MouseButton};
 
 /// Высокоточный инжектор пользовательского ввода в Windows с отслеживанием зажатых клавиш
 pub struct WindowsInputInjector {
@@ -35,7 +34,11 @@ impl WindowsInputInjector {
 
         Self {
             screen_width: AtomicU32::new(if screen_width > 0 { screen_width } else { 1920 }),
-            screen_height: AtomicU32::new(if screen_height > 0 { screen_height } else { 1080 }),
+            screen_height: AtomicU32::new(if screen_height > 0 {
+                screen_height
+            } else {
+                1080
+            }),
             pressed_keys: Mutex::new(HashSet::new()),
             pressed_mouse_buttons: Mutex::new(HashSet::new()),
         }
@@ -61,6 +64,29 @@ impl WindowsInputInjector {
         }
     }
 
+    /// Возвращает текущее множество зажатых скан-кодов клавиш (для тестирования и верификации)
+    pub fn pressed_keys(&self) -> HashSet<(u16, bool)> {
+        self.pressed_keys.lock().unwrap().clone()
+    }
+
+    /// Возвращает текущее множество зажатых кнопок мыши (для тестирования и верификации)
+    pub fn pressed_mouse_buttons(&self) -> HashSet<MouseButton> {
+        self.pressed_mouse_buttons.lock().unwrap().clone()
+    }
+
+    /// Проверяет, зажата ли конкретная клавиша
+    pub fn is_key_pressed(&self, scan_code: u16, is_extended: bool) -> bool {
+        self.pressed_keys
+            .lock()
+            .unwrap()
+            .contains(&(scan_code, is_extended))
+    }
+
+    /// Проверяет, зажата ли конкретная кнопка мыши
+    pub fn is_mouse_button_pressed(&self, button: MouseButton) -> bool {
+        self.pressed_mouse_buttons.lock().unwrap().contains(&button)
+    }
+
     /// Инжекция одного события ввода в ОС
     pub fn inject(&self, event: &InputEvent) -> Result<(), InputError> {
         match event {
@@ -82,9 +108,13 @@ impl WindowsInputInjector {
             }
 
             InputEvent::MouseMoveAbsolute { x, y } => {
-                // Прямая субпиксельная установка курсора через SetCursorPos без кривых ускорения мыши
+                let max_w = self.screen_width.load(Ordering::Relaxed).saturating_sub(1) as i32;
+                let max_h = self.screen_height.load(Ordering::Relaxed).saturating_sub(1) as i32;
+                let clamped_x = (*x as i32).clamp(0, max_w);
+                let clamped_y = (*y as i32).clamp(0, max_h);
+                // SAFETY: Прямая субпиксельная установка курсора через SetCursorPos в границах экрана
                 unsafe {
-                    let _ = SetCursorPos(*x as i32, *y as i32);
+                    let _ = SetCursorPos(clamped_x, clamped_y);
                 }
                 Ok(())
             }
@@ -159,10 +189,11 @@ impl WindowsInputInjector {
             }
 
             InputEvent::MouseWheel { delta_y, delta_x } => {
-                let mut inputs = Vec::with_capacity(2);
+                let mut inputs = [INPUT::default(); 2];
+                let mut count = 0;
 
                 if *delta_y != 0 {
-                    inputs.push(INPUT {
+                    inputs[count] = INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
@@ -174,11 +205,12 @@ impl WindowsInputInjector {
                                 dwExtraInfo: 0,
                             },
                         },
-                    });
+                    };
+                    count += 1;
                 }
 
                 if *delta_x != 0 {
-                    inputs.push(INPUT {
+                    inputs[count] = INPUT {
                         r#type: INPUT_MOUSE,
                         Anonymous: INPUT_0 {
                             mi: MOUSEINPUT {
@@ -190,11 +222,12 @@ impl WindowsInputInjector {
                                 dwExtraInfo: 0,
                             },
                         },
-                    });
+                    };
+                    count += 1;
                 }
 
-                if !inputs.is_empty() {
-                    self.send(&inputs)?;
+                if count > 0 {
+                    self.send(&inputs[..count])?;
                 }
                 Ok(())
             }
@@ -254,9 +287,7 @@ impl WindowsInputInjector {
     }
 
     fn send(&self, inputs: &[INPUT]) -> Result<(), InputError> {
-        let sent = unsafe {
-            SendInput(inputs, std::mem::size_of::<INPUT>() as i32)
-        };
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent != inputs.len() as u32 {
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             return Err(InputError::SendInputFailed {
@@ -270,20 +301,25 @@ impl WindowsInputInjector {
 
     /// Отправка Secure Attention Sequence (Ctrl+Alt+Del) в Windows через sas.dll
     pub fn send_sas(&self) -> bool {
+        // SAFETY: Динамическая загрузка sas.dll с гарантированным вызовом FreeLibrary
         unsafe {
             use windows::core::s;
+            use windows::Win32::Foundation::FreeLibrary;
             use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
             let h_module = LoadLibraryA(s!("sas.dll"));
             if let Ok(module) = h_module {
                 if !module.is_invalid() {
+                    let mut success = false;
                     let proc = GetProcAddress(module, s!("SendSAS"));
                     if let Some(proc) = proc {
                         type SendSasFn = unsafe extern "system" fn(i32);
                         let send_sas_fn: SendSasFn = std::mem::transmute(proc);
                         send_sas_fn(0); // 0 = FALSE (system SAS)
                         tracing::info!("Успешно вызван SendSAS (Secure Attention Sequence)");
-                        return true;
+                        success = true;
                     }
+                    let _ = FreeLibrary(module);
+                    return success;
                 }
             }
             tracing::debug!("sas.dll SendSAS недоступен, используется стандартный ввод");
@@ -325,7 +361,11 @@ impl WindowsInputInjector {
         }
 
         // Страховочный сброс базовых кнопок мыши
-        for flag in [MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP] {
+        for flag in [
+            MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_RIGHTUP,
+            MOUSEEVENTF_MIDDLEUP,
+        ] {
             inputs.push(INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
@@ -404,5 +444,12 @@ impl WindowsInputInjector {
 impl Default for WindowsInputInjector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WindowsInputInjector {
+    fn drop(&mut self) {
+        // Гарантированный сброс всех зажатых клавиш и кнопок мыши при завершении работы инжектора
+        self.release_all();
     }
 }

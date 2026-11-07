@@ -1,5 +1,9 @@
+use bincode::Options;
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
+
+/// Максимально допустимый размер датаграммы ввода для защиты от OOM
+pub const MAX_INPUT_PACKET_SIZE: u64 = 4096;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,15 +75,19 @@ impl InputPacket {
         Ok(buf)
     }
 
-    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT
+    /// Строгая десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT с лимитом размера
     pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
         if packet.first() == Some(&crate::packet::MSG_TYPE_INPUT) {
-            bincode::deserialize(&packet[1..])
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_INPUT_PACKET_SIZE)
+                .deserialize(&packet[1..])
         } else {
-            Err(bincode::ErrorKind::Custom(
-                "Пакет не содержит префикс MSG_TYPE_INPUT".to_string(),
+            Err(
+                bincode::ErrorKind::Custom("Пакет не содержит префикс MSG_TYPE_INPUT".to_string())
+                    .into(),
             )
-            .into())
         }
     }
 }
@@ -90,9 +98,13 @@ impl InputEvent {
         bincode::serialize(self)
     }
 
-    /// Десериализация бинарного пакета ввода
+    /// Десериализация бинарного пакета ввода с защитой от OOM
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_INPUT_PACKET_SIZE)
+            .deserialize(bytes)
     }
 
     /// Сериализация в сетевую датаграмму с префиксом MSG_TYPE_INPUT
@@ -103,20 +115,43 @@ impl InputEvent {
         Ok(buf)
     }
 
-    /// Десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT
+    /// Сериализация в предоставленный срез памяти без динамических аллокаций (Zero-Allocation)
+    pub fn write_to_slice(&self, out_buf: &mut [u8]) -> Result<usize, bincode::Error> {
+        if out_buf.is_empty() {
+            return Err(bincode::ErrorKind::SizeLimit.into());
+        }
+        out_buf[0] = crate::packet::MSG_TYPE_INPUT;
+        let mut cursor = std::io::Cursor::new(&mut out_buf[1..]);
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(MAX_INPUT_PACKET_SIZE)
+            .serialize_into(&mut cursor, self)?;
+        Ok(1 + cursor.position() as usize)
+    }
+
+    /// Десериализация из сетевой датаграммы с префиксом MSG_TYPE_INPUT с защитой от OOM
     pub fn from_packet(packet: &[u8]) -> Result<Self, bincode::Error> {
         if packet.first() == Some(&crate::packet::MSG_TYPE_INPUT) {
-            bincode::deserialize(&packet[1..])
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(MAX_INPUT_PACKET_SIZE)
+                .deserialize(&packet[1..])
         } else {
-            Err(bincode::ErrorKind::Custom(
-                "Пакет не содержит префикс MSG_TYPE_INPUT".to_string(),
+            Err(
+                bincode::ErrorKind::Custom("Пакет не содержит префикс MSG_TYPE_INPUT".to_string())
+                    .into(),
             )
-            .into())
         }
     }
 
     /// Упаковка события в сетевой пакет с привязкой к сессии
-    pub fn to_packet_with_session(&self, session_id: u64, sequence: u32) -> Result<Vec<u8>, bincode::Error> {
+    pub fn to_packet_with_session(
+        &self,
+        session_id: u64,
+        sequence: u32,
+    ) -> Result<Vec<u8>, bincode::Error> {
         let packet = InputPacket::new(session_id, sequence, self.clone());
         packet.to_packet()
     }

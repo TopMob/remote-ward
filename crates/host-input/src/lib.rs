@@ -21,7 +21,9 @@ mod tests {
         match res {
             Ok(_) => (),
             Err(InputError::SendInputFailed { error_code: 5, .. }) => {
-                println!("UIPI blocked SendInput in test runner (expected in headless CI/background)");
+                println!(
+                    "UIPI blocked SendInput in test runner (expected in headless CI/background)"
+                );
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
         }

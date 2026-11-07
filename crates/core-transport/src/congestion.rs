@@ -30,7 +30,9 @@ pub struct CongestionController {
 
 impl CongestionController {
     pub fn new(config: CongestionConfig) -> Self {
-        let initial = config.initial_bitrate_kbps.clamp(config.min_bitrate_kbps, config.max_bitrate_kbps);
+        let initial = config
+            .initial_bitrate_kbps
+            .clamp(config.min_bitrate_kbps, config.max_bitrate_kbps);
         Self {
             config,
             current_bitrate_kbps: initial,
@@ -56,14 +58,18 @@ impl CongestionController {
 
     /// Принудительно установить битрейт (например, по результатам калибровки)
     pub fn set_target_bitrate(&mut self, bitrate_kbps: u32) {
-        self.current_bitrate_kbps = bitrate_kbps.clamp(
-            self.config.min_bitrate_kbps,
-            self.config.max_bitrate_kbps,
-        );
+        self.current_bitrate_kbps =
+            bitrate_kbps.clamp(self.config.min_bitrate_kbps, self.config.max_bitrate_kbps);
     }
 
     /// Обновление состояния контроллера при получении телеметрии от клиента
     pub fn update_feedback(&mut self, rtt_us: u32, packet_loss_rate: f32) -> u32 {
+        let packet_loss_rate = if packet_loss_rate.is_finite() {
+            packet_loss_rate.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
         if rtt_us > 0 {
             if self.min_rtt_us == u32::MAX || rtt_us < self.min_rtt_us {
                 self.min_rtt_us = rtt_us;
@@ -99,8 +105,11 @@ impl CongestionController {
         }
         // 2. Предотвращение Bufferbloat (пинг вырос, но пакеты пока не теряются)
         else if self.min_rtt_us != u32::MAX
-            && rtt_us > self.min_rtt_us + self.config.bufferbloat_threshold_us
-            && self.current_bitrate_kbps > self.config.min_bitrate_kbps + 4_000
+            && rtt_us
+                > self
+                    .min_rtt_us
+                    .saturating_add(self.config.bufferbloat_threshold_us)
+            && self.current_bitrate_kbps > self.config.min_bitrate_kbps.saturating_add(4_000)
         {
             let target = self.current_bitrate_kbps.saturating_sub(2_000);
             self.current_bitrate_kbps = target.max(self.config.min_bitrate_kbps);
@@ -114,9 +123,13 @@ impl CongestionController {
             );
         }
         // 3. Сеть стабильна и свободна — аддитивное повышение битрейта (AIMD)
-        else if packet_loss_rate < 0.005 && self.current_bitrate_kbps < self.config.max_bitrate_kbps {
+        else if packet_loss_rate < 0.005
+            && self.current_bitrate_kbps < self.config.max_bitrate_kbps
+        {
             let increment = 1_000;
-            self.current_bitrate_kbps = (self.current_bitrate_kbps + increment)
+            self.current_bitrate_kbps = self
+                .current_bitrate_kbps
+                .saturating_add(increment)
                 .min(self.config.max_bitrate_kbps);
             tracing::trace!(
                 "[ABR] Сеть свободна, повышение битрейта: {} -> {} кбит/с",

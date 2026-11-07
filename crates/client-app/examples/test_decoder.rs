@@ -1,8 +1,8 @@
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::{
-    MFCreateMediaType, MFShutdown, MFStartup, IMFMediaType, IMFTransform,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFMediaType_Video, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION,
+    IMFMediaType, IMFTransform, MFCreateMediaType, MFMediaType_Video, MFShutdown, MFStartup,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -23,9 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[1] Media Foundation успешно инициализирован");
 
     // Создаем экземпляр декодера MFT
-    let decoder: IMFTransform = unsafe {
-        CoCreateInstance(&CLSID_CMSH264DECODER_MFT, None, CLSCTX_INPROC_SERVER)?
-    };
+    let decoder: IMFTransform =
+        unsafe { CoCreateInstance(&CLSID_CMSH264DECODER_MFT, None, CLSCTX_INPROC_SERVER)? };
     println!("[2] Microsoft H.264 Decoder MFT успешно инстанцирован");
 
     // Настраиваем тип входных данных (H.264)

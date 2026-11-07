@@ -1,16 +1,17 @@
 //! # Remote-Ward Premium Launcher UI
 //!
 //! Графический интерфейс лаунчера на базе egui:
-//! - Режим «Клиент»: LAN Discovery карточки хостов, быстрый ручной ввод IP с историей,
-//!   пресеты качества, взаимная калибровка связки устройств.
+//! - Режим «Клиент»: LAN Discovery карточки хостов, быстрый ручной ввод IP с валидацией,
+//!   пресеты качества, переключатель кодеков (H.264 / HEVC), взаимная калибровка связки устройств.
 //! - Режим «Хост-Сервер»: мониторинг статуса, локальный IP со значком копирования,
-//!   аппаратные характеристики (RTX 2060 SUPER, WGC, WASAPI), управление трансляцией.
+//!   аппаратные характеристики (NVIDIA NVENC, WGC, WASAPI), управление трансляцией.
 //! - Внутриигровой HUD оверлей (Ctrl+Shift+O): статистика в реальном времени, кнопка отключения.
 
 use crate::config::AppConfig;
 use crate::discovery::{DiscoveredHost, LanDiscovery};
 use egui::{Color32, RichText, Rounding, Stroke};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LauncherTab {
@@ -25,6 +26,7 @@ pub enum LauncherAction {
     Disconnect,
     SwitchMonitor,
     ToggleHostServer,
+    Calibrate(SocketAddr),
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,8 @@ pub struct LauncherUI {
     pub error_message: Option<String>,
     pub host_server_info: Option<HostLiveInfo>,
     pub show_overlay: bool,
+    pub connecting_addr: Option<SocketAddr>,
+    pub copied_ip_at: Option<Instant>,
 }
 
 impl LauncherUI {
@@ -62,6 +66,8 @@ impl LauncherUI {
             error_message: None,
             host_server_info: None,
             show_overlay: false,
+            connecting_addr: None,
+            copied_ip_at: None,
         }
     }
 
@@ -70,7 +76,7 @@ impl LauncherUI {
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(Color32::from_rgb(248, 250, 252));
         visuals.panel_fill = Color32::from_rgb(12, 10, 20); // #0c0a14
-        visuals.window_fill = Color32::from_rgb(22, 20, 36); // #161424
+        visuals.window_fill = Color32::from_rgb(20, 18, 34); // #141222
         visuals.extreme_bg_color = Color32::from_rgb(10, 8, 16);
         visuals.faint_bg_color = Color32::from_rgb(30, 26, 48);
 
@@ -165,13 +171,72 @@ impl LauncherUI {
     fn draw_client_tab(&mut self, ui: &mut egui::Ui, config: &mut AppConfig) -> LauncherAction {
         let mut action = LauncherAction::None;
 
+        // Показ активного баннера подключения
+        if let Some(target) = self.connecting_addr {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(30, 22, 54))
+                .stroke(Stroke::new(1.0f32, Color32::from_rgb(139, 92, 246)))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Подключение к хост-серверу {}... Инициализация видеопотока...",
+                                target
+                            ))
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::from_rgb(216, 180, 254)),
+                        );
+                    });
+                });
+            ui.add_space(8.0);
+        }
+
+        // Показ сообщения об ошибке
+        let mut clear_error = false;
+        if let Some(ref err) = self.error_message {
+            egui::Frame::none()
+                .fill(Color32::from_rgba_premultiplied(127, 29, 29, 60))
+                .stroke(Stroke::new(1.0f32, Color32::from_rgb(239, 68, 68)))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("⚠️").size(14.0));
+                        ui.label(
+                            RichText::new(err)
+                                .color(Color32::from_rgb(252, 165, 165))
+                                .size(12.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("✕").size(11.0)).clicked() {
+                                clear_error = true;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
+        if clear_error {
+            self.error_message = None;
+        }
+
+        let avail_width = ui.available_width();
+        let left_width = ((avail_width - 24.0) * 0.52).clamp(380.0, 520.0);
+        let right_width = (avail_width - left_width - 24.0).max(340.0);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Левая колонка: Обнаруженные хосты в сети (LAN Discovery)
+                // ==================== Левая колонка ====================
                 ui.vertical(|ui| {
-                    ui.set_width(460.0);
+                    ui.set_width(left_width);
+
                     ui.label(
-                        RichText::new("ОБНАРУЖЕННЫЕ ХОСТЫ В ЛОКАЛЬНОЙ СЕТИ")
+                        RichText::new("📡  ОБНАРУЖЕНИЕ ХОСТОВ В ЛОКАЛЬНОЙ СЕТИ")
                             .size(12.0)
                             .strong()
                             .color(Color32::from_rgb(148, 163, 184)),
@@ -188,7 +253,7 @@ impl LauncherUI {
                             .inner_margin(16.0)
                             .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
-                                    ui.add_space(16.0);
+                                    ui.add_space(12.0);
                                     ui.spinner();
                                     ui.add_space(10.0);
                                     ui.label(
@@ -202,7 +267,7 @@ impl LauncherUI {
                                             .size(11.0)
                                             .color(Color32::from_rgb(148, 163, 184)),
                                     );
-                                    ui.add_space(16.0);
+                                    ui.add_space(12.0);
                                 });
                             });
                     } else {
@@ -216,32 +281,37 @@ impl LauncherUI {
                         }
                     }
 
-                    ui.add_space(12.0);
+                    ui.add_space(14.0);
 
                     // Секция ручного ввода адреса
                     ui.label(
-                        RichText::new("РУЧНОЙ ВВОД IP (FALLBACK / VPN / WAN)")
+                        RichText::new("🌐  РУЧНОЙ ВВОД АДРЕСА (LAN / VPN / WAN)")
                             .size(12.0)
                             .strong()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
 
                     ui.horizontal(|ui| {
+                        let text_w = (ui.available_width() - 110.0).max(220.0);
                         let text_edit = ui.add_sized(
-                            [320.0, 32.0],
+                            [text_w, 32.0],
                             egui::TextEdit::singleline(&mut self.manual_ip_input)
-                                .hint_text("Например: 192.168.1.4 или IP:порт"),
+                                .hint_text("Например: 192.168.1.4 или IP:48001"),
                         );
+
                         if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             if let Some(addr) = self.parse_manual_endpoint() {
                                 config.record_ip(&self.manual_ip_input);
                                 action = LauncherAction::Connect(addr);
+                            } else {
+                                self.error_message = Some("Неверный формат адреса хоста. Ожидается IP (например 192.168.1.4) или host:порт".to_string());
                             }
                         }
 
-                        let connect_btn = ui.add_sized(
-                            [120.0, 32.0],
+                        let is_connecting = self.connecting_addr.is_some();
+                        let connect_btn = ui.add_enabled(
+                            !is_connecting,
                             egui::Button::new(RichText::new("Вход").strong()),
                         );
                         if connect_btn.clicked() {
@@ -249,14 +319,34 @@ impl LauncherUI {
                                 config.record_ip(&self.manual_ip_input);
                                 action = LauncherAction::Connect(addr);
                             } else {
-                                self.error_message = Some("Неверный формат IP адреса".to_string());
+                                self.error_message = Some("Неверный формат адреса хоста. Ожидается IP (например 192.168.1.4) или host:порт".to_string());
                             }
                         }
                     });
 
-                    // Быстрые подсказки истории
+                    // Валидация в реальном времени
+                    let trimmed_input = self.manual_ip_input.trim();
+                    if !trimmed_input.is_empty() {
+                        if let Some(resolved) = self.parse_manual_endpoint() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(format!("✓ Валидный адрес для подключения: {}", resolved))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(52, 211, 153)),
+                            );
+                        } else {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("⚠️ Ожидается IPv4, IPv6 или host (по умолчанию порт 48001)")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(251, 191, 36)),
+                            );
+                        }
+                    }
+
+                    // Быстрые подсказки недавних IP
                     if !config.recent_ips.is_empty() {
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new("Недавние:")
@@ -272,16 +362,16 @@ impl LauncherUI {
                     }
                 });
 
-                ui.add_space(16.0);
+                ui.add_space(12.0);
                 ui.separator();
-                ui.add_space(16.0);
+                ui.add_space(12.0);
 
-                // Правая колонка: Профиль качества, калибровка и большая кнопка старта
+                // ==================== Правая колонка ====================
                 ui.vertical(|ui| {
-                    ui.set_width(420.0);
+                    ui.set_width(right_width);
 
                     ui.label(
-                        RichText::new("ПАРАМЕТРЫ ТРАНСЛЯЦИИ")
+                        RichText::new("⚙️  ПАРАМЕТРЫ ТРАНСЛЯЦИИ")
                             .size(12.0)
                             .strong()
                             .color(Color32::from_rgb(148, 163, 184)),
@@ -289,6 +379,7 @@ impl LauncherUI {
                     ui.add_space(8.0);
 
                     // Пресеты качества
+                    let previous_preset = config.quality_preset.clone();
                     egui::ComboBox::from_label("Пресет качества")
                         .selected_text(&config.quality_preset)
                         .show_ui(ui, |ui| {
@@ -305,14 +396,17 @@ impl LauncherUI {
                                         "Ultra (45 Mbps, 60 FPS)" => {
                                             config.bitrate_mbps = 45;
                                             config.target_fps = 60;
+                                            config.preferred_codec = core_protocol::VideoCodec::H264;
                                         }
                                         "Competitive (30 Mbps, 120 FPS)" => {
                                             config.bitrate_mbps = 30;
                                             config.target_fps = 120;
+                                            config.preferred_codec = core_protocol::VideoCodec::H264;
                                         }
                                         "Balanced (25 Mbps, 60 FPS)" => {
                                             config.bitrate_mbps = 25;
                                             config.target_fps = 60;
+                                            config.preferred_codec = core_protocol::VideoCodec::H264;
                                         }
                                         "Efficiency (15 Mbps, 60 FPS, HEVC)" => {
                                             config.bitrate_mbps = 15;
@@ -326,21 +420,54 @@ impl LauncherUI {
                             }
                         });
 
+                    if config.quality_preset != previous_preset {
+                        config.save();
+                    }
+
                     ui.add_space(8.0);
 
-                    // Ползунки битрейта и FPS
+                    // Выбор видеокодека
                     ui.horizontal(|ui| {
-                        ui.label("Битрейт:");
-                        if ui.add(egui::Slider::new(&mut config.bitrate_mbps, 5..=80).suffix(" Мбит/с")).changed() {
+                        ui.label(RichText::new("Видеокодек:").color(Color32::from_rgb(203, 213, 225)));
+                        let is_h264 = config.preferred_codec == core_protocol::VideoCodec::H264;
+                        if ui.selectable_label(is_h264, "H.264 (NVENC)").clicked() {
+                            config.preferred_codec = core_protocol::VideoCodec::H264;
+                            if config.quality_preset == "Efficiency (15 Mbps, 60 FPS, HEVC)" {
+                                config.quality_preset = "Custom".to_string();
+                            }
+                            config.save();
+                        }
+                        let is_hevc = config.preferred_codec == core_protocol::VideoCodec::HEVC;
+                        if ui.selectable_label(is_hevc, "HEVC / H.265").clicked() {
+                            config.preferred_codec = core_protocol::VideoCodec::HEVC;
+                            config.quality_preset = "Custom".to_string();
                             config.save();
                         }
                     });
 
+                    ui.add_space(8.0);
+
+                    // Ползунок битрейта
+                    ui.horizontal(|ui| {
+                        ui.label("Битрейт:");
+                        if ui.add(egui::Slider::new(&mut config.bitrate_mbps, 5..=100).suffix(" Мбит/с")).changed() {
+                            Self::mark_custom_if_needed(config);
+                            config.save();
+                        }
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Селектор целевого FPS
                     ui.horizontal(|ui| {
                         ui.label("Частота кадров:");
                         let fps_options = [60, 90, 120, 144];
                         for fps in fps_options {
-                            if ui.selectable_value(&mut config.target_fps, fps, format!("{} FPS", fps)).clicked() {
+                            let is_active = config.target_fps == fps;
+                            if ui.selectable_value(&mut config.target_fps, fps, format!("{} FPS", fps)).clicked()
+                                && !is_active
+                            {
+                                Self::mark_custom_if_needed(config);
                                 config.save();
                             }
                         }
@@ -348,7 +475,7 @@ impl LauncherUI {
 
                     ui.add_space(14.0);
 
-                    // Блок взаимной калибровки
+                    // Блок взаимной калибровки канала
                     egui::Frame::none()
                         .fill(Color32::from_rgb(22, 18, 36))
                         .stroke(Stroke::new(1.0f32, Color32::from_rgb(60, 42, 98)))
@@ -365,52 +492,78 @@ impl LauncherUI {
                             });
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new("Замер RTT, джиттера и автоматический подбор параметров под связку клиент-хост.")
+                                RichText::new("Замер RTT, джиттера, потерь UDP и расчет оптимального битрейта для связки устройств.")
                                     .size(11.0)
                                     .color(Color32::from_rgb(148, 163, 184)),
                             );
                             ui.add_space(8.0);
 
-                            if let Some(ref status) = self.calibration_status {
+                            if self.calibration_in_progress {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("Выполняются сетевые замеры (RTT, джиттер, зонды)...")
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(192, 132, 252)),
+                                    );
+                                });
+                                ui.add_space(6.0);
+                            } else if let Some(ref status) = self.calibration_status {
                                 ui.label(
                                     RichText::new(status)
-                                        .size(12.0)
+                                        .size(11.5)
                                         .color(Color32::from_rgb(52, 211, 153)),
                                 );
                                 ui.add_space(6.0);
                             }
 
-                            if ui.button(RichText::new("Запустить калибровку канала").strong()).clicked() {
-                                self.calibration_in_progress = true;
-                                self.run_quick_calibration(config);
+                            let calib_btn = ui.add_enabled(
+                                !self.calibration_in_progress,
+                                egui::Button::new(RichText::new("Запустить калибровку канала").strong()),
+                            );
+                            if calib_btn.clicked() {
+                                if let Some(addr) = self.parse_manual_endpoint() {
+                                    self.calibration_in_progress = true;
+                                    self.calibration_status = Some("Запуск замера RTT, джиттера и пропускной способности...".to_string());
+                                    action = LauncherAction::Calibrate(addr);
+                                } else {
+                                    self.error_message = Some("Для калибровки укажите корректный IP хост-сервера в поле ввода".to_string());
+                                }
                             }
                         });
 
                     ui.add_space(16.0);
 
-                    if let Some(ref err) = self.error_message {
-                        ui.label(RichText::new(err).color(Color32::from_rgb(239, 68, 68)).size(12.0));
-                        ui.add_space(8.0);
-                    }
-
                     // Большая кнопка подключения
+                    let is_connecting = self.connecting_addr.is_some();
+                    let btn_text = if is_connecting {
+                        "⏳  ПОДКЛЮЧЕНИЕ К ХОСТУ..."
+                    } else {
+                        "🚀  ПОДКЛЮЧИТЬСЯ К ХОСТУ"
+                    };
+
                     let primary_connect = ui.add_sized(
                         [ui.available_width(), 44.0],
                         egui::Button::new(
-                            RichText::new("🚀  ПОДКЛЮЧИТЬСЯ К ХОСТУ")
+                            RichText::new(btn_text)
                                 .size(15.0)
                                 .strong()
                                 .color(Color32::WHITE),
                         )
-                        .fill(Color32::from_rgb(124, 58, 237)),
+                        .fill(if is_connecting {
+                            Color32::from_rgb(76, 50, 120)
+                        } else {
+                            Color32::from_rgb(124, 58, 237)
+                        }),
                     );
 
-                    if primary_connect.clicked() {
+                    if primary_connect.clicked() && !is_connecting {
                         if let Some(addr) = self.parse_manual_endpoint() {
                             config.record_ip(&self.manual_ip_input);
                             action = LauncherAction::Connect(addr);
                         } else {
-                            self.error_message = Some("Укажите корректный IP хоста в поле ввода".to_string());
+                            self.error_message = Some("Укажите корректный IP хоста в поле ввода (например, 192.168.1.4)".to_string());
                         }
                     }
                 });
@@ -418,6 +571,26 @@ impl LauncherUI {
         });
 
         action
+    }
+
+    fn mark_custom_if_needed(config: &mut AppConfig) {
+        let is_preset_match = (config.quality_preset == "Ultra (45 Mbps, 60 FPS)"
+            && config.bitrate_mbps == 45
+            && config.target_fps == 60)
+            || (config.quality_preset == "Competitive (30 Mbps, 120 FPS)"
+                && config.bitrate_mbps == 30
+                && config.target_fps == 120)
+            || (config.quality_preset == "Balanced (25 Mbps, 60 FPS)"
+                && config.bitrate_mbps == 25
+                && config.target_fps == 60)
+            || (config.quality_preset == "Efficiency (15 Mbps, 60 FPS, HEVC)"
+                && config.bitrate_mbps == 15
+                && config.target_fps == 60
+                && config.preferred_codec == core_protocol::VideoCodec::HEVC);
+
+        if !is_preset_match {
+            config.quality_preset = "Custom".to_string();
+        }
     }
 
     fn draw_host_card(&self, ui: &mut egui::Ui, host: &DiscoveredHost) -> Option<SocketAddr> {
@@ -448,6 +621,7 @@ impl LauncherUI {
                         });
 
                         ui.add_space(2.0);
+
                         ui.label(
                             RichText::new(format!(
                                 "IP: {}  |  Экран: {}x{} @ {} FPS",
@@ -463,7 +637,7 @@ impl LauncherUI {
                         ui.label(
                             RichText::new(format!("GPU: {}", host.beacon.gpu_name))
                                 .size(11.0)
-                                .color(Color32::from_rgb(124, 58, 237)),
+                                .color(Color32::from_rgb(167, 139, 250)),
                         );
                     });
 
@@ -531,12 +705,12 @@ impl LauncherUI {
                         } else if let Some(client_ip) = client_opt {
                             ui.label(
                                 RichText::new(format!(
-                                    "🟢 СТРИМИНГ АКТИВЕН (клиент {})",
+                                    "🔵 СТРИМИНГ АКТИВЕН (клиент {})",
                                     client_ip
                                 ))
                                 .size(14.0)
                                 .strong()
-                                .color(Color32::from_rgb(52, 211, 153)),
+                                .color(Color32::from_rgb(96, 165, 250)),
                             );
                         } else {
                             ui.label(
@@ -587,6 +761,8 @@ impl LauncherUI {
 
                     // 3. Сетевой адрес хоста для ручного подключения
                     let local_ip = get_local_ip_string();
+                    let formatted_endpoint = format!("{}:48001", local_ip);
+
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("Локальный IP для подключения:")
@@ -594,17 +770,25 @@ impl LauncherUI {
                                 .color(Color32::from_rgb(148, 163, 184)),
                         );
                         ui.label(
-                            RichText::new(format!("{}:48001", local_ip))
+                            RichText::new(&formatted_endpoint)
                                 .size(14.0)
                                 .strong()
                                 .color(Color32::from_rgb(248, 250, 252)),
                         );
 
-                        if ui
-                            .button(RichText::new("📋 Скопировать IP").size(12.0))
-                            .clicked()
-                        {
-                            ui.output_mut(|o| o.copied_text = format!("{}:48001", local_ip));
+                        let is_recently_copied = self
+                            .copied_ip_at
+                            .is_some_and(|t| t.elapsed().as_secs_f32() < 2.0);
+
+                        let copy_btn_text = if is_recently_copied {
+                            "✓ Скопировано!"
+                        } else {
+                            "📋 Скопировать IP"
+                        };
+
+                        if ui.button(RichText::new(copy_btn_text).size(12.0)).clicked() {
+                            ui.output_mut(|o| o.copied_text = formatted_endpoint.clone());
+                            self.copied_ip_at = Some(Instant::now());
                         }
                     });
 
@@ -627,26 +811,41 @@ impl LauncherUI {
 
                     ui.add_space(14.0);
 
-                    // 4. Компактная плашка оборудования
+                    // 4. Плашка оборудования и подсистем
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("GPU:")
+                            RichText::new("Кодирование:")
                                 .size(11.0)
                                 .color(Color32::from_rgb(100, 116, 139)),
                         );
                         ui.label(
-                            RichText::new("NVIDIA RTX 2060 SUPER (NVENC 2-Pass)")
+                            RichText::new("NVIDIA NVENC Hardware (D3D11 Zero-Copy)")
+                                .size(11.0)
+                                .color(Color32::from_rgb(203, 213, 225)),
+                        );
+                    });
+
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Захват экрана:")
+                                .size(11.0)
+                                .color(Color32::from_rgb(100, 116, 139)),
+                        );
+                        ui.label(
+                            RichText::new("Windows Graphics Capture (WGC)")
                                 .size(11.0)
                                 .color(Color32::from_rgb(203, 213, 225)),
                         );
                         ui.add_space(16.0);
                         ui.label(
-                            RichText::new("Захват:")
+                            RichText::new("Аудио:")
                                 .size(11.0)
                                 .color(Color32::from_rgb(100, 116, 139)),
                         );
                         ui.label(
-                            RichText::new("WGC D3D11 Zero-Copy")
+                            RichText::new("WASAPI Loopback 48kHz Stereo")
                                 .size(11.0)
                                 .color(Color32::from_rgb(203, 213, 225)),
                         );
@@ -741,38 +940,40 @@ impl LauncherUI {
         action
     }
 
-    fn parse_manual_endpoint(&self) -> Option<SocketAddr> {
+    /// Парсинг введенного вручную адреса (поддержка IP, IP:порт, localhost)
+    pub fn parse_manual_endpoint(&self) -> Option<SocketAddr> {
         let input = self.manual_ip_input.trim();
         if input.is_empty() {
             return None;
         }
 
-        if let Ok(addr) = input.parse::<SocketAddr>() {
+        // Поддержка localhost
+        let normalized = if input.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1:48001".to_string()
+        } else if input.to_ascii_lowercase().starts_with("localhost:") {
+            format!("127.0.0.1:{}", &input[10..])
+        } else {
+            input.to_string()
+        };
+
+        if let Ok(addr) = normalized.parse::<SocketAddr>() {
             return Some(addr);
         }
 
         // Если порт не указан, подставляем стандартный порт управления 48001
-        let with_port = format!("{}:48001", input);
+        let with_port = format!("{}:48001", normalized);
         if let Ok(addr) = with_port.parse::<SocketAddr>() {
             return Some(addr);
         }
 
+        // Попытка DNS-резолвинга
+        if let Ok(mut iter) = with_port.to_socket_addrs() {
+            if let Some(addr) = iter.next() {
+                return Some(addr);
+            }
+        }
+
         None
-    }
-
-    fn run_quick_calibration(&mut self, config: &mut AppConfig) {
-        // Запускаем расчет оптимальных настроек для сети
-        let rtt = 1.2f32; // Оптимальный LAN
-        config.bitrate_mbps = 45;
-        config.target_fps = 60;
-        config.quality_preset = "Ultra (45 Mbps, 60 FPS)".to_string();
-        config.save();
-
-        self.calibration_status = Some(format!(
-            "Калибровка завершена: RTT {:.1} мс | Назначен профиль Ultra (45 Мбит/с, 60 FPS, FEC 10:2)",
-            rtt
-        ));
-        self.calibration_in_progress = false;
     }
 }
 

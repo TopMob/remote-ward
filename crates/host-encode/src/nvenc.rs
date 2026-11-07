@@ -349,14 +349,26 @@ impl NvencEncoder {
 
     /// Динамическое изменение битрейта на лету без перезапуска сессии кодировщика
     pub fn reconfigure_bitrate(&mut self, new_bitrate_kbps: u32) -> Result<(), EncodeError> {
+        self.reconfigure(new_bitrate_kbps, self.fps)
+    }
+
+    /// Динамическое изменение целевой частоты кадров (FPS) на лету без перезапуска сессии
+    pub fn reconfigure_fps(&mut self, new_fps: u32) -> Result<(), EncodeError> {
+        let current_bitrate = self.encode_config.rcParams.averageBitRate / 1000;
+        self.reconfigure(current_bitrate, new_fps)
+    }
+
+    /// Динамическое одновременное изменение битрейта и частоты кадров (FPS) на лету без перезапуска сессии кодировщика
+    pub fn reconfigure(&mut self, new_bitrate_kbps: u32, new_fps: u32) -> Result<(), EncodeError> {
         let reconfig_fn = self.fn_list.nvEncReconfigureEncoder.ok_or_else(|| {
             EncodeError::MediaTypeConfigFailed("nvEncReconfigureEncoder отсутствует".into())
         })?;
 
+        self.fps = if new_fps > 0 { new_fps } else { 60 };
         let avg_bitrate = new_bitrate_kbps * 1000;
         self.encode_config.rcParams.averageBitRate = avg_bitrate;
         self.encode_config.rcParams.maxBitRate = (avg_bitrate as f64 * 1.5) as u32;
-        let effective_fps = if self.fps > 0 { self.fps } else { 60 };
+        let effective_fps = self.fps;
         let frame_bits = avg_bitrate / effective_fps.max(1);
         let vbv_size = frame_bits * 3;
         self.encode_config.rcParams.vbvBufferSize = vbv_size;
@@ -386,14 +398,15 @@ impl NvencEncoder {
         let status = unsafe { reconfig_fn(self.encoder_ptr, &mut reconfig_params) };
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(EncodeError::MediaTypeConfigFailed(format!(
-                "Ошибка reconfigure_bitrate({} kbps): {:?}",
-                new_bitrate_kbps, status
+                "Ошибка reconfigure({} kbps, {} fps): {:?}",
+                new_bitrate_kbps, effective_fps, status
             )));
         }
 
         tracing::info!(
-            "NVENC битрейт успешно перенастроен: {} кбит/с",
-            new_bitrate_kbps
+            "NVENC параметры успешно перенастроены: {} кбит/с @ {} FPS",
+            new_bitrate_kbps,
+            effective_fps
         );
         Ok(())
     }

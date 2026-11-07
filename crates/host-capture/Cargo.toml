@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Zero-copy Windows Graphics Capture (WGC) and DXGI Desktop Duplication capture subsystem for Remote-Ward"
 
 [dependencies]
 core-protocol = { path = "../core-protocol" }

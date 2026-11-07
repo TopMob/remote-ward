@@ -42,6 +42,8 @@ logs/
 *.crash
 *.tmp
 *.bak
+.pytest_cache/
+__pycache__/
 
 # === Secrets, Certificates & Keys ===
 *.pem

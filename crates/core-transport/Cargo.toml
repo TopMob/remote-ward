@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Microsecond-paced UDP transport, Reed-Solomon FEC, NACK retransmission, and congestion control for Remote-Ward"
 
 [dependencies]
 core-protocol = { path = "../core-protocol" }

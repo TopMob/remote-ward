@@ -1,7 +1,11 @@
 [package]
 name = "host-input"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level Win32 hardware scancode injection and input sanitization for Remote-Ward"
 
 [dependencies]
 core-protocol = { path = "../core-protocol" }

@@ -7,6 +7,7 @@
 
 use parking_lot::Mutex;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,7 @@ pub struct PacedSender {
     socket: Arc<UdpSocket>,
     pacer: PacketPacer,
     nack_buffer: Arc<Mutex<NackBuffer>>,
-    target_fps: u32,
+    target_fps: AtomicU32,
 }
 
 impl PacedSender {
@@ -44,7 +45,7 @@ impl PacedSender {
             socket,
             pacer: PacketPacer::default(),
             nack_buffer: Arc::new(Mutex::new(NackBuffer::new())),
-            target_fps,
+            target_fps: AtomicU32::new(target_fps),
         }
     }
 
@@ -58,7 +59,7 @@ impl PacedSender {
             socket,
             pacer,
             nack_buffer,
-            target_fps,
+            target_fps: AtomicU32::new(target_fps),
         }
     }
 
@@ -66,8 +67,12 @@ impl PacedSender {
         Arc::clone(&self.nack_buffer)
     }
 
-    pub fn set_target_fps(&mut self, fps: u32) {
-        self.target_fps = fps;
+    pub fn target_fps(&self) -> u32 {
+        self.target_fps.load(Ordering::Relaxed)
+    }
+
+    pub fn set_target_fps(&self, fps: u32) {
+        self.target_fps.store(fps, Ordering::Relaxed);
     }
 
     /// Отправить все пакеты одного кадра с пейсингом и сохранением в NACK-буфер
@@ -92,9 +97,10 @@ impl PacedSender {
         }
 
         // 2. Рассчитываем задержку между пакетами
+        let effective_fps = self.target_fps.load(Ordering::Relaxed);
         let per_packet_delay = self
             .pacer
-            .calculate_packet_delay(total_packets, self.target_fps);
+            .calculate_packet_delay(total_packets, effective_fps);
 
         // 3. Отправляем пакеты с микро-пакетным пейсингом (burst по 2 пакета) для разгрузки CPU
         let burst_size = 2usize;

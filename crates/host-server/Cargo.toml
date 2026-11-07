@@ -1,7 +1,11 @@
 [package]
 name = "host-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host streaming server combining zero-copy screen capture, NVENC, WASAPI audio, and transport"
 
 [dependencies]
 core-protocol = { path = "../core-protocol" }

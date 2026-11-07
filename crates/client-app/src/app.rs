@@ -79,6 +79,8 @@ pub struct RemoteWardClientApp {
     pub egui_winit_state: Option<egui_winit::State>,
     pub session: Option<StreamingSession>,
     pub session_rx: Option<mpsc::Receiver<Result<StreamingSession, String>>>,
+    pub calibration_rx:
+        Option<mpsc::Receiver<Result<crate::calibration::CalibrationResult, String>>>,
     pub connecting_target: Option<SocketAddr>,
     pub host_handle: Option<HostHandle>,
     pub renderer: Option<crate::renderer::D3D11Renderer>,
@@ -248,6 +250,7 @@ impl RemoteWardClientApp {
             egui_winit_state: None,
             session: None,
             session_rx: None,
+            calibration_rx: None,
             connecting_target: None,
             host_handle: None,
             renderer: None,
@@ -440,6 +443,8 @@ impl RemoteWardClientApp {
         self.session = None;
         self.connecting_target = None;
         self.session_rx = None;
+        self.calibration_rx = None;
+        self.launcher_ui.connecting_addr = None;
         self.launcher_ui.show_overlay = false;
 
         self.set_fullscreen_mode(false);
@@ -866,6 +871,36 @@ impl ApplicationHandler for RemoteWardClientApp {
             }
         }
 
+        // 1b. Проверяем результат асинхронной калибровки сети
+        if let Some(ref mut rx) = self.calibration_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.calibration_rx = None;
+                self.launcher_ui.calibration_in_progress = false;
+                match res {
+                    Ok(calib) => {
+                        let rtt_ms = calib.avg_rtt_us as f32 / 1000.0;
+                        let jitter_ms = calib.jitter_us as f32 / 1000.0;
+                        let mbps = (calib.target_bitrate_kbps / 1000).clamp(10, 80);
+                        self.app_config.bitrate_mbps = mbps;
+                        self.app_config.quality_preset = "Custom".to_string();
+                        self.app_config.save();
+                        self.launcher_ui.calibration_status = Some(format!(
+                            "✓ RTT {:.1} мс | Джиттер {:.1} мс | Потери {:.1}% | Оптимальный битрейт: {} Мбит/с ({})",
+                            rtt_ms,
+                            jitter_ms,
+                            calib.packet_loss_rate * 100.0,
+                            mbps,
+                            calib.connection_class
+                        ));
+                    }
+                    Err(e) => {
+                        self.launcher_ui.calibration_status =
+                            Some(format!("Ошибка калибровки сети: {}", e));
+                    }
+                }
+            }
+        }
+
         // 2. Отрисовка кадров
         let window = match self.window.as_ref() {
             Some(w) => w,
@@ -1011,6 +1046,7 @@ impl ApplicationHandler for RemoteWardClientApp {
             let mut launcher_draw_data = None;
 
             if let Some(ref mut state) = self.egui_winit_state {
+                self.launcher_ui.connecting_addr = self.connecting_target;
                 let raw_input = state.take_egui_input(window);
                 let full_output = self.egui_ctx.run(raw_input, |ctx| {
                     launcher_action = self.launcher_ui.draw_launcher(ctx, &mut self.app_config);
@@ -1026,6 +1062,30 @@ impl ApplicationHandler for RemoteWardClientApp {
             match launcher_action {
                 LauncherAction::Connect(target_addr) => {
                     self.start_connection(target_addr);
+                }
+                LauncherAction::Calibrate(target_addr) => {
+                    tracing::info!("Запуск сетевой калибровки для хоста {}...", target_addr);
+                    let (tx, rx) = mpsc::channel(1);
+                    self.calibration_rx = Some(rx);
+                    self.launcher_ui.calibration_in_progress = true;
+                    tokio::spawn(async move {
+                        match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(socket) => {
+                                let res = crate::calibration::run_network_calibration(
+                                    &socket,
+                                    target_addr,
+                                    9999,
+                                )
+                                .await;
+                                let _ = tx.send(Ok(res)).await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(format!("Не удалось открыть UDP сокет: {e}")))
+                                    .await;
+                            }
+                        }
+                    });
                 }
                 LauncherAction::ToggleHostServer => {
                     if self.host_handle.is_none() {

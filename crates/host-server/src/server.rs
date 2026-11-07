@@ -9,7 +9,7 @@ use core_protocol::{
     PROTOCOL_VERSION,
 };
 use core_transport::{CongestionConfig, CongestionController, PacedSender};
-use host_capture::WgcCaptureSession;
+use host_capture::ScreenCaptureSession;
 use host_encode::NvencEncoder;
 use host_input::WindowsInputInjector;
 
@@ -54,6 +54,7 @@ pub struct ServerState {
     pub is_running: Arc<AtomicBool>,
     pub frame_counter: Arc<AtomicU64>,
     pub target_bitrate_kbps: Arc<AtomicU32>,
+    pub target_fps: Arc<AtomicU32>,
     pub display_width: Arc<AtomicU32>,
     pub display_height: Arc<AtomicU32>,
     pub target_monitor_index: Arc<AtomicU32>,
@@ -86,6 +87,7 @@ impl RemoteWardHost {
             is_running: Arc::new(AtomicBool::new(true)),
             frame_counter: Arc::new(AtomicU64::new(0)),
             target_bitrate_kbps: Arc::new(AtomicU32::new(initial_bitrate)),
+            target_fps: Arc::new(AtomicU32::new(config.fps)),
             display_width: Arc::new(AtomicU32::new(0)),
             display_height: Arc::new(AtomicU32::new(0)),
             target_monitor_index: Arc::new(AtomicU32::new(0)),
@@ -407,6 +409,9 @@ impl RemoteWardHost {
                                             strategy, negotiated_fps, hello.supports_tearing, selected, fec_data, fec_parity
                                         );
 
+                                        state.target_fps.store(negotiated_fps, Ordering::Relaxed);
+                                        paced_sender_ctrl.set_target_fps(negotiated_fps);
+
                                         let response = ControlMessage::ServerHello(ServerHello {
                                             server_name: "remote-ward-host".into(),
                                             server_version: "0.1.0".into(),
@@ -555,7 +560,7 @@ impl RemoteWardHost {
                                     }
 
                                     ControlMessage::SwitchMonitor { monitor_index, .. } => {
-                                        let monitors = WgcCaptureSession::enumerate_monitors()
+                                        let monitors = ScreenCaptureSession::enumerate_monitors()
                                             .unwrap_or_default();
                                         let count = if monitors.is_empty() {
                                             1
@@ -624,7 +629,7 @@ impl RemoteWardHost {
         };
 
         // 3. Запуск конвейера захвата и кодирования кадров
-        let fps = self.config.fps;
+        let _fps = self.config.fps;
         let bitrate_kbps = self.config.bitrate_kbps;
 
         // Канал синхронизации первого кадра
@@ -667,11 +672,13 @@ impl RemoteWardHost {
             Arc::new(std::sync::Mutex::new(None));
         let last_codec_lock = Arc::new(std::sync::Mutex::new(VideoCodec::H264));
         let last_bitrate_lock = Arc::new(std::sync::Mutex::new(bitrate_kbps));
+        let last_fps_lock = Arc::new(std::sync::Mutex::new(self.config.fps));
 
         let encoder_clone = Arc::clone(&encoder_lock);
         let supervisor_encoder = Arc::clone(&encoder_lock);
         let last_codec_clone = Arc::clone(&last_codec_lock);
         let last_bitrate_clone = Arc::clone(&last_bitrate_lock);
+        let last_fps_clone = Arc::clone(&last_fps_lock);
         let sender_tx_capture = sender_tx.clone();
 
         // 4. Запуск фонового захвата системного звука Windows (WASAPI Loopback)
@@ -718,7 +725,9 @@ impl RemoteWardHost {
             let mut enc_guard = encoder_clone.lock().unwrap();
             let mut last_codec_guard = last_codec_clone.lock().unwrap();
             let mut last_bitrate_guard = last_bitrate_clone.lock().unwrap();
+            let mut last_fps_guard = last_fps_clone.lock().unwrap();
             let current_target_bitrate = state_capture.target_bitrate_kbps.load(Ordering::Relaxed);
+            let current_target_fps = state_capture.target_fps.load(Ordering::Relaxed);
 
             // Инициализация или переинициализация энкодера при смене разрешения/смене устройства D3D11/первом кадре
             let need_reinit = match enc_guard.as_ref() {
@@ -739,21 +748,22 @@ impl RemoteWardHost {
                     device_raw,
                     width,
                     height,
-                    fps,
+                    current_target_fps,
                     current_target_bitrate,
                     codec,
                 ) {
                     Ok(enc) => {
                         *enc_guard = Some(enc);
                         *last_bitrate_guard = current_target_bitrate;
+                        *last_fps_guard = current_target_fps;
                         state_capture.display_width.store(width, Ordering::Relaxed);
                         state_capture
                             .display_height
                             .store(height, Ordering::Relaxed);
                         let _ = init_tx.try_send((width, height));
                         tracing::info!(
-                            "Аппаратный энкодер NVENC успешно привязан к текстурам WGC: {}x{} @ {} FPS (битрейт: {} кбит/с)",
-                            width, height, fps, current_target_bitrate
+                            "Аппаратный энкодер NVENC успешно привязан: {}x{} @ {} FPS (битрейт: {} кбит/с)",
+                            width, height, current_target_fps, current_target_bitrate
                         );
                     }
                     Err(e) => {
@@ -790,23 +800,29 @@ impl RemoteWardHost {
                     device_raw,
                     width,
                     height,
-                    fps,
+                    current_target_fps,
                     current_target_bitrate,
                     current_codec,
                 ) {
                     *encoder = new_enc;
                     *last_codec_guard = current_codec;
                     *last_bitrate_guard = current_target_bitrate;
+                    *last_fps_guard = current_target_fps;
                 }
-            } else if current_target_bitrate != *last_bitrate_guard {
-                // Динамическое изменение битрейта (ABR адаптация)
-                if let Err(e) = encoder.reconfigure_bitrate(current_target_bitrate) {
+            } else if current_target_bitrate != *last_bitrate_guard
+                || current_target_fps != *last_fps_guard
+            {
+                // Динамическое изменение битрейта и частоты кадров (ABR и авто-согласование)
+                if let Err(e) = encoder.reconfigure(current_target_bitrate, current_target_fps) {
                     tracing::warn!(
-                        "Не удалось динамически перенастроить битрейт NVENC: {:?}",
+                        "Не удалось динамически перенастроить NVENC ({} кбит/с @ {} FPS): {:?}",
+                        current_target_bitrate,
+                        current_target_fps,
                         e
                     );
                 } else {
                     *last_bitrate_guard = current_target_bitrate;
+                    *last_fps_guard = current_target_fps;
                 }
             }
 
@@ -869,12 +885,12 @@ impl RemoteWardHost {
             Ok(())
         });
 
-        // Запуск начальной сессии захвата WGC
+        // Запуск начальной сессии захвата (WGC с автоматическим отказоустойчивым переключением на DXGI)
         let initial_monitor = self.state.target_monitor_index.load(Ordering::Relaxed);
         let initial_cursor = self.state.local_cursor_enabled.load(Ordering::Relaxed);
         let on_frame_start = Arc::clone(&on_frame);
 
-        let mut capture_session = WgcCaptureSession::start_monitor(
+        let mut capture_session = ScreenCaptureSession::start_monitor(
             initial_monitor as usize,
             !initial_cursor,
             move |tex, dev, w, h| on_frame_start(tex, dev, w, h),
@@ -888,7 +904,8 @@ impl RemoteWardHost {
             .store(capture_session.height, Ordering::Relaxed);
 
         tracing::info!(
-            "Сессия захвата экрана запущена (монитор #{}): разрешение дисплея {}x{}",
+            "Сессия захвата экрана запущена [{:?}, монитор #{}]: разрешение дисплея {}x{}",
+            capture_session.backend,
             initial_monitor,
             capture_session.width,
             capture_session.height
@@ -937,7 +954,7 @@ impl RemoteWardHost {
                         let target_cursor = supervisor_state.local_cursor_enabled.load(Ordering::Relaxed);
 
                         let on_frame_new = Arc::clone(&on_frame);
-                        match WgcCaptureSession::start_monitor(
+                        match ScreenCaptureSession::start_monitor(
                             target_monitor as usize,
                             !target_cursor,
                             move |tex, dev, w, h| on_frame_new(tex, dev, w, h),
@@ -950,8 +967,8 @@ impl RemoteWardHost {
                                 current_cursor = target_cursor;
                                 supervisor_state.force_keyframe.store(true, Ordering::SeqCst);
                                 tracing::info!(
-                                    "Захват успешно переключен на монитор #{}: {}x{}",
-                                    target_monitor, new_session.width, new_session.height
+                                    "Захват успешно переключен на монитор #{} [{:?}]: {}x{}",
+                                    target_monitor, new_session.backend, new_session.width, new_session.height
                                 );
 
                                 // Отправляем подтверждение клиенту о новом мониторе и его разрешении
@@ -977,7 +994,7 @@ impl RemoteWardHost {
                                 );
                                 supervisor_state.target_monitor_index.store(current_monitor, Ordering::Relaxed);
                                 let on_frame_fallback = Arc::clone(&on_frame);
-                                if let Ok(fallback_session) = WgcCaptureSession::start_monitor(
+                                if let Ok(fallback_session) = ScreenCaptureSession::start_monitor(
                                     current_monitor as usize,
                                     !current_cursor,
                                     move |tex, dev, w, h| on_frame_fallback(tex, dev, w, h),
@@ -1029,7 +1046,7 @@ mod tests {
         let encoder_opt = Arc::new(std::sync::Mutex::new(None));
         let enc_clone = Arc::clone(&encoder_opt);
 
-        let session = WgcCaptureSession::start(move |tex, dev, w, h| {
+        let session = ScreenCaptureSession::start(move |tex, dev, w, h| {
             let mut enc_guard = enc_clone.lock().unwrap();
             if enc_guard.is_none() {
                 println!("Init Nvenc with dev={:?}, {}x{}", dev, w, h);

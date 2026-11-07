@@ -72,7 +72,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    ✅ Сессия аппаратного кодирования NVENC (D3D11) УСПЕШНО ОТКРЫТА!");
         println!("    Указатель энкодера: {:p}", encoder_handle);
 
-        // Закрываем сессию
+        let mut guid_count = 0u32;
+        let mut guids = vec![GUID::default(); 16];
+        if let Some(get_guids) = fn_list.nvEncGetEncodeGUIDs {
+            let s = unsafe { get_guids(encoder_handle, guids.as_mut_ptr(), 16, &mut guid_count) };
+            if s == NVENCSTATUS::NV_ENC_SUCCESS {
+                println!("[4] Поддерживаемые кодеки (всего {}):", guid_count);
+                for g in guids.iter().take(guid_count as usize) {
+                    let name = if *g == NV_ENC_CODEC_H264_GUID {
+                        "H.264"
+                    } else if *g == NV_ENC_CODEC_HEVC_GUID {
+                        "HEVC (H.265)"
+                    } else if *g == NV_ENC_CODEC_AV1_GUID {
+                        "AV1"
+                    } else {
+                        "Неизвестный"
+                    };
+                    println!("    - {} ({:08x})", name, g.Data1);
+                }
+            }
+        }
+
+        let encode_guid = NV_ENC_CODEC_H264_GUID;
+        let mut preset_count = 0u32;
+        if let Some(get_presets) = fn_list.nvEncGetEncodePresetGUIDs {
+            let mut presets = vec![GUID::default(); 16];
+            let s = unsafe {
+                get_presets(
+                    encoder_handle,
+                    encode_guid,
+                    presets.as_mut_ptr(),
+                    16,
+                    &mut preset_count,
+                )
+            };
+            if s == NVENCSTATUS::NV_ENC_SUCCESS {
+                println!("[5] Поддерживаемые пресеты H.264 (всего {}):", preset_count);
+                for (idx, p) in presets.iter().take(preset_count as usize).enumerate() {
+                    let label = if *p == host_encode::nvenc::NV_ENC_PRESET_P1_GUID {
+                        "P1 (Fastest / Ultra-Low Latency)"
+                    } else if *p == host_encode::nvenc::NV_ENC_PRESET_P2_GUID {
+                        "P2 (Faster)"
+                    } else if *p == host_encode::nvenc::NV_ENC_PRESET_P3_GUID {
+                        "P3 (Fast)"
+                    } else if *p == host_encode::nvenc::NV_ENC_PRESET_P4_GUID {
+                        "P4 (Medium / Balanced)"
+                    } else {
+                        "Другой пресет"
+                    };
+                    println!("    [{}] {} ({:08x})", idx, label, p.Data1);
+                }
+            }
+        }
+
+        if let Some(get_preset_ex) = fn_list.nvEncGetEncodePresetConfigEx {
+            let mut preset_config = NV_ENC_PRESET_CONFIG {
+                version: NV_ENC_PRESET_CONFIG_VER,
+                presetCfg: NV_ENC_CONFIG {
+                    version: NV_ENC_CONFIG_VER,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let p1_guid = host_encode::nvenc::NV_ENC_PRESET_P1_GUID;
+            let s = unsafe {
+                get_preset_ex(
+                    encoder_handle,
+                    encode_guid,
+                    p1_guid,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                    &mut preset_config,
+                )
+            };
+            println!("[6] Конфигурация P1 + Ultra-Low Latency: {:?}", s);
+        }
+
         unsafe {
             let destroy_fn = fn_list.nvEncDestroyEncoder.expect("nvEncDestroyEncoder");
             let _ = destroy_fn(encoder_handle);

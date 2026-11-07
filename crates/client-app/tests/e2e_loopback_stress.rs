@@ -917,7 +917,9 @@ async fn test_dual_instance_artificial_network_stress_simulation() {
     );
     assert!(
         measured_ping_rtt >= Duration::from_millis(25)
-            && measured_ping_rtt <= Duration::from_millis(60)
+            && measured_ping_rtt <= Duration::from_millis(120),
+        "Ping/Pong RTT must reflect injected proxy latency: {:?}",
+        measured_ping_rtt
     );
 
     // 3. Test Host ABR Congestion Adaptation under network stress

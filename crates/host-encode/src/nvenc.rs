@@ -7,12 +7,28 @@ use std::time::Instant;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
-/// GUID для пресета P1 (ultra-low latency) кодировщика NVIDIA NVENC
+/// GUID для пресета P1 (ultra-low latency / fastest) кодировщика NVIDIA NVENC
 pub const NV_ENC_PRESET_P1_GUID: GUID = GUID {
-    Data1: 0xfc0a_3770,
-    Data2: 0x01a4,
-    Data3: 0x480e,
-    Data4: [0xa7, 0x76, 0x4f, 0x6e, 0x24, 0x01, 0x67, 0x22],
+    Data1: 0xfc0a_8d3e,
+    Data2: 0x45f8,
+    Data3: 0x4cf8,
+    Data4: [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
+};
+
+/// GUID для пресета P2 кодировщика NVIDIA NVENC
+pub const NV_ENC_PRESET_P2_GUID: GUID = GUID {
+    Data1: 0xf581_cfb8,
+    Data2: 0x88d6,
+    Data3: 0x4381,
+    Data4: [0x93, 0xf0, 0xdf, 0x13, 0xf9, 0xc2, 0x7d, 0xab],
+};
+
+/// GUID для пресета P3 кодировщика NVIDIA NVENC
+pub const NV_ENC_PRESET_P3_GUID: GUID = GUID {
+    Data1: 0x3685_0110,
+    Data2: 0x3a07,
+    Data3: 0x441f,
+    Data4: [0x94, 0xd5, 0x36, 0x70, 0x63, 0x1f, 0x91, 0xf6],
 };
 
 /// GUID для пресета P4 (balanced) кодировщика NVIDIA NVENC
@@ -21,6 +37,14 @@ pub const NV_ENC_PRESET_P4_GUID: GUID = GUID {
     Data2: 0xdf06,
     Data3: 0x4862,
     Data4: [0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81],
+};
+
+/// GUID для устаревшего пресета DEFAULT (NVIDIA SDK <= 9)
+pub const NV_ENC_PRESET_DEFAULT_GUID: GUID = GUID {
+    Data1: 0xfc0a_3770,
+    Data2: 0x01a4,
+    Data3: 0x480e,
+    Data4: [0xa7, 0x76, 0x4f, 0x6e, 0x24, 0x01, 0x67, 0x22],
 };
 
 use crate::error::EncodeError;
@@ -151,41 +175,114 @@ impl NvencEncoder {
             VideoCodec::AV1 => NV_ENC_CODEC_AV1_GUID,
         };
 
-        let preset_guid = NV_ENC_PRESET_P1_GUID; // P1 = Ultra-Low Latency (<0.1 мс инпут-лаг согласно AGENTS.md)
-
-        // 3. Получение конфигурации пресета
-        let mut preset_config = NV_ENC_PRESET_CONFIG {
-            version: NV_ENC_PRESET_CONFIG_VER,
-            presetCfg: NV_ENC_CONFIG {
-                version: NV_ENC_CONFIG_VER,
-                ..Default::default()
-            },
+        // 3. Многоуровневое согласование пресета кодирования (P1 -> P2 -> P4 -> Legacy Default)
+        let mut encode_config = NV_ENC_CONFIG {
+            version: NV_ENC_CONFIG_VER,
             ..Default::default()
         };
 
-        let get_preset_fn = fn_list.nvEncGetEncodePresetConfigEx.ok_or_else(|| {
-            EncodeError::MediaTypeConfigFailed("nvEncGetEncodePresetConfigEx отсутствует".into())
-        })?;
+        let mut selected_preset = NV_ENC_PRESET_P1_GUID;
+        let mut selected_tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+        let mut preset_loaded = false;
 
-        let status = unsafe {
-            get_preset_fn(
-                encoder_ptr,
-                encode_guid,
-                preset_guid,
-                NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                &mut preset_config,
-            )
-        };
+        if let Some(get_preset_ex) = fn_list.nvEncGetEncodePresetConfigEx {
+            let candidates = [
+                (
+                    NV_ENC_PRESET_P1_GUID,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                ),
+                (
+                    NV_ENC_PRESET_P1_GUID,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
+                ),
+                (
+                    NV_ENC_PRESET_P2_GUID,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                ),
+                (
+                    NV_ENC_PRESET_P4_GUID,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+                ),
+                (
+                    NV_ENC_PRESET_P4_GUID,
+                    NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY,
+                ),
+            ];
 
-        if status != NVENCSTATUS::NV_ENC_SUCCESS {
-            tracing::warn!(
-                "GetEncodePresetConfigEx вернул {:?}, используем базовую конфигурацию",
-                status
-            );
+            for &(candidate_preset, candidate_tuning) in &candidates {
+                let mut preset_config = NV_ENC_PRESET_CONFIG {
+                    version: NV_ENC_PRESET_CONFIG_VER,
+                    presetCfg: NV_ENC_CONFIG {
+                        version: NV_ENC_CONFIG_VER,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                let status = unsafe {
+                    get_preset_ex(
+                        encoder_ptr,
+                        encode_guid,
+                        candidate_preset,
+                        candidate_tuning,
+                        &mut preset_config,
+                    )
+                };
+
+                if status == NVENCSTATUS::NV_ENC_SUCCESS {
+                    encode_config = preset_config.presetCfg;
+                    selected_preset = candidate_preset;
+                    selected_tuning = candidate_tuning;
+                    preset_loaded = true;
+                    tracing::debug!(
+                        "NVENC: успешно получен пресет {:08x} с тюнингом {:?}",
+                        selected_preset.Data1,
+                        selected_tuning
+                    );
+                    break;
+                }
+            }
+        }
+
+        if !preset_loaded {
+            if let Some(get_preset) = fn_list.nvEncGetEncodePresetConfig {
+                let legacy_candidates = [
+                    NV_ENC_PRESET_P1_GUID,
+                    NV_ENC_PRESET_P4_GUID,
+                    NV_ENC_PRESET_DEFAULT_GUID,
+                ];
+                for &cand in &legacy_candidates {
+                    let mut preset_config = NV_ENC_PRESET_CONFIG {
+                        version: NV_ENC_PRESET_CONFIG_VER,
+                        presetCfg: NV_ENC_CONFIG {
+                            version: NV_ENC_CONFIG_VER,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let status =
+                        unsafe { get_preset(encoder_ptr, encode_guid, cand, &mut preset_config) };
+                    if status == NVENCSTATUS::NV_ENC_SUCCESS {
+                        encode_config = preset_config.presetCfg;
+                        selected_preset = cand;
+                        selected_tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_UNDEFINED;
+                        preset_loaded = true;
+                        tracing::info!(
+                            "NVENC: применен legacy-пресет {:08x}",
+                            selected_preset.Data1
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !preset_loaded {
+            tracing::warn!("NVENC: не удалось загрузить пресет ни из одного API, используем базовую конфигурацию");
+            selected_tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_UNDEFINED;
         }
 
         // Настройка сверхнизкой задержки: 0 B-фреймов, CBR, двухпроходное распределение битрейта, IDR по запросу
-        let mut encode_config = preset_config.presetCfg;
         encode_config.version = NV_ENC_CONFIG_VER;
         encode_config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
         // Бесконечный GOP (0xFFFFFFFF): устраняет периодические 2-секундные всплески и пульсацию мутности/ряби
@@ -282,7 +379,7 @@ impl NvencEncoder {
         let mut init_params = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
             encodeGUID: encode_guid,
-            presetGUID: preset_guid,
+            presetGUID: selected_preset,
             encodeWidth: width,
             encodeHeight: height,
             darWidth: width,
@@ -291,7 +388,7 @@ impl NvencEncoder {
             frameRateDen: 1,
             enablePTD: 1,
             encodeConfig: &mut encode_config,
-            tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            tuningInfo: selected_tuning,
             ..Default::default()
         };
 
@@ -326,8 +423,8 @@ impl NvencEncoder {
         }
 
         tracing::info!(
-            "NVENC Аппаратный энкодер готов: {}x{} @ {} FPS, {} кбит/с, задержка: ULTRA_LOW_LATENCY",
-            width, height, fps, bitrate_kbps
+            "NVENC Аппаратный энкодер готов: {}x{} @ {} FPS, {} кбит/с, пресет: {:08x}, тюнинг: {:?}",
+            width, height, fps, bitrate_kbps, selected_preset.Data1, selected_tuning
         );
 
         Ok(Self {
@@ -339,7 +436,7 @@ impl NvencEncoder {
             height,
             fps,
             encode_guid,
-            preset_guid,
+            preset_guid: selected_preset,
             output_bitstream: create_bitstream.bitstreamBuffer,
             frame_count: 0,
             encode_config,
